@@ -1,0 +1,30 @@
+{
+  "electronProjectPath": "..",
+  "outputPath": ".",
+  "runtime": {
+    "mainEntry": "main.js",
+    "preloadEntries": [
+      "preload/index.js"
+    ],
+    "rendererEntries": [
+      "index.html"
+    ]
+  },
+  "electron": {
+    "sendSyncStrategy": "async-promise",
+    "browserWindowDefaults": {
+      "windowMode": "fullscreen",
+      "showTitleBar": false,
+      "resizable": true,
+      "movable": false
+    }
+  },
+  "polyfills": {
+    "strategy": "auto",
+    "dynamicRequire": "warn"
+  },
+  "settings": {
+    "autoCheck": true,
+    "bundleMainIntoRnBundle": true
+  }
+}

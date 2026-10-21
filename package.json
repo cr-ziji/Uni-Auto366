@@ -19,22 +19,22 @@
     "test:upgrade": "node scripts/prepare.js && node tests/startup.cjs --upgrade"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
+    "@supabase/supabase-js": "^2.118.0",
     "archiver": "^7.0.1",
-    "bootstrap-icons": "^1.13.1",
-    "electron-updater": "^6.7.3",
-    "form-data": "^4.0.5",
-    "fs-extra": "^11.1.1",
+    "bootstrap-icons": "^1.13.2",
+    "electron-updater": "^6.8.9",
+    "form-data": "^4.0.6",
+    "fs-extra": "^11.4.1",
     "http-mitm-proxy": "^1.1.0",
-    "node-stream-zip": "^1.15.0",
-    "posthog-node": "^5.21.2",
-    "sherpa-onnx-node": "^1.13.4",
-    "uuid": "^11.1.0",
-    "ws": "^8.14.2"
+    "node-stream-zip": "^1.16.0",
+    "posthog-node": "^5.56.2",
+    "sherpa-onnx-node": "^1.13.8",
+    "uuid": "^11.1.1",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "electron": "^28.0.0",
-    "electron-builder": "^24.13.3"
+    "electron": "^45.0.0",
+    "electron-builder": "^26.15.3"
   },
   "build": {
     "appId": "com.auto366.app",
@@ -101,5 +101,9 @@
       "owner": "cyrilguocode",
       "repo": "Auto366"
     }
+  },
+  "allowScripts": {
+    "electron@45.0.0": true,
+    "electron-winstaller@5.4.0": true
   }
 }
