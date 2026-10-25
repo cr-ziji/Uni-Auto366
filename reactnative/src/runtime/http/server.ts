@@ -498,6 +498,7 @@ export class HttpServer {
               response.destroy(normalizeSocketError(error));
             });
           } catch (error) {
+            console.error('[http] 请求处理异常:', error);
             response.destroy(normalizeSocketError(error));
           }
           return;

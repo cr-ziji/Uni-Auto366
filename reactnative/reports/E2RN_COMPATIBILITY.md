@@ -5,7 +5,7 @@
 
 基线：React Native 0.88.0（New Architecture only）· React 19.3.1 · Metro 0.87.1。
 `react-native-fs` / `react-native-tcp-socket` 为旧式 NativeModule，
-在新架构下通过 TurboModule interop 运行（未真机验证）。
+在新架构下通过 TurboModule interop 运行（Android 真机已验证；iOS 未验证）。
 
 图例：✅ 完全等价 · ⚠️ 有降级或限制 · ❌ 不支持
 
@@ -25,7 +25,7 @@
 | Node 全局对象 | `Buffer` `setImmediate` `TextDecoder` `global` | `src/polyfills/node/globals.ts`（`installNodeGlobals()`） | ✅ | 桌面端不 `require` 直接用，必须在加载 `main.js` 前装到 `globalThis` |
 | `stream` / `stream/promises` | `pipeline` | `stream-browserify` + `src/polyfills/node/stream-promises.ts` | ✅ | |
 | `string_decoder` | `StringDecoder` | npm `string_decoder` | ✅ | |
-| `http` / `https` | `createServer` `request` `get`，绝对形式请求、`for await (const chunk of req)`、`res.writeHead/write/end` | `src/polyfills/node/http.ts` + `src/runtime/http/*`（react-native-tcp-socket） | ⚠️ | 无 keep-alive 复用（`Connection: close`）；HTTPS 走 TLS 直连 |
+| `http` / `https` | `createServer` `request` `get`，绝对形式请求、`for await (const chunk of req)`、`res.writeHead/write/end` | `src/polyfills/node/http.ts` + `src/runtime/http/*`（react-native-tcp-socket） | ⚠️ | 无 keep-alive 复用（`Connection: close`）；服务端支持 `options.tls`（`createTLSServer` + PKCS#12 keystore），客户端 `options.tls` 走 `connectTLS` 直连上游 |
 | `net` | 未直接使用 | `src/polyfills/node/net.ts` | ⚠️ | 仅保留占位 API |
 | `child_process` | `fork`（TTS worker、答案学习）、`exec`/`spawn`（加速、证书导入、TUN） | `src/polyfills/node/child_process.ts`（惰性） | ❌ | 无法派生进程；相关功能已在 TODO 中登记 |
 | `process` | `cwd()` `on('uncaughtException'/'unhandledRejection')` `env` `platform` | `src/polyfills/node/process.ts` + `installProcessGlobals()` | ✅ | `cwd()` → 数据根 |
@@ -52,7 +52,7 @@
 
 | 包 | 桌面端用途 | 移动端实现 | 状态 |
 | --- | --- | --- | --- |
-| `http-mitm-proxy` | 代理核心：明文全量拦截 + HTTPS MITM | `src/stubs/http-mitm-proxy.ts` | ⚠️ 明文 ✅；HTTPS 改为 CONNECT 盲隧道（不解密） |
+| `http-mitm-proxy` | 代理核心：明文全量拦截 + HTTPS MITM | `src/stubs/http-mitm-proxy.ts` | ✅ | 明文与 HTTPS 均解密（本机 `createTLSServer` 终止 TLS，复用同一套钩子链，`ctx.isSSL = true`）；客户端需手动信任导出的 CA；keystore 不可用时退回 CONNECT 盲隧道 |
 | `electron-updater` | GitHub Release 自动更新 | `src/stubs/electron-updater.ts` | ⚠️ 始终报告“无可用更新” |
 | `posthog-node` | 使用统计上报 | `src/stubs/posthog-node.ts` | ⚠️ 仅记录日志，不上报 |
 | `@supabase/supabase-js` | 答案文件上传分享 | `src/stubs/supabase.ts` | ⚠️ 仅实现 storage 接口（上传/下载/公开 URL） |
@@ -66,9 +66,20 @@ ModuleMapper 覆盖（`electron`、`fs`、`fs-extra`、`fs/promises`、`path`、
 `uuid`、`node-stream-zip`、`archiver`、`child_process`、`http-mitm-proxy`、
 `electron-updater`、`posthog-node`、`@supabase/supabase-js`、`sherpa-onnx-node`）。
 
+除模块名映射外，`metro.config.js` 的 `fileOverrides` 还替换了一个**相对路径**模块：
+
+| 桌面端文件 | 替身 | 原因 |
+| --- | --- | --- |
+| `modules/proxy/cert.js` | `src/shims/proxy-cert.ts` | 桌面版用 `child_process` 调 `certutil` / `security` 写系统信任库；移动端改为导出 CA PEM 并提示手动安装 |
+
 ## 5. Web UI
 
-- 资源在打包期由 `scripts/build-web-assets.js` 内嵌为 `src/web-assets/assets.json`（92 个文件 / 2.07 MB）。
-- 运行时由 `src/runtime/web/assetServer.ts` 在 `127.0.0.1` 的临时端口上提供，
-  WebView 从该地址加载，页面里的相对路径与 `fetch()` 行为与桌面端一致。
+- 资源在打包期由 `scripts/build-web-assets.js` 内嵌为 `src/web-assets/assets.json`
+  （97 个文件，其中 8 个二进制；2.06 MB 原始 → 2.38 MB manifest）。
+  字体（`.woff/.woff2`）等二进制必须 base64 存储，并按 UTF-8 往返校验，
+  否则图标字体加载后是乱码/空白。
+- 运行时由 `src/runtime/web/assetServer.ts` 在 `127.0.0.1:17866` 上提供
+  （端口被占用才回退随机端口，固定端口是为了让 `localStorage` 的 origin 稳定）。
+- 页面里的 `<meta name="viewport">` 由资源服务器按 `?e2rn_vw=<虚拟宽度>` 改写，
+  由 WebView 自己缩放（不使用 RN `transform`）。
 - 渲染进程通过 `window.electronAPI` 与主进程通信，桥协议见 `src/runtime/protocol.ts`。

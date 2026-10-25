@@ -303,6 +303,9 @@ export class HttpClientRequest extends HttpEmitter {
           {
             host: this.host,
             port: this.port,
+            // 原生实现用 IP 建 socket，不传 servername 就不会发 SNI；
+            // Cloudflare / Supabase 这类按域名路由的服务端会直接握手失败。
+            servername: this.host,
             ca: this.options.ca,
             key: this.options.key,
             cert: this.options.cert,
@@ -414,11 +417,11 @@ export class HttpClientRequest extends HttpEmitter {
         // 忽略
       }
     }
-    try {
-      this.socket.end?.();
-    } catch {
-      // 忽略
-    }
+    // 不要调用 `socket.end()`：`react-native-tcp-socket` 把 `end` 实现成
+    // `NativeModules.TcpSockets.end(id)` -> `TcpSocketClient.destroy()`，
+    // 也就是**关闭整条连接**（不是 Node 的半关闭）。请求一写完就关连接，
+    // 上游的响应就再也读不到了。这里只把请求发完，连接由响应结束时关闭
+    // （见 `process()`）。
   }
 
   private onData(data: any): void {
@@ -476,6 +479,14 @@ export class HttpClientRequest extends HttpEmitter {
       if (result.complete && !this.complete) {
         this.complete = true;
         this.emit('end');
+        // 没有连接池：响应收完就主动断开，避免 keep-alive 连接一直占着。
+        // 用底层 socket 的 `destroy` 而不是 `this.destroy()`，让 `close`
+        // 事件仍然由 socket 的 close 事件统一触发一次。
+        try {
+          this.socket?.destroy?.();
+        } catch {
+          // 忽略
+        }
       }
       return;
     }

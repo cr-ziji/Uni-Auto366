@@ -90,6 +90,21 @@ const electronRoot = r('..');
 const escape = p => p.replace(/[\\/]/g, '/').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const blockDir = rel => new RegExp('^' + escape(path.join(electronRoot, rel)) + '(?:/|$)');
 
+/**
+ * Single-FILE overrides, keyed by the absolute path of the original module
+ * WITHOUT its extension (the caller may omit it: `require('./cert')`).
+ *
+ * `modules/proxy/cert.js` is the desktop certificate importer: it shells out to
+ * PowerShell/certutil to install the MITM root certificate into the Windows
+ * trust store. Neither `child_process` nor a writable system trust store
+ * exists on Android/iOS, so the file is swapped for `src/shims/proxy-cert.ts`
+ * (export the CA + tell the user how to install it) while every other module
+ * in `modules/proxy/` stays untouched.
+ */
+const fileOverrides = new Map([
+  [path.join(electronRoot, 'modules', 'proxy', 'cert'), r('src/shims/proxy-cert.ts')],
+]);
+
 const config = {
   // The original Electron project is bundled as-is.
   watchFolders: [electronRoot],
@@ -114,6 +129,14 @@ const config = {
     extraNodeModules,
     sourceExts: ['ts', 'tsx', 'js', 'jsx', 'json', 'cjs', 'mjs'],
     resolveRequest: (context, moduleName, platform) => {
+      // Single-file overrides (`modules/proxy/cert.js` -> our shim).
+      if (moduleName.startsWith('.')) {
+        const candidate = path.resolve(path.dirname(context.originModulePath), moduleName);
+        const override = fileOverrides.get(candidate);
+        if (override) {
+          return context.resolveRequest(context, override, platform);
+        }
+      }
       // Strip Node's "node:" prefix ("node:path" -> "path").
       const request = moduleName.startsWith('node:') ? moduleName.slice(5) : moduleName;
       const mapped = builtins[request];

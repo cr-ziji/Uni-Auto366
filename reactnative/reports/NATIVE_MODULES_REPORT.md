@@ -13,7 +13,7 @@ NDK 27.1.12297006 · iOS Swift AppDelegate + SceneDelegate（`RCTNewArchEnabled=
 | 模块 | 版本 | 用途 | Android | iOS | 备注 |
 | --- | --- | --- | --- | --- | --- |
 | `react-native-fs` | 2.20.0 | 文件系统（fs polyfill 的落盘后端） | ✅ | ✅ | 真机已验证（Android）：镜像 hydrate、日志落盘、配置读写正常。旧式 NativeModule，靠新架构的 TurboModule interop 运行 |
-| `react-native-tcp-socket` | 6.4.3 | TCP 服务端/客户端（HTTP 代理与资源服务器） | ✅ | ✅ | 真机已验证（Android）：本地资源服务器监听 `127.0.0.1` 并被 WebView 成功访问。旧式模块 + interop |
+| `react-native-tcp-socket` | 6.4.3 | TCP 服务端/客户端（HTTP 代理与资源服务器） | ✅ | ✅ | 真机已验证（Android）：本地资源服务器、代理监听、HTTPS 中间人的原生 TLS 服务端均正常。旧式模块 + interop；**必须**运行 `scripts/patch-tcp-socket.js`（`postinstall` 自动）才能加载带密码的 PKCS#12 keystore |
 | `react-native-webview` | 14.0.1 | 承载桌面端渲染进程 | ✅ | ✅ | 真机已验证（Android）：页面加载、preload 注入、`postMessage` 双向通信正常；`injectedJavaScriptBeforeContentLoaded` 等 prop 在 14.x 均保留 |
 | `react-native-url-polyfill` | 4.0.0 | `URL` / `URLSearchParams` | ✅ | ✅ | 4.x 的 API 与 2.x 一致（`/auto` 入口保留） |
 
@@ -31,7 +31,7 @@ NDK 27.1.12297006 · iOS Swift AppDelegate + SceneDelegate（`RCTNewArchEnabled=
 
 | 桌面端能力 | 依赖的原生能力 | 移动端处置 |
 | --- | --- | --- |
-| MITM 代理（自签 CA + HTTPS 解密） | Node `crypto` X509 + `child_process` 导入 CA | ❌ 不可用，改为 CONNECT 隧道 |
+| MITM 代理（自签 CA + HTTPS 解密） | Node `crypto` X509 + `child_process` 导入 CA | ✅ 已实现：openssl 预生成 CA/叶子证书，PKCS#12 打进 APK，`react-native-tcp-socket` 的 `createTLSServer` 终止 TLS，复用明文代理钩子链。客户端需手动安装导出的 CA |
 | 进程级加速（openspeed / speed） | `child_process` 拉起外部程序 | ❌ 不可用，功能下线 |
 | TUN 模式 | 外部 tun2socks 进程 + 路由表 | ❌ 不可用 |
 | 系统代理设置 | 注册表 / `networksetup` | ⚠️ 移动端无法设置系统代理，改为应用内代理 |
@@ -93,4 +93,6 @@ Podfile 中 `use_frameworks!` 已启用（可通过 `USE_FRAMEWORKS` 环境变�
 - `react-native-svg`、`react-native-reanimated` 等 UI 库：桌面端 UI 在 WebView 内，
   RN 侧只画一个全屏容器，不需要。
 - `react-native-fs` 之外的存储库：与桌面端 `fs` 语义差异大，反而增加 polyfill 复杂度。
-- VPN / MITM 类原生库：见 `E2RN_TODOS.md` 第 1、2 项，属于产品级决策。
+- VPN / TUN 类原生库：见 `E2RN_TODOS.md` 第 2 项（`child_process` / TUN 不可用），
+  属于产品级决策。HTTPS 解密**不需要** VPN：用 `react-native-tcp-socket` 的原生
+  TLS 服务端在本机终止 TLS 即可（见 `MIGRATION_GUIDE.md` §3.7）。

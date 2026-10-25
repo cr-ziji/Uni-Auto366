@@ -11,8 +11,10 @@
    桌面端代码通过 `require()` 拿到的仍是它熟悉的那套 API。
 2. **Polyfill 而非重写**：所有平台差异都由 `src/polyfills/node/*`（Node 内置模块）与
    `src/shims/electron/*`（Electron API）提供，**不存在** `src/modules/**` 这样的业务代码副本。
-3. **显式暴露差异**：移动端做不到的能力（MITM 解密、TUN、进程级加速、证书导入、
-   原生 TTS、应用内自动更新）不做静默降级，统一登记在 [`E2RN_TODOS.md`](./E2RN_TODOS.md)。
+3. **显式暴露差异**：移动端做不到的能力（进程级加速、TUN、原生 TTS、
+   应用内自动更新、系统级证书导入）不做静默降级，统一登记在
+   [`E2RN_TODOS.md`](./E2RN_TODOS.md)。HTTPS 解密已通过“内置 CA + 本机 TLS
+   服务端”实现，见 §3.7。
 
 > 参考实现：`D:\program\e2rn-test\vscode-1.141.0\reactnative`（VS Code 1.141 的 E2RN 移植），
 > 本目录的目录结构、ModuleMapper、reports 组织方式与其保持一致。
@@ -29,7 +31,7 @@
 | TypeScript | 6.0.3（`@react-native/typescript-config` 0.88.0） |
 | Jest | 29.7.0（`@react-native/jest-preset` 0.88.0） |
 | ESLint / Prettier | 8.57.1 / 3.9.10 |
-| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-tcp-socket` 6.4.3、`react-native-url-polyfill` 4.0.0 |
+| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-tcp-socket` 6.4.3、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1 |
 | Android | Gradle 9.4.1、AGP（`com.android.tools.build:gradle`）、Kotlin 2.2.0、compileSdk 37、targetSdk 36、minSdk 24、NDK 27.1.12297006 |
 | iOS | Swift `AppDelegate` + `SceneDelegate`（`RCTDefaultReactNativeFactoryDelegate`）、`RCTNewArchEnabled=true` |
 
@@ -44,7 +46,8 @@
 - Jest preset 由 `react-native` 改为 `@react-native/jest-preset`（0.88 已移除 `react-native/jest-preset.js`）。
 - 新增 `@types/node`（polyfill 代码依赖 `Buffer`/`stream`/`NodeJS` 等 Node 全局类型）。
 - **New Architecture**：RN 0.88 只支持新架构；`react-native-fs` / `react-native-tcp-socket`
-  仍是旧式 NativeModule，依赖 RN 的 **TurboModule interop 层**运行（未做真机验证，见 TODO）。
+  仍是旧式 NativeModule，依赖 RN 的 **TurboModule interop 层**运行
+  （Android 真机已验证；iOS 未验证）。
 
 > ⚠️ **Metro 缓存陷阱**：Metro 的 transform 缓存 key **不包含** `babel.config.js` 与本目录的自定义
 > Babel 插件。修改 `babel.config.js` / `babel-plugin-e2rn-dirname.js` 后必须
@@ -72,22 +75,28 @@ reactnative/
 │   │   ├── child_process.ts process.ts console.ts timers.ts uuid.ts
 │   │   └── unsupported.ts
 │   ├── shims/electron/         # Electron API 替身（app/BrowserWindow/ipcMain/...）
+│   ├── shims/proxy-cert.ts     # modules/proxy/cert.js 替身（导出 CA + 提示安装）
+│   ├── mitm/ca-certificate.ts  # 生成物：CA PEM、keystore 资源名与密码
 │   ├── runtime/                # 运行时
 │   │   ├── EventBus.ts         #   进程内事件总线（ipcMain ⇄ ipcRenderer）
 │   │   ├── WindowManagerBridge.ts #  WebView ⇄ RN 消息桥
 │   │   ├── windowStore.ts windowState.ts webviewRegistry.ts
 │   │   ├── preload.ts protocol.ts
-│   │   ├── http/               #   HTTP/1.1 协议核心（parse/server/client）
-│   │   └── web/assetServer.ts  #   本地 Web 资源服务器
-│   ├── components/WindowManager/  # 窗口 → react-native-webview
+│   │   ├── http/               #   HTTP/1.1 协议核心（parse/server/client，支持 TLS）
+│   │   └── web/assetServer.ts  #   本地 Web 资源服务器（固定端口 17866）
+│   ├── components/WindowManager/  # 窗口 → react-native-webview（viewport.ts 计算缩放）
 │   ├── components/preloadBridge.ts # 注入页面的桥脚本
 │   ├── bootstrap/E2RNMainBootstrap.ts # 启动流程
 │   ├── auto366-main/entry.ts   # 入口
 │   ├── stubs/                  # 桌面专属 npm 包的替身
-│   │   ├── http-mitm-proxy.ts  #   代理核心的替身（真实实现）
+│   │   ├── http-mitm-proxy.ts  #   代理核心的替身（明文 + HTTPS MITM）
 │   │   ├── electron-updater.ts posthog-node.ts supabase.ts sherpa-onnx.ts
 │   ├── web-assets/             # 内嵌 Web 资源（assets.json）+ 只读虚拟 FS
 │   └── types/globals.d.ts
+├── scripts/                    # build-web-assets / generate-mitm-cert /
+│                               # patch-tcp-socket / mitm-e2e-test / cdp-eval
+├── certs/                      # CA 与叶子证书（openssl 生成，含私钥，勿外传）
+├── android/app/src/main/res/raw/auto366_mitm.p12  # 打进 APK 的服务端 keystore
 ├── __tests__/                  # polyfill 单元测试
 └── reports/                    # 本目录
 ```
@@ -180,9 +189,88 @@ shim 在合成事件时把 `event.senderFrame.url` 置为：
 
 ### 3.6 窗口与缩放
 
-桌面 UI 固定为 1400×900（专业模式）/ 875×1010（简洁模式）。
-移动端以原尺寸渲染 WebView，再整体 `scale` 到可用空间并居中
-（`src/components/WindowManager/viewport.ts`），保证布局与桌面端一致。
+桌面 UI 固定为 1400×900（专业模式）/ 875×1010（简洁模式）。移动端**不再**
+用 RN `transform` 缩放 WebView：
+
+1. WebView 按屏幕实际可用尺寸布局（`SafeAreaProvider` + `useSafeAreaInsets()`，
+   横屏时左右各留约 20dp，竖屏留状态栏/手势区），因此**不留黑边**；
+2. `viewport.ts` 只做计算：`scale = containerWidth / virtualWidth`，
+   `virtualHeight = containerHeight / scale`；
+3. 页面用 `<meta name="viewport" content="width=<virtualWidth>">` 按桌面宽度
+   布局，WebView 的 `scalesPageToFit` 负责把它缩放到屏幕宽度；
+4. 资源服务器按 `?e2rn_vw=<virtualWidth>` 改写 HTML 里的 viewport meta。
+
+> 早期实现是「原尺寸 WebView + `transform: scale()` + 居中」，在真机上会闪屏：
+> 被 transform 的 WebView 仍按 **1400×900 dp**（3x 屏约 4200×2700 物理像素）
+> 布局和光栅化，每次重绘都要重新上传这块巨大的硬件层。
+> 改成 WebView 自己缩放后，合成层就是屏幕尺寸。
+
+### 3.7 HTTPS 中间人（MITM）
+
+桌面端 `http-mitm-proxy` 自带 CA 生成与证书签发；移动端用
+`react-native-tcp-socket` 的原生 TLS 服务端复刻同一条链路。
+
+**证书**（`npm run certs` → `scripts/generate-mitm-cert.js`，需要 `openssl`）：
+
+| 产物 | 用途 |
+| --- | --- |
+| `certs/auto366-ca.key` / `.pem` | 根证书（CA），**私钥不外发** |
+| `certs/auto366-mitm.key` / `.pem` | 叶子证书，SAN 覆盖 `*.up366.cn` / `*.up366.com` / `*.cyril.zone` 等 |
+| `android/app/src/main/res/raw/auto366_mitm.p12` | 叶子证书 + 私钥 + 链，打进 APK，密码 `auto366-mitm` |
+| `src/mitm/ca-certificate.ts` | CA PEM 与 keystore 常量（生成物） |
+
+CA 只生成一次（重跑保留已有 CA，`--force` 才轮换），避免已安装证书的手机失效。
+
+**运行时链路**：
+
+```
+客户端 --CONNECT host:443--> 代理 (5291)
+                              ├─ 回 200 Connection Established
+                              └─ 把密文经本机 loopback 转发给
+                                 createTLSServer(keystore)  <-- TLS 在此终止
+                                        ↓ 得到明文 HTTP
+                                 handleHttp(..., isSSL = true)
+                                        ↓ 同一套钩子链
+                                 onRequest / onRequestData / onRequestEnd
+                                        ↓
+                                 HttpClientRequest(tls: true) --> 真实上游
+                                        ↓
+                                 onResponse / onResponseData / onResponseEnd
+```
+
+- 明文与 HTTPS 走**同一个** `pipeRequest` / `handleResponseHead`，所以规则匹配、
+  抓包、正文改写的行为一致，只是 `ctx.isSSL` 不同；
+- keystore 缺失 / TLS 服务端起不来时自动退回 CONNECT 盲隧道（只转发密文），
+  代理整体仍可用；
+- 客户端必须信任导出的 CA：`modules/proxy/cert.js` 被
+  `src/shims/proxy-cert.ts` 替换，把 CA 写到
+  `<documents>/.Auto366/Auto366-MITM-CA.pem` 并提示手动安装。
+
+**`react-native-tcp-socket` 补丁**（`scripts/patch-tcp-socket.js`，`postinstall` 幂等执行）：
+
+- **keystore 密码**：`SSLCertificateHelper.createServerSocketFactory()` 原本把
+  PKCS#12 密码写死成 `"".toCharArray()`，Android 的 BouncyCastle **打不开空密码
+  keystore**（加密的报 `password empty`，未加密的报
+  `OpenSSLRSAPrivateCrtKey cannot be cast to PKCS12BagAttributeCarrier`）。
+  补丁让 `createServerSocketFactory(context, uri, char[] password)` 接收密码，
+  `TcpSocketServer` 从 `tlsOptions.password` 读取；因此 `createTLSServer` 的
+  options 必须传 `{keystore: {uri: 'auto366_mitm'}, password}`，
+  `keystore` 必须是对象——库内部会调 `Image.resolveAssetSource()`。
+- **SNI**：原生 TLS 客户端用 peer **IP** 建 socket，平台默认**不发 SNI**，
+  Cloudflare / Supabase 这类按域名路由的服务端会直接 `handshake_failure` / RST。
+  补丁把 `servername` 选项转成 `SSLParameters.setServerNames()`，
+  `src/runtime/http/client.ts` 在 `connectTLS()` 里传 `servername: this.host`
+  （IP 字面量会被忽略）。
+
+**两个必须记住的坑**：
+
+1. `Socket.end()` 在这个库里映射到原生 `destroy()`，是**整条关闭**而不是 Node 的
+   半关闭。`src/runtime/http/client.ts` 的 `finishRequest()` 绝不能调 `end()`，
+   否则请求刚写完连接就断了，上游响应永远读不到（明文 HTTP 同样超时）。
+   现在的做法是：请求写完只发数据，响应收完后主动 `socket.destroy()`。
+2. `TcpSocket.connectTLS()` 在 TCP `connect` 成功时就 emit `secureConnect`，
+   并不代表 TLS 握手完成；此时立刻 `write()` 会抛 `Socket is closed`。
+   所以代理桥接层用 `ready` 标志 + 缓冲，等真正的握手数据到达再放行。
 
 ## 4. ModuleMapper
 
@@ -199,7 +287,7 @@ shim 在合成事件时把 `event.senderFrame.url` 置为：
 | `child_process` | `src/polyfills/node/child_process.ts` | 惰性 no-op |
 | `uuid` `node-stream-zip` `archiver` `stream/promises` | `src/polyfills/node/*` | fflate 实现 |
 | `electron` `@e2rn/electron` | `src/shims/electron/index.ts` | 进程内替身 |
-| `http-mitm-proxy` | `src/stubs/http-mitm-proxy.ts` | **真实实现**（明文全拦截 / HTTPS 隧道） |
+| `http-mitm-proxy` | `src/stubs/http-mitm-proxy.ts` | **真实实现**：明文全拦截 + HTTPS MITM（本机 TLS 服务端 + 同一套钩子链） |
 | `electron-updater` | `src/stubs/electron-updater.ts` | 报告“无可用更新” |
 | `posthog-node` | `src/stubs/posthog-node.ts` | 只记录不上报 |
 | `@supabase/supabase-js` | `src/stubs/supabase.ts` | 只实现 storage 接口 |
@@ -208,17 +296,26 @@ shim 在合成事件时把 `event.senderFrame.url` 置为：
 桌面端的 `node_modules` 被 `blockList` 屏蔽（原生插件、electron-builder 等），
 Babel 注入的 `@babel/runtime` 通过 `extraNodeModules` 显式映射。
 
+除模块名映射外，`metro.config.js` 的 `fileOverrides` 还替换了相对路径模块
+`<electronRoot>/modules/proxy/cert` → `src/shims/proxy-cert.ts`
+（桌面版用 `child_process` 写系统信任库，移动端改为导出 CA PEM + 提示手动安装）。
+
 ## 5. 构建与验证
 
 ```bash
-npm install
-npm run assets          # 重新生成 src/web-assets/assets.json
+npm install             # postinstall 会自动给 react-native-tcp-socket 打 keystore 密码补丁
+npm run assets          # 重新生成 src/web-assets/assets.json（生成物，gitignore）
+npm run certs           # 生成 CA / 叶子证书 / p12 keystore（需要 openssl，已有则跳过）
 npm run typecheck       # tsc --noEmit
 npm run lint            # eslint
 npm test                # jest（polyfill 单元测试）
 npm run android         # 需要 Android SDK
 npm run ios             # 需要 Xcode
 ```
+
+> `src/web-assets/assets.json` 是生成物：全新 clone 后不跑 `npm run assets`，
+> Metro 会报 `Unable to resolve module ./assets.json`。`npm start` / `npm run android`
+> 的 `pre*` 钩子会自动生成，只有直接 `npx react-native run-android` 才会踩到。
 
 真机验证（Android，2026-10）：
 
@@ -232,13 +329,31 @@ adb logcat -v brief ReactNativeJS:V *:S
 启动成功的日志序列：
 
 ```
-[e2rn] web assets are served from http://127.0.0.1:<port>
+[e2rn] web assets are served from http://127.0.0.1:17866
 [e2rn] the Auto366 main process has been started
 [统计] [Analytics] 初始化成功, distinctId: <uuid>
 [规则] 内置规则集导入完成
 [界面] DOM 加载完成，开始初始化应用...
 [界面] 应用初始化完成
+[http-mitm-proxy] HTTPS 中间人已就绪 (127.0.0.1:<port>)
 ```
+
+HTTPS 中间人端到端验证（真机 / 模拟器均可，前提是代理已启动）：
+
+```bash
+adb forward tcp:15291 tcp:5291       # 代理端口 5291 -> 本机 15291
+node scripts/mitm-e2e-test.js        # 默认 fs.up366.cn:443 /
+node scripts/mitm-e2e-test.js --host study-api.up366.cn --path /api/v1/config
+```
+
+脚本会逐字节构造 `CONNECT` → 用 `certs/auto366-ca.pem` 校验 TLS 证书
+（期望 `CN=Auto366 MITM`）→ 发送 `GET`，最后打印
+`PASS: <host><path> 经 HTTPS 中间人代理成功`。
+
+> 不要用 `cmd` 的 `echo X& echo Y` 拼请求做这个测试：Windows `cmd` 会给每行尾部
+> 补一个空格（`HTTP/1.1 \r\n`、空行变 ` \r\n`），解析器找不到 `\r\n\r\n`。
+> Windows 的 `curl` 走 Schannel，`--cacert` / `-k` 对自签 MITM 也不可靠，
+> 请用上面的 Node 脚本或 `openssl s_client -proxy`。
 
 Metro 打包自检：
 

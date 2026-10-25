@@ -9,8 +9,9 @@ CLI 20.2.0 · TypeScript 6.0.3。
 ## 快速开始
 
 ```bash
-npm install          # 安装依赖
-npm run assets       # 把 Web 资源内嵌进 src/web-assets/assets.json
+npm install          # 安装依赖（postinstall 会给 tcp-socket 打 keystore 密码补丁）
+npm run assets       # 把 Web 资源内嵌进 src/web-assets/assets.json（生成物）
+npm run certs        # 生成 HTTPS 中间人证书与 p12 keystore（需要 openssl，已有则跳过）
 npm start            # 启动 Metro
 npm run android      # 需要 Android SDK
 npm run ios          # 需要 Xcode
@@ -23,6 +24,17 @@ npm run typecheck    # tsc --noEmit
 npm run lint         # eslint
 npm test             # jest：fs 镜像 / HTTP 解析 / 视口缩放
 ```
+
+HTTPS 中间人端到端验证（真机代理启动后）：
+
+```bash
+adb forward tcp:15291 tcp:5291
+node scripts/mitm-e2e-test.js --host fs.up366.cn --path /
+```
+
+客户端要信任 `<documents>/.Auto366/Auto366-MITM-CA.pem`（应用内「安装证书」
+只会导出并提示手动安装）。详见
+[`reports/MIGRATION_GUIDE.md`](./reports/MIGRATION_GUIDE.md) §3.7。
 
 > 改过 `babel.config.js` 或 `babel-plugin-e2rn-dirname.js` 后，必须清 Metro 缓存
 > （`npx react-native start --reset-cache` 或删除 `%TEMP%\metro-cache`），

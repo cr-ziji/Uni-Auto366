@@ -1,0 +1,20 @@
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = Auto366 MITM
+O = Auto366
+[ext]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+[alt_names]
+DNS.1 = localhost
+DNS.2 = up366.cn
+DNS.3 = *.up366.cn
+DNS.4 = up366.com
+DNS.5 = *.up366.com
+DNS.6 = cyril.zone
+DNS.7 = *.cyril.zone
+DNS.8 = *.366.cyril.zone
