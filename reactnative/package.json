@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "assets": "node scripts/build-web-assets.js",
+    "certs": "node scripts/generate-mitm-cert.js",
+    "postinstall": "node scripts/patch-tcp-socket.js",
     "prestart": "npm run assets",
     "start": "react-native start",
     "preandroid": "npm run assets",
@@ -12,7 +14,9 @@
     "ios": "react-native run-ios",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "jest"
+    "test": "jest",
+    "bundle:android": "react-native bundle --platform android --dev false --entry-file index.js --bundle-output android/app/src/main/assets/index.android.bundle --assets-dest android/app/src/main/res",
+    "bundle:ios": "react-native bundle --platform ios --dev false --entry-file index.js --bundle-output ios/main.jsbundle --assets-dest ios"
   },
   "dependencies": {
     "aes-js": "^3.1.2",
