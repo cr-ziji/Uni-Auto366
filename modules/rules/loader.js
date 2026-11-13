@@ -66,30 +66,15 @@ class RulesLoader {
           let rulesData = JSON.parse(fs.readFileSync(rulesJsonPath, 'utf-8'));
 
           rulesData = rulesData.map(rule => {
-            if (rule.type === 'zip-implant' && rule.zipImplant && !rule.zipImplant.startsWith('http')) {
-              const zipPath = path.join(folderPath, rule.zipImplant);
-              if (fs.existsSync(zipPath)) {
-                rule.zipImplant = zipPath;
+            for (const field of ['zipImplant', 'injectScript', 'newContentFile']) {
+              if (rule[field]) {
+                rule[field] = this._resolveRuleAsset(folderPath, rule[field], rulesetInfo.name, rule.name, field);
               }
             }
-            if (rule.type === 'zip-implant-dynamic' && rule.injectScript && !rule.injectScript.startsWith('http') && !path.isAbsolute(rule.injectScript)) {
-              const scriptPath = path.join(folderPath, rule.injectScript);
-              if (fs.existsSync(scriptPath)) {
-                rule.injectScript = scriptPath;
-              }
-            }
-            if (rule.type === 'zip-implant-dynamic' && Array.isArray(rule.injectScripts)) {
-              rule.injectScripts = rule.injectScripts.map(s => {
-                if (!s || s.startsWith('http') || path.isAbsolute(s)) return s;
-                const p = path.join(folderPath, s);
-                return fs.existsSync(p) ? p : s;
-              });
-            }
-            if (rule.type === 'content-change' && rule.newContentFile && !path.isAbsolute(rule.newContentFile)) {
-              const ccPath = path.join(folderPath, rule.newContentFile);
-              if (fs.existsSync(ccPath)) {
-                rule.newContentFile = ccPath;
-              }
+            if (Array.isArray(rule.injectScripts)) {
+              rule.injectScripts = rule.injectScripts.map(value =>
+                this._resolveRuleAsset(folderPath, value, rulesetInfo.name, rule.name, 'injectScripts')
+              );
             }
             return rule;
           });
@@ -165,6 +150,27 @@ class RulesLoader {
     } catch (error) {
       moduleLog.error('导入内置规则集失败:', error);
     }
+  }
+
+  /**
+   * Rewrites a rule asset reference to its absolute path inside the rule set.
+   *
+   * Remote URLs and already absolute paths are returned untouched. A relative
+   * reference that does not resolve to a file keeps its original value, but it
+   * is reported: such a rule stays enabled in the UI while `injection/` skips
+   * it (`if (!await fs.pathExists(rule.zipImplant)) continue;`), so the user
+   * only saw "the rule does nothing" with no hint about the real cause.
+   */
+  _resolveRuleAsset(folderPath, value, rulesetName, ruleName, field) {
+    if (typeof value !== 'string' || !value || /^https?:/i.test(value) || path.isAbsolute(value)) {
+      return value;
+    }
+    const candidate = path.join(folderPath, value);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    moduleLog.warn(`规则集「${rulesetName}」的规则「${ruleName}」引用了不存在的文件: ${value} (${field})`);
+    return value;
   }
 
   rebaseBuiltinPaths(ruleset, folderPath, rulesManager) {

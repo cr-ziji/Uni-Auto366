@@ -304,6 +304,12 @@ export class BrowserWindow {
     }
     this.destroyed = true;
     windowStore.removeWindow(this.windowId);
+    // Without this the instance stays in the registry forever: every window
+    // that is created and closed again (the injection progress window does
+    // that on each injection) leaked one entry, `getAllWindows()` grew with
+    // every run and `notifyWindowLoaded()` could still dispatch events to a
+    // destroyed window.
+    unregisterWindow(this);
     unregisterWebContents(this.windowId);
     this.webContents.destroy();
     this.emit('closed');

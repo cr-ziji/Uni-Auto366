@@ -175,7 +175,16 @@ export function Window({window, containerWidth, containerHeight}: WindowProps) {
     if (webView && typeof webView.injectJavaScript === 'function') {
       // The bridge is normally injected before the content is loaded - this
       // is the fallback for pages that reset the global scope.
-      webView.injectJavaScript(PRELOAD_BRIDGE_SOURCE);
+      //
+      // The WebView can already be gone (the window was closed or swapped out
+      // while the page was still loading); `injectJavaScript` then throws and
+      // the exception would escape into the `onLoadEnd` callback of the native
+      // view.
+      try {
+        webView.injectJavaScript(PRELOAD_BRIDGE_SOURCE);
+      } catch (error) {
+        console.warn(`[e2rn] the preload bridge could not be re-injected into window ${windowId}`, error);
+      }
     }
     notifyWindowLoaded(windowId);
   }, [windowId]);

@@ -16,8 +16,17 @@ import {appDataDirectory, virtualAppRoot, workingDirectory} from '../../runtime/
 
 const startedAt = Date.now();
 
-/** The desktop build reports `win32`/`darwin`; the mobile build mirrors it. */
-export const platform: string = Platform.OS === 'ios' ? 'darwin' : 'win32';
+/**
+ * The platform the JavaScript runs on.
+ *
+ * Node and Electron report the host platform (`win32`, `darwin`, `linux`);
+ * the mobile build reports the platform it really runs on, matching
+ * `os.platform()`. Pretending to be `win32` made every desktop-only branch in
+ * the ported main process believe it could run its Windows helpers (the
+ * `openspeedy` injector, `taskkill`, the TUN binaries), which only failed
+ * later and with a misleading message.
+ */
+export const platform: string = Platform.OS === 'ios' ? 'ios' : 'android';
 export const arch: string = Platform.OS === 'ios' ? 'arm64' : 'arm64-v8a';
 
 /** Node reports `browser` for every non Node.js runtime. */

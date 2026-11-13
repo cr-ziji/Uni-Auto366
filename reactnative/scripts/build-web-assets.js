@@ -33,6 +33,20 @@ const ENTRIES = [
   {from: 'rulesets', to: 'rulesets', dir: true},
   {from: 'preload', to: 'preload', dir: true},
   {from: 'resources', to: 'resources', dir: true},
+  // The injection progress window is loaded with `BrowserWindow.loadFile()`
+  // by `modules/injection/window`. The desktop build reads it straight from
+  // the application directory; on mobile the file has to be in the manifest,
+  // otherwise the local asset server answers 404 and the window stays blank.
+  // `index.js` is deliberately not listed - it is main process code that
+  // Metro bundles, not a page asset.
+  {
+    from: path.join('modules', 'injection', 'window', 'index.html'),
+    to: path.join('modules', 'injection', 'window', 'index.html'),
+  },
+  {
+    from: path.join('modules', 'injection', 'window', 'progress.js'),
+    to: path.join('modules', 'injection', 'window', 'progress.js'),
+  },
   {
     from: path.join('node_modules', 'bootstrap-icons', 'font', 'bootstrap-icons.css'),
     to: path.join('node_modules', 'bootstrap-icons', 'font', 'bootstrap-icons.css'),
@@ -65,11 +79,17 @@ const TEXT_EXTENSIONS = new Set([
 ]);
 
 /**
- * Fonts are binary. They used to be listed as text, which silently corrupted
- * them (`bootstrap-icons.woff2` grew from 134012 to 170707 bytes after a
- * UTF-8 round-trip) and made every icon render as a tofu box.
+ * Fonts and archives are binary. They used to be listed as text, which
+ * silently corrupted them (`bootstrap-icons.woff2` grew from 134012 to
+ * 170707 bytes after a UTF-8 round-trip) and made every icon render as a
+ * tofu box.
+ *
+ * `.zip` is listed explicitly because the rule sets ship their implants as
+ * ZIP archives (`rulesets/auto-boat/auto-boat.zip`). Those bytes are handed
+ * to `node-stream-zip` at runtime, so a UTF-8 round-trip would break every
+ * `zip-implant` rule.
  */
-const BINARY_EXTENSIONS = new Set(['.woff', '.woff2', '.ttf', '.otf', '.eot']);
+const BINARY_EXTENSIONS = new Set(['.woff', '.woff2', '.ttf', '.otf', '.eot', '.zip', '.gz']);
 
 function parseArgs(argv) {
   const options = {source: DEFAULT_SOURCE, out: DEFAULT_OUTPUT};
@@ -154,6 +174,89 @@ function collect(source) {
   return files;
 }
 
+/** Rule fields that may point at a file shipped next to the rule set. */
+const RULE_ASSET_FIELDS = ['zipImplant', 'injectScript', 'newContentFile'];
+
+/**
+ * The values of a rule that have to be packaged together with its rule set.
+ *
+ * Remote URLs are downloaded at runtime and absolute paths were picked by the
+ * user on the desktop, so neither of them belongs to the bundle. Everything
+ * else is resolved relative to the rule set directory
+ * (`rulesets/<name>/<reference>`).
+ */
+function ruleAssetReferences(rule) {
+  const values = [];
+  for (const field of RULE_ASSET_FIELDS) {
+    if (typeof rule[field] === 'string' && rule[field]) {
+      values.push(rule[field]);
+    }
+  }
+  if (Array.isArray(rule.injectScripts)) {
+    for (const value of rule.injectScripts) {
+      if (typeof value === 'string' && value) {
+        values.push(value);
+      }
+    }
+  }
+  return values.filter(value => !/^https?:/i.test(value) && !path.isAbsolute(value));
+}
+
+/**
+ * Verifies that every file a rule set references is part of the bundle.
+ *
+ * The desktop build reads `rulesets/<name>/<file>` straight from the
+ * application directory, so a missing file only shows up as a rule that
+ * silently never fires. On mobile that directory is the asset manifest: a
+ * file that was not packaged can never be read, therefore the gap is
+ * reported here instead of at runtime.
+ */
+function verifyRulesetAssets(source, files) {
+  const rulesetsRoot = path.join(source, 'rulesets');
+  if (!fs.existsSync(rulesetsRoot)) {
+    return {expected: 0, missing: []};
+  }
+
+  const missing = [];
+  let expected = 0;
+
+  const entries = fs.readdirSync(rulesetsRoot, {withFileTypes: true});
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const rulesPath = path.join(rulesetsRoot, entry.name, `${entry.name}.json`);
+    if (!fs.existsSync(rulesPath)) {
+      continue;
+    }
+
+    let rules;
+    try {
+      rules = JSON.parse(fs.readFileSync(rulesPath, 'utf8'));
+    } catch (error) {
+      missing.push({ruleset: entry.name, rule: '', reference: `${entry.name}.json`, reason: 'invalid JSON'});
+      continue;
+    }
+
+    for (const rule of Array.isArray(rules) ? rules : [rules]) {
+      if (!rule || typeof rule !== 'object') {
+        continue;
+      }
+      for (const reference of ruleAssetReferences(rule)) {
+        expected += 1;
+        const bundledName = path.posix.normalize(
+          `rulesets/${entry.name}/${reference.split('\\').join('/')}`,
+        );
+        if (!files.has(bundledName)) {
+          missing.push({ruleset: entry.name, rule: rule.name || '', reference});
+        }
+      }
+    }
+  }
+
+  return {expected, missing};
+}
+
 function build() {
   const options = parseArgs(process.argv.slice(2));
   if (!fs.existsSync(options.source)) {
@@ -161,6 +264,7 @@ function build() {
   }
 
   const files = collect(options.source);
+  const rulesetAssets = verifyRulesetAssets(options.source, files);
   const manifest = {generatedAt: new Date().toISOString(), files: {}};
   let rawBytes = 0;
   let binaryFiles = 0;
@@ -208,6 +312,20 @@ function build() {
     `[web-assets] ${files.size} files (${binaryFiles} binary), ${formatBytes(rawBytes)} raw -> ${formatBytes(manifestBytes)} manifest\n`,
   );
   process.stdout.write(`[web-assets] written to ${options.out}\n`);
+
+  if (rulesetAssets.expected > 0) {
+    const packaged = rulesetAssets.expected - rulesetAssets.missing.length;
+    process.stdout.write(
+      `[web-assets] rule set assets: ${packaged}/${rulesetAssets.expected} packaged\n`,
+    );
+  }
+  for (const entry of rulesetAssets.missing) {
+    const target = entry.rule ? ` (rule "${entry.rule}")` : '';
+    process.stdout.write(
+      `[web-assets] warning: rule set "${entry.ruleset}" references a file that is not packaged: ` +
+        `${entry.reference}${target}\n`,
+    );
+  }
 }
 
 function formatBytes(bytes) {
