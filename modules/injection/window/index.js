@@ -1,9 +1,15 @@
 const moduleLog = require('../../logging').create('注入窗口');
 const { BrowserWindow } = require('electron');
+const { isMobile } = require('../../app/platform');
 const path = require('path');
 
 module.exports = {
 showProgressWindow() {
+    // 移动端没有独立窗口：多窗口会让 React Native 窗口管理器切换布局并
+    // 重建主窗口的 WebView（页面整页重载），进度统一由 rule-log 推到主窗口。
+    if (isMobile) {
+      return;
+    }
     try {
       if (this.progressWindow && !this.progressWindow.isDestroyed()) {
         this.progressWindow.show();

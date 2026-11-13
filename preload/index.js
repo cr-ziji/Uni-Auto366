@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getScaleFactor: () => ipcRenderer.invoke('get-scale-factor'),
   setGlobalScale: () => ipcRenderer.send('set-global-scale'),
   getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+  getPlatform: () => ipcRenderer.invoke('get-platform'),
 
   // 答案获取相关API
   startAnswerProxy: () => ipcRenderer.send('start-answer-proxy'),

@@ -57,7 +57,8 @@ async initWindowTitlebar() {
       });
     }
     const drag = document.getElementById('titlebar-drag-region');
-    if (drag) {
+    // 移动端没有最大化按钮（renderer/app.js 会按平台删除），双击标题栏也不应再切换最大化
+    if (drag && document.getElementById('titlebar-maximize-btn')) {
       drag.addEventListener('dblclick', async () => {
         try {
           if (window.electronAPI.windowToggleMaximize) {

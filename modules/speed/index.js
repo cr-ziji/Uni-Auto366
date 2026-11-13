@@ -27,6 +27,7 @@ const moduleLog = require('../logging').create('进程加速');
 
 const { spawn } = require('child_process');
 const { readLines } = require('../app/process-text');
+const { isMobile, isWindows, unsupported } = require('../app/platform');
 const { app } = require('electron');
 // Preserve the existing IPC namespace; source ownership follows the business directory.
 const ipcMain = require('../register').forModule('system');
@@ -119,16 +120,26 @@ class SpeedManager {
 
   // 环境自检: 平台 / 文件是否存在 / 路径是否含中文
   _preflight() {
-    if (process.platform !== 'win32') {
-      this._log('仅 Windows 支持进程加速', 'warning');
+    this.unavailableReason = null;
+    if (isMobile) {
+      // 移动端没有 up366.exe 可注入，也没有可执行的注入器
+      this.unavailableReason = unsupported('进程加速');
+      this._log(this.unavailableReason, 'warning');
+      return false;
+    }
+    if (!isWindows) {
+      this.unavailableReason = '仅 Windows 支持进程加速';
+      this._log(this.unavailableReason, 'warning');
       return false;
     }
     if (!fs.existsSync(this.injectorPath)) {
-      this._log('缺少 injector32.exe: ' + this.injectorPath, 'error');
+      this.unavailableReason = '缺少 injector32.exe: ' + this.injectorPath;
+      this._log(this.unavailableReason, 'error');
       return false;
     }
     if (!fs.existsSync(this.dllPath)) {
-      this._log('缺少 speedpatch32.dll: ' + this.dllPath, 'error');
+      this.unavailableReason = '缺少 speedpatch32.dll: ' + this.dllPath;
+      this._log(this.unavailableReason, 'error');
       return false;
     }
     // 含中文路径会导致 LoadLibrary ASCII 回退失败
@@ -325,7 +336,7 @@ class SpeedManager {
     if (this.enabled && this.factor) {
       // 需要加速: 确保注入器在跑, 就绪后会自动 _applyDesired
       if (!this._preflight()) {
-        return { success: false, error: '环境自检未通过(缺少注入器/DLL 或路径含中文)' };
+        return { success: false, error: this.unavailableReason || '环境自检未通过(缺少注入器/DLL 或路径含中文)' };
       }
       const up = this._ensureChild();
       if (up && this.ready) this._applyDesired();

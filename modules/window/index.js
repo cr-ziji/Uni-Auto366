@@ -1,6 +1,7 @@
 const moduleLog = require('../logging').create('窗口');
 const { app, BrowserWindow, screen } = require('electron');
 const ipcMain = require('../register').forModule('window');
+const platformInfo = require('../app/platform');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -142,6 +143,11 @@ class WindowManager {
 
     ipcMain.handle('get-app-version', () => {
       return app.getVersion();
+    });
+
+    // 渲染层据此裁剪桌面专属界面（窗口按钮、进程加速、增强模式入口）。
+    ipcMain.handle('get-platform', () => {
+      return { platform: platformInfo.platform, isMobile: platformInfo.isMobile };
     });
   }
 

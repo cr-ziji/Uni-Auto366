@@ -1,6 +1,7 @@
 const moduleLog = require('../logging').create('TUN');
 const { spawn } = require('child_process');
 const { readLines } = require('../app/process-text');
+const { isMobile, unsupported } = require('../app/platform');
 const { app } = require('electron');
 // Preserve the existing IPC namespace; source ownership follows the business directory.
 const ipcMain = require('../register').forModule('system');
@@ -293,6 +294,12 @@ ${processRules || '  - MATCH,DIRECT'}
 
   // 启动 TUN（启动 mihomo 进程）
   async start() {
+    // 移动端既没有 mihomo/wintun，也不允许创建虚拟网卡：直接拒绝，避免触发资源下载。
+    if (isMobile) {
+      this.safeIpcSend('rule-log', moduleLog.event({ type: 'warning', message: `[TUN] ${unsupported('TUN 增强模式')}` }));
+      return { success: false, message: unsupported('TUN 增强模式') };
+    }
+
     if (this.isRunning) {
       return { success: false, message: 'TUN 模式已在运行中' };
     }
