@@ -16,15 +16,19 @@ class CaptureBody {
     this.file = null;
   }
   append(chunk) {
+    // 原生 HTTP 客户端有时会给出 `Uint8Array`（RN 的 Buffer.subarray()
+    // 返回的就是普通 Uint8Array），统一成 Buffer，后面的 `copy()` /
+    // `Buffer.concat()` 才可用。
+    const payload = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     this.pending = this.pending.then(async () => {
       if (this.references === 0) throw new Error('响应捕获已取消');
       const remaining = this.previewLimit - this.previewSize;
       if (remaining > 0) {
-        const preview = Buffer.from(chunk.subarray(0, remaining));
+        const preview = Buffer.from(payload.subarray(0, remaining));
         this.previewChunks.push(preview); this.previewSize += preview.length;
       }
-      this.size += chunk.length;
-      if (!this.file && this.size <= this.limit) { this.chunks.push(chunk); return; }
+      this.size += payload.length;
+      if (!this.file && this.size <= this.limit) { this.chunks.push(payload); return; }
       if (!this.file) {
         this.directory = await fs.mkdtemp(path.join(os.tmpdir(), 'auto366-capture-'));
         this.file = path.join(this.directory, 'body.bin');
@@ -32,14 +36,15 @@ class CaptureBody {
         for (const buffered of this.chunks) await this.write(buffered);
         this.chunks = [];
       }
-      await this.write(chunk);
+      await this.write(payload);
     });
     return this.pending;
   }
   async write(chunk) {
+    const payload = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     let offset = 0;
-    while (offset < chunk.length) {
-      const { bytesWritten } = await this.handle.write(chunk, offset, chunk.length - offset);
+    while (offset < payload.length) {
+      const { bytesWritten } = await this.handle.write(payload, offset, payload.length - offset);
       if (!bytesWritten) throw new Error('响应临时文件写入失败');
       offset += bytesWritten;
     }

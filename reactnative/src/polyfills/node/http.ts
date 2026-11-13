@@ -2,7 +2,7 @@
  * Node `http` 兼容层（React Native）。
  *
  * 桌面版模块是按 Node 的 `http` API 写的（`http.createServer`、`req.on('data')`、
- * `res.writeHead`、`http.request` ...）。这里用 `react-native-tcp-socket` 复刻这一层，
+ * `res.writeHead`、`http.request` ...）。这里用原生 `Auto366Net` 传输层复刻这一层，
  * 让业务逻辑可以基本照搬桌面原版。
  *
  * 与 Node 的刻意差异：
@@ -15,6 +15,10 @@
  */
 import {Buffer} from 'buffer';
 import {Readable, Writable} from 'stream';
+import {
+  MITM_KEYSTORE_PASSWORD,
+  MITM_KEYSTORE_RESOURCE,
+} from '../../mitm/ca-certificate';
 import {
   HttpClientOptions,
   HttpClientRequest,
@@ -652,7 +656,23 @@ function buildServer(handler?: NodeRequestListener, serverOptions?: any): NodeSe
     const tlsOption = serverOptions.tls;
     const keystore = serverOptions.keystore ?? tlsOption?.keystore;
     if (tlsOption === true || keystore) {
-      innerOptions.tls = {keystore};
+      // 原生层只接受 {resource, password}；字符串按资源名处理。
+      if (typeof keystore === 'string') {
+        innerOptions.tls = {
+          resource: keystore,
+          password: serverOptions.password,
+        };
+      } else if (keystore && keystore.resource) {
+        innerOptions.tls = {
+          resource: keystore.resource,
+          password: keystore.password,
+        };
+      } else {
+        innerOptions.tls = {
+          resource: MITM_KEYSTORE_RESOURCE,
+          password: MITM_KEYSTORE_PASSWORD,
+        };
+      }
     }
   }
 

@@ -1209,7 +1209,9 @@ export class FileHandle implements FileHandleLike {
   ): Promise<{bytesWritten: number; buffer: Buffer}> {
     this.assertOpen();
     const size = length ?? buffer.length - offset;
-    const payload = buffer.subarray(offset, offset + size);
+    // `buffer.subarray()` returns a plain `Uint8Array` in the RN Buffer
+    // implementation, and `Uint8Array` has no `.copy()`. Normalise first.
+    const payload = Buffer.from(buffer.subarray(offset, offset + size));
     const start = position === undefined || position === null ? this.position : position;
     const needed = start + payload.length;
     if (needed > this.content.length) {
@@ -1502,7 +1504,9 @@ export function writeSync(
     throw createError('EBADF', 'write', '', 'bad file descriptor');
   }
   const start = position === null ? descriptor.position : position;
-  const payload = buffer.subarray(offset, offset + length);
+  // `buffer.subarray()` returns a plain `Uint8Array` in the RN Buffer
+  // implementation, and `Uint8Array` has no `.copy()`. Normalise first.
+  const payload = Buffer.from(buffer.subarray(offset, offset + length));
   const needed = start + payload.length;
   if (needed > descriptor.buffer.length) {
     const expanded = Buffer.alloc(needed);
@@ -1530,6 +1534,87 @@ export function closeSync(fd: number): void {
   queueWrite(descriptor.target, () => persistFile(descriptor.target, buffer)).catch(error =>
     reportPersistenceError(descriptor.target, error),
   );
+}
+
+function isFileHandleLike(handle: FileHandleLike | number): handle is FileHandleLike {
+  return typeof handle === 'object' && handle !== null && typeof handle.read === 'function';
+}
+
+/**
+ * Asynchronous `fs.read`. Accepts either a `FileHandle` (what `open()`
+ * resolves to in this polyfill) or a numeric descriptor returned by
+ * `openSync()`, mirroring the Node API used by `fs-extra` consumers.
+ */
+export async function read(
+  handle: FileHandleLike | number,
+  buffer: Buffer,
+  offset: number = 0,
+  length?: number,
+  position: number | null = null,
+  callback?: (error: NodeJS.ErrnoException | null, bytesRead?: number, buffer?: Buffer) => void,
+): Promise<{bytesRead: number; buffer: Buffer}> {
+  try {
+    const result = isFileHandleLike(handle)
+      ? await handle.read(buffer, offset, length, position)
+      : {
+          bytesRead: readSync(handle, buffer, offset, length ?? buffer.length - offset, position),
+          buffer,
+        };
+    callback?.(null, result.bytesRead, result.buffer);
+    return result;
+  } catch (error) {
+    callback?.(error as NodeJS.ErrnoException);
+    throw error;
+  }
+}
+
+/**
+ * Asynchronous `fs.write`. Accepts either a `FileHandle` or a numeric
+ * descriptor, mirroring the Node API used by `fs-extra` consumers.
+ */
+export async function write(
+  handle: FileHandleLike | number,
+  buffer: Buffer | Uint8Array,
+  offset: number = 0,
+  length?: number,
+  position: number | null = null,
+  callback?: (error: NodeJS.ErrnoException | null, bytesWritten?: number, buffer?: Buffer) => void,
+): Promise<{bytesWritten: number; buffer: Buffer}> {
+  try {
+    const payload = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+    const result = isFileHandleLike(handle)
+      ? await handle.write(payload, offset, length, position)
+      : {
+          bytesWritten: writeSync(handle, payload, offset, length ?? payload.length - offset, position),
+          buffer: payload,
+        };
+    callback?.(null, result.bytesWritten, result.buffer);
+    return result;
+  } catch (error) {
+    callback?.(error as NodeJS.ErrnoException);
+    throw error;
+  }
+}
+
+/**
+ * Asynchronous `fs.close`. Accepts either a `FileHandle` or a numeric
+ * descriptor, mirroring the Node API used by `fs-extra` consumers.
+ */
+export async function close(
+  handle: FileHandleLike | number,
+  callback?: (error: NodeJS.ErrnoException | null) => void,
+): Promise<void> {
+  try {
+    if (typeof handle === 'number') {
+      closeSync(handle);
+    } else {
+      await handle.close();
+    }
+    callback?.(null);
+  } catch (error) {
+    callback?.(error as NodeJS.ErrnoException);
+    throw error;
+  }
 }
 
 export function fstatSync(fd: number): FileStats {
@@ -1593,6 +1678,7 @@ export const promises = {
   appendFile,
   chmod,
   chown,
+  close,
   copyFile,
   exists,
   lstat,
@@ -1600,6 +1686,7 @@ export const promises = {
   mkdtemp,
   open,
   opendir,
+  read,
   readFile,
   readdir,
   readFileBuffer,
@@ -1611,6 +1698,7 @@ export const promises = {
   truncate,
   unlink,
   utimes,
+  write,
   writeFile,
   constants,
 };
@@ -1631,6 +1719,7 @@ const fs = {
   chmodSync,
   chown,
   chownSync,
+  close,
   closeSync,
   constants,
   copyFile,
@@ -1657,6 +1746,7 @@ const fs = {
   opendir,
   pathExists,
   promises,
+  read,
   readdir,
   readdirSync,
   readFile,
@@ -1680,6 +1770,7 @@ const fs = {
   unlinkSync,
   utimes,
   utimesSync,
+  write,
   writeFile,
   writeFileSync,
   writeSync,

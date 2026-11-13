@@ -55,9 +55,14 @@ class RuleEngine {
   }
 
   _isFileInfoRequest(url) {
-    return url.includes('/fileinfo/') ||
-      (url.includes('/files/') && !url.endsWith('.zip')) ||
-      (url.includes('.json') && (url.includes('/fileinfo/') || url.includes('/files/')));
+    // 只看 pathname：带签名参数的下载地址（xxx.zip?signature=...）不能因为
+    // endsWith('.zip') 为 false 就被当成 fileinfo 请求，否则会把二进制 ZIP
+    // 当成 JSON 文本改写，客户端收到的包直接损坏、只能重下。
+    let pathname = url;
+    try { pathname = new URL(url).pathname; } catch (_) { /* 相对路径等非法 URL 按原样判断 */ }
+    return pathname.includes('/fileinfo/') ||
+      (pathname.includes('/files/') && !pathname.endsWith('.zip')) ||
+      (pathname.endsWith('.json') && (pathname.includes('/fileinfo/') || pathname.includes('/files/')));
   }
 
   _isFileDownloadRequest(url) {

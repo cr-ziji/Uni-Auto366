@@ -1,14 +1,14 @@
 /**
  * Node `https` 兼容层（React Native）。
  *
- * TLS 由 `react-native-tcp-socket` 的原生实现提供，使用系统信任库：
- *  - 客户端：`TcpSocket.connectTLS({host, port, ca, key, cert})`；
- *  - 服务端：`TcpSocket.createTLSServer({keystore})`，`keystore` 必须是打包进
- *    assets 的原生 keystore 资源（RN 的 TLS 服务端只支持原生 keystore，
- *    不支持 PEM），没有它就无法启动 HTTPS 服务端。
+ * TLS 由原生 `Auto366Net` 提供，使用系统信任库：
+ *  - 客户端：原生 `SSLContext` / Network.framework 直接握手；
+ *  - 服务端：原生层从 APK `res/raw` 或 iOS App bundle 读取 PKCS#12，
+ *    证书不经过 JS，也不需要 `patch-tcp-socket`。
  *
- * 桌面版把自签根证书装进系统证书库，从而能在中间人代理里解密 HTTPS。
- * 移动端没有这个能力（见 E2RN_TODOS.md），因此代理对 HTTPS 只能做 CONNECT 隧道。
+ * HTTPS 中间人由 `modules/proxy` 使用的 `http-mitm-proxy` 替身完成：
+ * CONNECT 在原生层终止 TLS，再以 `isSSL = true` 的普通 HTTP 连接回调给
+ * polyfill，接口与桌面版一致。
  *
  * 接口与 `http` 完全一致，只是默认端口变成 443、并且默认走 TLS。
  */
@@ -36,8 +36,10 @@ export type {
 } from './http';
 
 export interface HttpsServerOptions {
-  /** 原生 keystore 资源（`require('./keystore.json')` 之类）。 */
-  keystore?: any;
+  /** 原生 PKCS#12 资源名（Android `res/raw` / iOS bundle 文件名，不带扩展名）。 */
+  keystore?: string | {resource: string; password?: string};
+  /** PKCS#12 密码（`keystore` 为字符串时使用）。 */
+  password?: string;
   /** 与 `http.createServer` 的 `requestTimeout` / `keepAliveTimeout` 一致。 */
   requestTimeout?: number;
   keepAliveTimeout?: number;

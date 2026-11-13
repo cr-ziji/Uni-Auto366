@@ -4,7 +4,8 @@
 以及移动端（`reactnative/`）的实现状态。
 
 基线：React Native 0.88.0（New Architecture only）· React 19.3.1 · Metro 0.87.1。
-`react-native-fs` / `react-native-tcp-socket` 为旧式 NativeModule，
+网络层由自研原生模块 `Auto366Net`（Android Kotlin / iOS Swift）提供，
+不使用 `react-native-tcp-socket`。`react-native-fs` 仍是旧式 NativeModule，
 在新架构下通过 TurboModule interop 运行（Android 真机已验证；iOS 未验证）。
 
 图例：✅ 完全等价 · ⚠️ 有降级或限制 · ❌ 不支持
@@ -25,8 +26,8 @@
 | Node 全局对象 | `Buffer` `setImmediate` `TextDecoder` `global` | `src/polyfills/node/globals.ts`（`installNodeGlobals()`） | ✅ | 桌面端不 `require` 直接用，必须在加载 `main.js` 前装到 `globalThis` |
 | `stream` / `stream/promises` | `pipeline` | `stream-browserify` + `src/polyfills/node/stream-promises.ts` | ✅ | |
 | `string_decoder` | `StringDecoder` | npm `string_decoder` | ✅ | |
-| `http` / `https` | `createServer` `request` `get`，绝对形式请求、`for await (const chunk of req)`、`res.writeHead/write/end` | `src/polyfills/node/http.ts` + `src/runtime/http/*`（react-native-tcp-socket） | ⚠️ | 无 keep-alive 复用（`Connection: close`）；服务端支持 `options.tls`（`createTLSServer` + PKCS#12 keystore），客户端 `options.tls` 走 `connectTLS` 直连上游 |
-| `net` | 未直接使用 | `src/polyfills/node/net.ts` | ⚠️ | 仅保留占位 API |
+| `http` / `https` | `createServer` `request` `get`，绝对形式请求、`for await (const chunk of req)`、`res.writeHead/write/end` | `src/polyfills/node/http.ts` + `src/runtime/http/*`（原生 `Auto366Net`） | ⚠️ | 无 keep-alive 复用（`Connection: close`）；服务端支持 `options.tls`（原生 `SSLServerSocket` / Network.framework + PKCS#12），客户端 `options.tls` 走原生 TLS 直连上游 |
+| `net` | 未直接使用 | `src/polyfills/node/net.ts`（原生 `Auto366Net` 之上） | ⚠️ | 仅保留代理需要的 API；`destroy()` 不接受错误参数 |
 | `child_process` | `fork`（TTS worker、答案学习）、`exec`/`spawn`（加速、证书导入、TUN） | `src/polyfills/node/child_process.ts`（惰性） | ❌ | 无法派生进程；相关功能已在 TODO 中登记 |
 | `process` | `cwd()` `on('uncaughtException'/'unhandledRejection')` `env` `platform` | `src/polyfills/node/process.ts` + `installProcessGlobals()` | ✅ | `cwd()` → 数据根 |
 | `uuid` | `v4()` | `src/polyfills/node/uuid.ts` | ✅ | |
@@ -52,7 +53,7 @@
 
 | 包 | 桌面端用途 | 移动端实现 | 状态 |
 | --- | --- | --- | --- |
-| `http-mitm-proxy` | 代理核心：明文全量拦截 + HTTPS MITM | `src/stubs/http-mitm-proxy.ts` | ✅ | 明文与 HTTPS 均解密（本机 `createTLSServer` 终止 TLS，复用同一套钩子链，`ctx.isSSL = true`）；客户端需手动信任导出的 CA；keystore 不可用时退回 CONNECT 盲隧道 |
+| `http-mitm-proxy` | 代理核心：明文全量拦截 + HTTPS MITM | `src/stubs/http-mitm-proxy.ts` | ✅ | 明文与 HTTPS 均解密（原生层终止 TLS，复用同一套钩子链，`ctx.isSSL = true`）；客户端需手动信任导出的 CA；keystore 不可用时退回 CONNECT 盲隧道 |
 | `electron-updater` | GitHub Release 自动更新 | `src/stubs/electron-updater.ts` | ⚠️ 始终报告“无可用更新” |
 | `posthog-node` | 使用统计上报 | `src/stubs/posthog-node.ts` | ⚠️ 仅记录日志，不上报 |
 | `@supabase/supabase-js` | 答案文件上传分享 | `src/stubs/supabase.ts` | ⚠️ 仅实现 storage 接口（上传/下载/公开 URL） |

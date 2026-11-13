@@ -1,33 +1,31 @@
 /**
  * `http-mitm-proxy` 的移动端替身。
  *
- * 桌面版用 `http-mitm-proxy` 做中间人代理：它自己签发证书、装进系统信任库，
- * 因此能解密 HTTPS 流量并改写正文。移动端做不到这一点：
+ * 对外接口（`Proxy` / `ctx.onRequest` / `ctx.onResponseData` ...）与桌面版
+ * 保持一致，网络层则完全交给原生模块 `Auto366Net`：
  *
- *  - iOS / Android 不允许 App 往系统证书库塞自签根证书；
- *  - `react-native-tcp-socket` 的 TLS 服务端只认原生 keystore 资产，
- *    没有 PEM 私钥这条路；
- *  - 桌面版那套「装根证书」的流程本身也超出本次移植范围（见 E2RN_TODOS.md）。
+ *  - Android：Kotlin `ServerSocket` + `SSLContext`，直接从 APK 的
+ *    `res/raw/auto366_mitm.p12` 读证书；
+ *  - iOS：Network.framework `NWListener` + `SecPKCS12Import`，证书随 App
+ *    bundle 一起打包；
+ *  - CONNECT 的密文隧道、TLS 终止、上游 TLS 握手都在原生层完成，JS 只看到
+ *    解密后的 HTTP 字节，不再经过「本机 loopback + JS 双向转发」。
  *
- * 所以这里实现的是**明文 HTTP 拦截 + HTTPS 中间人**：
- *
- *  - 明文 HTTP：完整实现 `onRequest` / `onRequestData` / `onRequestEnd` /
- *    `onResponse` / `onResponseData` / `onResponseEnd` 这套钩子，语义对齐
- *    `http-mitm-proxy` 的 `ProxyFinalRequestFilter` / `ProxyFinalResponseFilter`；
- *  - HTTPS（`CONNECT`）：回 `200 Connection Established` 之后，把客户端连接
- *    接到本机的原生 TLS 服务端上（`react-native-tcp-socket` 的
- *    `createTLSServer`，证书来自 APK 里的 PKCS#12 keystore），由它完成 TLS
- *    握手，再走和明文完全相同的钩子链，`ctx.isSSL = true`；上游用 TLS 重连。
+ * 因此：
+ *  - 明文 HTTP 与 HTTPS 共用同一套 `onRequest` / `onRequestData` /
+ *    `onRequestEnd` / `onResponse` / `onResponseData` / `onResponseEnd` 钩子；
+ *  - `ctx.isSSL` 由原生连接标记；
+ *  - ZIP / 大文件不会因为两段 socket 转发和 JS 背压被截断；
+ *  - 不再需要 `react-native-tcp-socket` 的 keystore / SNI 补丁。
  *
  * 前提：客户端必须信任 `certs/auto366-ca.pem`（见
  * `scripts/generate-mitm-cert.js`），否则握手会被客户端拒绝。
  *
- * 没有 keystore 时（`tlsKeystore: false`，或原生 TLS 服务端起不来）自动退回
+ * 没有证书时（`tlsKeystore: false`，或原生 TLS 服务端起不来）自动退回
  * 盲隧道：只做 TCP 转发，看不到明文。
  */
 import {Buffer} from 'buffer';
 import {EventEmitter} from 'events';
-import TcpSocket from 'react-native-tcp-socket';
 import {
   MITM_KEYSTORE_PASSWORD,
   MITM_KEYSTORE_RESOURCE,
@@ -59,8 +57,9 @@ export interface ProxyOptions {
   /** 去掉上游请求的 content-length，强制 chunked。 */
   forceChunkedRequest?: boolean;
   /**
-   * HTTPS 中间人用的原生 PKCS#12 keystore（`res/raw` 资源名，空密码）。
+   * HTTPS 中间人用的原生 PKCS#12 keystore。
    *
+   * Android 是 `res/raw` 资源名，iOS 是 bundle 里的 p12 文件名（不带扩展名）。
    * 传 `false` 可以关闭中间人能力（CONNECT 退回盲隧道），主要给没有打包
    * 证书的调试构建用。默认 `'auto366_mitm'`。
    */
@@ -121,6 +120,13 @@ export interface ProxyContext {
 
   /** 响应正文可能被改写 → 上游响应要改用 chunked。 */
   responseContentPotentiallyModified: boolean;
+  /**
+   * 已知的完整响应正文长度（ZIP 注入等整包替换时由拦截器设置）。
+   *
+   * 设置后代理会回 `Content-Length` 而不是 chunked：Android 端的下载器
+   * 依赖它判断下载是否完整，chunked 响应在慢网络上更容易被当成失败重下。
+   */
+  knownResponseBodyLength?: number | null;
 
   onRequest(fn: OnRequestParams): ProxyContext;
   onError(fn: OnErrorParams): ProxyContext;
@@ -144,6 +150,8 @@ export class ProxyToClientResponse extends EventEmitter {
   headersSent = false;
   finished = false;
   writableEnded = false;
+  /** 标记：这是原生传输层的响应（`write()` 返回 false 表示连接不可写）。 */
+  readonly nativeTransport = true;
   private closed = false;
 
   constructor(private readonly raw: RawHttpResponse) {
@@ -202,8 +210,7 @@ export class ProxyToClientResponse extends EventEmitter {
     if (!this.headersSent) {
       this.writeHead(this.statusCode);
     }
-    this.raw.write(chunk);
-    return true;
+    return this.raw.write(chunk) !== false;
   }
 
   end(chunk?: any): void {
@@ -509,10 +516,6 @@ export class Proxy {
   responseContentPotentiallyModified = false;
 
   private server: HttpServer | null = null;
-  /** 本机 TLS 服务端，用来给 CONNECT 的客户端做 TLS 终止。 */
-  private tlsServer: HttpServer | null = null;
-  /** 上面那个服务端的端口（0 = 不可用，CONNECT 退回盲隧道）。 */
-  private tlsPort = 0;
   private readonly onErrorHandlers: OnErrorParams[] = [];
   private readonly onRequestHandlers: OnRequestParams[] = [];
   private readonly onRequestHeadersHandlers: OnRequestParams[] = [];
@@ -523,6 +526,16 @@ export class Proxy {
   private readonly onResponseDataHandlers: OnRequestDataParams[] = [];
   private readonly onResponseEndHandlers: OnRequestParams[] = [];
   private readonly onConnectHandlers: OnConnectParams[] = [];
+
+  /**
+   * 每个 keep-alive 连接上尚未完成的请求。
+   *
+   * 之前是每个请求都往同一个 socket 上挂一个 `close` 监听器，长连接处理到
+   * 第 11 个请求时就会触发 MaxListenersExceededWarning，而且监听器闭包会
+   * 一直持有旧请求。现在每个 socket 只挂一个 `close`，请求结束后从集合里移除。
+   */
+  private readonly activeSocketRequests = new WeakMap<any, Set<ClientToProxyRequest>>();
+  private readonly monitoredSockets = new WeakSet<any>();
 
   constructor(options?: ProxyOptions) {
     this.options = options || {};
@@ -540,70 +553,39 @@ export class Proxy {
     this.keepAlive = !!this.options.keepAlive;
     this.forceSNI = !!this.options.forceSNI;
 
-    const server = new HttpServer(
-      (request, response) => this.handleRequest(request, response),
-      {
-        requestTimeout: this.timeout,
-      },
-    );
-    this.server = server;
-
-    const start = async () => {
-      await server.listen(this.httpPort, this.httpHost || '0.0.0.0');
-      const info = server.address();
-      if (info) {
-        this.httpPort = info.port;
-      }
-      // 原生 TLS 服务端起不来不影响明文代理：CONNECT 会退回盲隧道。
-      await this.startTlsServer();
-    };
-
-    start().then(
-      () => callback?.(),
-      (error: Error) => callback?.(error),
-    );
-    return this;
-  }
-
-  /**
-   * 启动本机 TLS 服务端（HTTPS 中间人的服务端那一半）。
-   *
-   * `react-native-tcp-socket` 只能从 APK 里的 PKCS#12 keystore 建 TLS 服务端，
-   * 证书和私钥都由原生 `SSLContext` 持有，JS 侧只拿到明文字节流。
-   */
-  private async startTlsServer(): Promise<void> {
     const keystore =
       this.options.tlsKeystore === undefined
         ? DEFAULT_KEYSTORE
         : this.options.tlsKeystore;
-    if (!keystore) {
-      return;
-    }
-    const tlsServer = new HttpServer(
-      (request, response) => this.handleHttp(request, response, true),
-      // `TLSServer.setSecureContext` runs the value through
-      // `Image.resolveAssetSource(...).uri`; an object is returned unchanged,
-      // so `{uri: 'auto366_mitm'}` resolves to the `res/raw` resource name
-      // without having to `require()` the keystore (which would make Metro
-      // bundle a second copy of it).
-      {tls: {keystore: {uri: keystore}, password: MITM_KEYSTORE_PASSWORD}},
+    const server = new HttpServer(
+      (request, response) => this.handleRequest(request, response),
+      {
+        requestTimeout: this.timeout,
+        // 原生服务端会在监听普通端口的同时，启动一个只监听 127.0.0.1 的
+        // TLS 服务端；证书由原生代码直接读取，JS 不接触私钥。
+        tls: keystore
+          ? {resource: keystore, password: MITM_KEYSTORE_PASSWORD}
+          : undefined,
+      },
     );
-    try {
-      await tlsServer.listen(0, '127.0.0.1');
-      const info = tlsServer.address();
-      if (!info || !info.port) {
-        throw new Error('TLS 服务端没有拿到端口');
-      }
-      this.tlsServer = tlsServer;
-      this.tlsPort = info.port;
-      console.log(`[http-mitm-proxy] HTTPS 中间人已就绪 (127.0.0.1:${info.port})`);
-    } catch (error) {
-      this.tlsPort = 0;
-      console.warn(
-        '[http-mitm-proxy] HTTPS 中间人不可用，CONNECT 将退回盲隧道:',
-        error,
-      );
-    }
+    this.server = server;
+
+    server
+      .listen(this.httpPort, this.httpHost || '0.0.0.0')
+      .then(() => {
+        const info = server.address();
+        if (info) {
+          this.httpPort = info.port;
+        }
+        if (server.hasTls) {
+          console.log('[http-mitm-proxy] 原生 HTTPS 中间人已就绪');
+        } else {
+          console.warn('[http-mitm-proxy] HTTPS 中间人不可用，CONNECT 将退回盲隧道');
+        }
+        callback?.();
+      })
+      .catch((error: Error) => callback?.(error));
+    return this;
   }
 
   /** 停止监听。 */
@@ -611,10 +593,6 @@ export class Proxy {
     const server = this.server;
     this.server = null;
     server?.close();
-    const tlsServer = this.tlsServer;
-    this.tlsServer = null;
-    this.tlsPort = 0;
-    tlsServer?.close();
     return this;
   }
 
@@ -704,20 +682,29 @@ export class Proxy {
     return this;
   }
 
-  /** 证书相关回调：移动端没有中间人能力，直接回错误。 */
+  /** 证书相关回调：移动端证书固定打包，不支持按域名动态签发。 */
   onCertificateRequired(hostname: string, callback: any): void {
-    callback(new Error('移动端不支持 HTTPS 中间人代理（缺少证书签发能力）'));
+    callback(
+      new Error(
+        `移动端使用内置证书，无法为 ${hostname} 动态签发（请把域名加入 scripts/generate-mitm-cert.js 的 SAN 列表）`,
+      ),
+    );
   }
 
   onCertificateMissing(ctx: any, files: any, callback: any): void {
-    callback(new Error('移动端不支持 HTTPS 中间人代理（缺少证书签发能力）'));
+    callback(
+      new Error(
+        '移动端使用内置证书，无法动态签发；请把域名加入 scripts/generate-mitm-cert.js 的 SAN 列表后重新打包',
+      ),
+    );
   }
 
   /**
    * 处理一条进来的连接。
    *
-   * `CONNECT` 走 HTTPS 中间人（没有 TLS 服务端时退回盲隧道），其它方法按普通
-   * HTTP 代理处理。
+   * `CONNECT` 走 HTTPS 中间人（没有原生 TLS 服务端时退回盲隧道），其它方法按
+   * 普通 HTTP 代理处理。TLS 终止后原生层会以 `isSSL = true` 的新连接回调
+   * 回来，因此明文与 HTTPS 复用完全相同的 `handleHttp`。
    */
   private handleRequest(
     rawRequest: RawHttpRequest,
@@ -727,12 +714,15 @@ export class Proxy {
       this.handleConnect(rawRequest, rawResponse);
       return;
     }
-    this.handleHttp(rawRequest, rawResponse, false);
+    this.handleHttp(rawRequest, rawResponse, !!rawRequest.isSSL);
   }
 
   /**
-   * CONNECT：回 200 之后把连接交给本机 TLS 服务端（中间人）或直接转发
-   * （盲隧道）。
+   * CONNECT：回 200 之后把整条连接交给原生层。
+   *
+   * 原生层要么把密文接到本机 TLS 服务端（中间人），要么直接连目标主机
+   * （盲隧道）。两种方式都不再经过 JS，TLS ClientHello 不会在事件队列里
+   * 丢失，ZIP 等大流量也不会被 JS 背压截断。
    */
   private handleConnect(
     rawRequest: RawHttpRequest,
@@ -742,6 +732,16 @@ export class Proxy {
     const target = String(rawRequest.url || '');
     const parsed = parseHost(target, 443);
     const rest = rawRequest.rest;
+
+    // 从现在开始，JS 层暂时缓存原生 `data` 事件；同时让原生读循环先暂停。
+    // `socket.tunnel()` 会把 JS 缓存的字节并入 `rest`，原生排队中的字节由
+    // 原生层回放，避免 ClientHello 在 JS 事件队列里被丢掉。
+    try {
+      socket?.holdData?.();
+      socket?.suspend?.();
+    } catch {
+      // 忽略
+    }
 
     const fail = (error: Error) => {
       this.reportError(null, error, 'CONNECT_ERROR');
@@ -763,6 +763,10 @@ export class Proxy {
       fail(new Error(`无法解析 CONNECT 目标: ${target}`));
       return;
     }
+    if (!socket || typeof socket.tunnel !== 'function') {
+      fail(new Error('原生传输层不可用，无法建立 CONNECT 隧道'));
+      return;
+    }
 
     // 客户端要等这个 200 才会开始 TLS 握手。
     try {
@@ -771,138 +775,23 @@ export class Proxy {
       // 忽略
     }
 
-    if (this.tlsPort) {
-      this.pipeToTlsServer(socket, rest, target);
-      return;
+    const useTls = !!this.server?.hasTls;
+    if (useTls) {
+      console.log(`[http-mitm-proxy] CONNECT ${target} → 原生 TLS 中间人`);
+    } else {
+      console.warn(`[http-mitm-proxy] CONNECT ${target} → 盲隧道（没有原生 TLS）`);
     }
-    this.pipeBlindTunnel(socket, rest, parsed);
-  }
 
-  /**
-   * 把客户端连接接到本机 TLS 服务端。
-   *
-   * 服务端在另一条 socket 上完成 TLS 握手，因此这里只是双向转发密文；
-   * 解密后的 HTTP 由 `handleHttp(..., isSSL = true)` 处理。
-   */
-  private pipeToTlsServer(socket: any, rest: Buffer | undefined, target: string): void {
-    try {
-      this.bridge(socket, {host: '127.0.0.1', port: this.tlsPort}, rest);
-    } catch (error) {
-      this.reportError(null, error as Error, 'CONNECT_TLS_ERROR');
-      try {
-        socket.destroy?.();
-      } catch {
-        // 忽略
-      }
-      return;
-    }
-    console.log(`[http-mitm-proxy] CONNECT ${target} → 本机 TLS 中间人`);
-  }
-
-  /** CONNECT：盲隧道，代理看不到 TLS 明文。 */
-  private pipeBlindTunnel(
-    socket: any,
-    rest: Buffer | undefined,
-    parsed: {host: string; port: number},
-  ): void {
-    try {
-      this.bridge(socket, parsed, rest);
-    } catch (error) {
-      this.reportError(null, error as Error, 'CONNECT_ERROR');
-      try {
-        socket.destroy?.();
-      } catch {
-        // 忽略
-      }
-    }
-  }
-
-  /**
-   * 双向转发两条 TCP 连接，`rest`（CONNECT 首部之后同一批到达的字节）先写给
-   * 目标端。
-   *
-   * 客户端拿到 `200 Connection Established` 后**立刻**开始 TLS 握手，握手包
-   * 可能比 `TcpSocket.connect` 的 `connect` 回调更早到达。因此这里先挂上
-   * `data` 监听并缓冲，等目标连接建立后再回放，避免丢包导致握手卡死。
-   */
-  private bridge(
-    client: any,
-    target: {host: string; port: number},
-    rest: Buffer | undefined,
-  ): void {
-    const pending: any[] = [];
-    let upstream: any = null;
-    /** `TcpSocket.connect()` 返回的对象立刻可用，但连接建立前 `write()` 会抛错。 */
-    let ready = false;
-    let closed = false;
-
-    const teardown = () => {
-      if (closed) {
-        return;
-      }
-      closed = true;
-      try {
-        upstream?.destroy?.();
-      } catch {
-        // 忽略
-      }
-      try {
-        client.destroy?.();
-      } catch {
-        // 忽略
-      }
-    };
-
-    client.on('data', (data: any) => {
-      if (closed) {
-        return;
-      }
-      if (!ready) {
-        pending.push(data);
-        return;
-      }
-      try {
-        upstream.write(data);
-      } catch {
-        teardown();
-      }
-    });
-    client.on('close', teardown);
-    client.on('error', teardown);
-
-    try {
-      upstream = TcpSocket.connect({host: target.host, port: target.port}, () => {
-        if (closed) {
-          return;
-        }
-        ready = true;
+    socket
+      .tunnel({host: parsed.host, port: parsed.port, rest, useTls})
+      .catch((error: Error) => {
+        this.reportError(null, error, 'CONNECT_ERROR');
         try {
-          if (rest && rest.length) {
-            upstream.write(rest);
-          }
-          for (const chunk of pending) {
-            upstream.write(chunk);
-          }
+          socket.destroy?.();
         } catch {
-          teardown();
-          return;
+          // 忽略
         }
-        pending.length = 0;
       });
-    } catch (error) {
-      teardown();
-      throw error;
-    }
-
-    upstream.on('data', (data: any) => {
-      try {
-        client.write(data);
-      } catch {
-        teardown();
-      }
-    });
-    upstream.on('close', teardown);
-    upstream.on('error', teardown);
   }
 
   /** 明文 HTTP / 中间人后的 HTTPS：完整实现 http-mitm-proxy 的钩子语义。 */
@@ -916,14 +805,39 @@ export class Proxy {
     const ctx = this.createContext(clientRequest, clientResponse);
     ctx.isSSL = isSSL;
 
-    // 客户端断开时通知钩子（桌面代码用它释放抓包文件）
+    // 客户端断开时通知钩子（桌面代码用它释放抓包文件）。
+    // 同一个 keep-alive socket 会被多个请求复用，因此 close 监听器必须
+    // 按连接去重；请求正常结束后再从活动集合里移除。
     const socket = rawRequest.socket;
-    try {
-      socket?.on?.('close', () => {
-        clientRequest.emit('aborted');
+    if (socket) {
+      let active = this.activeSocketRequests.get(socket);
+      if (!active) {
+        active = new Set();
+        this.activeSocketRequests.set(socket, active);
+      }
+      active.add(clientRequest);
+
+      clientResponse.once('close', () => {
+        active?.delete(clientRequest);
+        if (active && active.size === 0) {
+          this.activeSocketRequests.delete(socket);
+        }
       });
-    } catch {
-      // 忽略
+
+      if (!this.monitoredSockets.has(socket)) {
+        this.monitoredSockets.add(socket);
+        socket.once('close', () => {
+          this.monitoredSockets.delete(socket);
+          const pending = this.activeSocketRequests.get(socket);
+          this.activeSocketRequests.delete(socket);
+          if (!pending) {
+            return;
+          }
+          for (const request of pending) {
+            request.emit('aborted');
+          }
+        });
+      }
     }
 
     this.pipeRequest(ctx, clientRequest, rawRequest).catch((error: Error) => {
@@ -953,6 +867,7 @@ export class Proxy {
       onResponseDataHandlers: [],
       onResponseEndHandlers: [],
       responseContentPotentiallyModified: false,
+      knownResponseBodyLength: undefined,
       onRequest(fn) {
         ctx.onRequestHandlers.push(fn);
         return ctx;
@@ -1209,6 +1124,18 @@ export class Proxy {
     ) {
       headers['transfer-encoding'] = 'chunked';
       delete headers['content-length'];
+    }
+    // 整包替换（ZIP 注入）时长度是确定的：回 Content-Length，客户端才能
+    // 判断下载是否完整、能不能续传；chunked 会让部分安卓下载器反复重下。
+    const knownLength = Number(ctx.knownResponseBodyLength);
+    if (
+      ctx.knownResponseBodyLength !== undefined &&
+      ctx.knownResponseBodyLength !== null &&
+      Number.isFinite(knownLength) &&
+      knownLength >= 0
+    ) {
+      headers['content-length'] = String(knownLength);
+      delete headers['transfer-encoding'];
     }
 
     try {

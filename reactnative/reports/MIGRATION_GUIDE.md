@@ -31,7 +31,7 @@
 | TypeScript | 6.0.3（`@react-native/typescript-config` 0.88.0） |
 | Jest | 29.7.0（`@react-native/jest-preset` 0.88.0） |
 | ESLint / Prettier | 8.57.1 / 3.9.10 |
-| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-tcp-socket` 6.4.3、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1 |
+| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1；网络层为自研原生模块 `Auto366Net` |
 | Android | Gradle 9.4.1、AGP（`com.android.tools.build:gradle`）、Kotlin 2.2.0、compileSdk 37、targetSdk 36、minSdk 24、NDK 27.1.12297006 |
 | iOS | Swift `AppDelegate` + `SceneDelegate`（`RCTDefaultReactNativeFactoryDelegate`）、`RCTNewArchEnabled=true` |
 
@@ -45,9 +45,10 @@
   TS 6 弃用 `baseUrl` → 删除未使用的 `paths` 并加 `ignoreDeprecations`。
 - Jest preset 由 `react-native` 改为 `@react-native/jest-preset`（0.88 已移除 `react-native/jest-preset.js`）。
 - 新增 `@types/node`（polyfill 代码依赖 `Buffer`/`stream`/`NodeJS` 等 Node 全局类型）。
-- **New Architecture**：RN 0.88 只支持新架构；`react-native-fs` / `react-native-tcp-socket`
-  仍是旧式 NativeModule，依赖 RN 的 **TurboModule interop 层**运行
-  （Android 真机已验证；iOS 未验证）。
+- **New Architecture**：RN 0.88 只支持新架构；`react-native-fs` 仍是旧式
+  NativeModule，依赖 RN 的 **TurboModule interop 层**运行（Android 真机已验证；
+  iOS 未验证）。网络层已改为自研的 `Auto366Net`（Kotlin / Swift），不再依赖
+  `react-native-tcp-socket`。
 
 > ⚠️ **Metro 缓存陷阱**：Metro 的 transform 缓存 key **不包含** `babel.config.js` 与本目录的自定义
 > Babel 插件。修改 `babel.config.js` / `babel-plugin-e2rn-dirname.js` 后必须
@@ -94,9 +95,10 @@ reactnative/
 │   ├── web-assets/             # 内嵌 Web 资源（assets.json）+ 只读虚拟 FS
 │   └── types/globals.d.ts
 ├── scripts/                    # build-web-assets / generate-mitm-cert /
-│                               # patch-tcp-socket / mitm-e2e-test / cdp-eval
+│                               # mitm-e2e-test / cdp-eval
 ├── certs/                      # CA 与叶子证书（openssl 生成，含私钥，勿外传）
 ├── android/app/src/main/res/raw/auto366_mitm.p12  # 打进 APK 的服务端 keystore
+├── ios/Auto366/auto366_mitm.p12                   # 打进 iOS App bundle 的同一份 keystore
 ├── __tests__/                  # polyfill 单元测试
 └── reports/                    # 本目录
 ```
@@ -207,8 +209,9 @@ shim 在合成事件时把 `event.senderFrame.url` 置为：
 
 ### 3.7 HTTPS 中间人（MITM）
 
-桌面端 `http-mitm-proxy` 自带 CA 生成与证书签发；移动端用
-`react-native-tcp-socket` 的原生 TLS 服务端复刻同一条链路。
+桌面端 `http-mitm-proxy` 自带 CA 生成与证书签发；移动端用自研原生模块
+`Auto366Net`（Android Kotlin `SSLContext` + `SSLServerSocket`，iOS
+Network.framework）复刻同一条链路。
 
 **证书**（`npm run certs` → `scripts/generate-mitm-cert.js`，需要 `openssl`）：
 
@@ -217,6 +220,7 @@ shim 在合成事件时把 `event.senderFrame.url` 置为：
 | `certs/auto366-ca.key` / `.pem` | 根证书（CA），**私钥不外发** |
 | `certs/auto366-mitm.key` / `.pem` | 叶子证书，SAN 覆盖 `*.up366.cn` / `*.up366.com` / `*.cyril.zone` 等 |
 | `android/app/src/main/res/raw/auto366_mitm.p12` | 叶子证书 + 私钥 + 链，打进 APK，密码 `auto366-mitm` |
+| `ios/Auto366/auto366_mitm.p12` | 同一份 keystore，作为 iOS App bundle 资源 |
 | `src/mitm/ca-certificate.ts` | CA PEM 与 keystore 常量（生成物） |
 
 CA 只生成一次（重跑保留已有 CA，`--force` 才轮换），避免已安装证书的手机失效。
@@ -226,51 +230,50 @@ CA 只生成一次（重跑保留已有 CA，`--force` 才轮换），避免已�
 ```
 客户端 --CONNECT host:443--> 代理 (5291)
                               ├─ 回 200 Connection Established
-                              └─ 把密文经本机 loopback 转发给
-                                 createTLSServer(keystore)  <-- TLS 在此终止
-                                        ↓ 得到明文 HTTP
-                                 handleHttp(..., isSSL = true)
+                              └─ JS 调用 socket.tunnel({useTls: true})
+                                        ↓ 原生层把整条连接桥接到
+                                 SSLServerSocket / NWListener (loopback)
+                                        ↓ TLS 在此终止
+                                 以 isSSL = true 回调 handleHttp
                                         ↓ 同一套钩子链
                                  onRequest / onRequestData / onRequestEnd
                                         ↓
-                                 HttpClientRequest(tls: true) --> 真实上游
+                                 原生 TLS 客户端 --> 真实上游
                                         ↓
                                  onResponse / onResponseData / onResponseEnd
 ```
 
 - 明文与 HTTPS 走**同一个** `pipeRequest` / `handleResponseHead`，所以规则匹配、
   抓包、正文改写的行为一致，只是 `ctx.isSSL` 不同；
+- CONNECT 首部之后紧跟的字节（TLS ClientHello）由原生层缓存并回放，不会在 JS
+  事件队列里丢失；
 - keystore 缺失 / TLS 服务端起不来时自动退回 CONNECT 盲隧道（只转发密文），
   代理整体仍可用；
 - 客户端必须信任导出的 CA：`modules/proxy/cert.js` 被
   `src/shims/proxy-cert.ts` 替换，把 CA 写到
   `<documents>/.Auto366/Auto366-MITM-CA.pem` 并提示手动安装。
 
-**`react-native-tcp-socket` 补丁**（`scripts/patch-tcp-socket.js`，`postinstall` 幂等执行）：
+**原生传输层实现**：
 
-- **keystore 密码**：`SSLCertificateHelper.createServerSocketFactory()` 原本把
-  PKCS#12 密码写死成 `"".toCharArray()`，Android 的 BouncyCastle **打不开空密码
-  keystore**（加密的报 `password empty`，未加密的报
-  `OpenSSLRSAPrivateCrtKey cannot be cast to PKCS12BagAttributeCarrier`）。
-  补丁让 `createServerSocketFactory(context, uri, char[] password)` 接收密码，
-  `TcpSocketServer` 从 `tlsOptions.password` 读取；因此 `createTLSServer` 的
-  options 必须传 `{keystore: {uri: 'auto366_mitm'}, password}`，
-  `keystore` 必须是对象——库内部会调 `Image.resolveAssetSource()`。
-- **SNI**：原生 TLS 客户端用 peer **IP** 建 socket，平台默认**不发 SNI**，
-  Cloudflare / Supabase 这类按域名路由的服务端会直接 `handshake_failure` / RST。
-  补丁把 `servername` 选项转成 `SSLParameters.setServerNames()`，
-  `src/runtime/http/client.ts` 在 `connectTLS()` 里传 `servername: this.host`
-  （IP 字面量会被忽略）。
+- Android：`android/app/src/main/java/com/auto366/mobile/net/Auto366NetModule.kt`，
+  `listen()` 同时启动普通 `ServerSocket` 和只监听 `127.0.0.1` 的
+  `SSLServerSocket`；`tunnel()` 把客户端连接和 loopback TLS（或目标主机）对接，
+  读/写泵都在原生线程池里；
+- iOS：`ios/Auto366/Auto366Net.swift`，`NWListener` + Network.framework TLS，
+  `SecPKCS12Import` 从 bundle 读取 `auto366_mitm.p12`；通过
+  `Auto366NetBridge.m` 的 `RCT_EXTERN_MODULE` 注册；
+- JS 适配层：`src/runtime/native/net.ts`（`NativeSocket` / `NativeServer` /
+  `connectTcp` / `connectTls`），保持与旧 socket API 相近的形状；
+- 已移除 `scripts/patch-tcp-socket.js`、`postinstall` 与
+  `react-native-tcp-socket` 依赖。
 
-**两个必须记住的坑**：
+**两个必须记住的坑（已由原生层解决）**：
 
-1. `Socket.end()` 在这个库里映射到原生 `destroy()`，是**整条关闭**而不是 Node 的
-   半关闭。`src/runtime/http/client.ts` 的 `finishRequest()` 绝不能调 `end()`，
-   否则请求刚写完连接就断了，上游响应永远读不到（明文 HTTP 同样超时）。
-   现在的做法是：请求写完只发数据，响应收完后主动 `socket.destroy()`。
-2. `TcpSocket.connectTLS()` 在 TCP `connect` 成功时就 emit `secureConnect`，
-   并不代表 TLS 握手完成；此时立刻 `write()` 会抛 `Socket is closed`。
-   所以代理桥接层用 `ready` 标志 + 缓冲，等真正的握手数据到达再放行。
+1. 请求正文写完不能关闭整条连接；现在 `HttpClientRequest.finishRequest()` 只发
+   数据，等响应收完再 `socket.destroy()`。
+2. 旧库在 TCP connect 时就报告 TLS 成功，此时 `write()` 会失败；现在
+   `connectTls()` 只在原生 TLS 握手完成后才回调，JS 不会再遇到
+   “Socket is closed”。
 
 ## 4. ModuleMapper
 
@@ -283,11 +286,11 @@ CA 只生成一次（重跑保留已有 CA，`--force` 才轮换），避免已�
 | `path` `os` `events` `buffer` `stream` `querystring` `assert` `string_decoder` | npm polyfill / 自研 | |
 | `util` | `src/polyfills/node/util.ts` | **必须用自研实现**：npm `util@0.12` 没有 `formatWithOptions()`，桌面端日志模块会在 `catch` 里把每条日志降级成“无法序列化日志内容” |
 | `url` `crypto` `zlib` `timers` `console` `process` | `src/polyfills/node/*` | `fileURLToPath`、AES-128-CBC、gzip |
-| `http` `https` `net` | `src/polyfills/node/*` + `src/runtime/http/*` | 基于 `react-native-tcp-socket` |
+| `http` `https` `net` | `src/polyfills/node/*` + `src/runtime/http/*` | 基于原生 `Auto366Net` |
 | `child_process` | `src/polyfills/node/child_process.ts` | 惰性 no-op |
 | `uuid` `node-stream-zip` `archiver` `stream/promises` | `src/polyfills/node/*` | fflate 实现 |
 | `electron` `@e2rn/electron` | `src/shims/electron/index.ts` | 进程内替身 |
-| `http-mitm-proxy` | `src/stubs/http-mitm-proxy.ts` | **真实实现**：明文全拦截 + HTTPS MITM（本机 TLS 服务端 + 同一套钩子链） |
+| `http-mitm-proxy` | `src/stubs/http-mitm-proxy.ts` | **真实实现**：明文全拦截 + HTTPS MITM（原生 TLS 终止 + 同一套钩子链） |
 | `electron-updater` | `src/stubs/electron-updater.ts` | 报告“无可用更新” |
 | `posthog-node` | `src/stubs/posthog-node.ts` | 只记录不上报 |
 | `@supabase/supabase-js` | `src/stubs/supabase.ts` | 只实现 storage 接口 |
@@ -303,9 +306,9 @@ Babel 注入的 `@babel/runtime` 通过 `extraNodeModules` 显式映射。
 ## 5. 构建与验证
 
 ```bash
-npm install             # postinstall 会自动给 react-native-tcp-socket 打 keystore 密码补丁
+npm install             # 无需 postinstall 补丁；原生传输层随 App 一起编译
 npm run assets          # 重新生成 src/web-assets/assets.json（生成物，gitignore）
-npm run certs           # 生成 CA / 叶子证书 / p12 keystore（需要 openssl，已有则跳过）
+npm run certs           # 生成 CA / 叶子证书 / 两份 p12 keystore（需要 openssl，已有则跳过）
 npm run typecheck       # tsc --noEmit
 npm run lint            # eslint
 npm test                # jest（polyfill 单元测试）

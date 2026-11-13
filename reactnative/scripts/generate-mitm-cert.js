@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 /**
  * Generates the MITM certificate authority and the PKCS#12 keystore that the
- * native TLS server (`react-native-tcp-socket`) uses to terminate HTTPS.
+ * native `Auto366Net` module uses to terminate HTTPS.
  *
  * Why a keystore and not PEM files?
  *
- *   `react-native-tcp-socket` creates its TLS server from a PKCS#12 keystore
- *   that ships inside the APK (`res/raw`), because the private key has to be
- *   handed to the platform `SSLContext` - JavaScript cannot reach the native
- *   key material. Android cannot open a PKCS#12 file with an empty password,
- *   so the export below uses a real one (`auto366-mitm`) and
- *   `scripts/patch-tcp-socket.js` teaches the library to accept it.
+ *   Android's `SSLContext` and iOS' `SecPKCS12Import` both need the private key
+ *   plus its chain as a single PKCS#12 container. JavaScript cannot reach the
+ *   native key material, so the container ships inside the APK (`res/raw`) and
+ *   inside the iOS app bundle. The password below is a build-time constant, not
+ *   a secret: the keystore itself is in the package.
  *
  * Outputs:
  *
@@ -18,7 +17,8 @@
  *   certs/auto366-ca.pem          CA certificate (install this on the client)
  *   certs/auto366-mitm.key        leaf private key
  *   certs/auto366-mitm.pem        leaf certificate (signed by the CA)
- *   android/app/src/main/res/raw/auto366_mitm.p12   leaf key + chain, password `auto366-mitm`
+ *   android/app/src/main/res/raw/auto366_mitm.p12   Android keystore, password `auto366-mitm`
+ *   ios/Auto366/auto366_mitm.p12                    iOS keystore (same file)
  *   src/mitm/ca-certificate.ts    the CA certificate as a JS string (install flow)
  *
  * The CA is only created once. Re-running the script keeps the existing CA, so
@@ -38,14 +38,14 @@ const path = require('path');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_CERT_DIR = path.join(PROJECT_ROOT, 'certs');
 const ANDROID_RAW_DIR = path.join(PROJECT_ROOT, 'android', 'app', 'src', 'main', 'res', 'raw');
+const IOS_BUNDLE_DIR = path.join(PROJECT_ROOT, 'ios', 'Auto366');
 const KEYSTORE_NAME = 'auto366_mitm';
 /**
  * Password of the PKCS#12 keystore.
  *
- * `react-native-tcp-socket` used to hardcode an empty password, which Android
- * cannot load (see scripts/patch-tcp-socket.js); the patched version reads the
- * password from the TLS options. This is a build-time constant, not a secret:
- * the keystore itself ships inside the APK.
+ * Android cannot open a PKCS#12 file with an empty password, and both native
+ * implementations read this constant from `src/mitm/ca-certificate.ts`. This is
+ * a build-time value, not a secret: the keystore itself ships inside the app.
  */
 const KEYSTORE_PASSWORD = 'auto366-mitm';
 const TS_OUTPUT = path.join(PROJECT_ROOT, 'src', 'mitm', 'ca-certificate.ts');
@@ -118,6 +118,7 @@ function build(options) {
   const certDir = options.certDir;
   fs.mkdirSync(certDir, {recursive: true});
   fs.mkdirSync(ANDROID_RAW_DIR, {recursive: true});
+  fs.mkdirSync(IOS_BUNDLE_DIR, {recursive: true});
 
   const caKey = path.join(certDir, 'auto366-ca.key');
   const caPem = path.join(certDir, 'auto366-ca.pem');
@@ -125,6 +126,7 @@ function build(options) {
   const leafCsr = path.join(certDir, 'auto366-mitm.csr');
   const leafPem = path.join(certDir, 'auto366-mitm.pem');
   const keystore = path.join(ANDROID_RAW_DIR, `${KEYSTORE_NAME}.p12`);
+  const iosKeystore = path.join(IOS_BUNDLE_DIR, `${KEYSTORE_NAME}.p12`);
 
   const haveCa = fs.existsSync(caKey) && fs.existsSync(caPem);
   if (haveCa && !options.force) {
@@ -175,8 +177,8 @@ function build(options) {
   );
 
   // A real (non-empty) password is required: Android's PKCS#12 provider cannot
-  // open a keystore with an empty password. `scripts/patch-tcp-socket.js` lets
-  // the TLS server read the password from its options.
+  // open a keystore with an empty password. Both `Auto366Net` implementations
+  // read the password from the TLS options passed by JS.
   process.stdout.write(`[mitm-cert] packaging ${KEYSTORE_NAME}.p12\n`);
   run(
     [
@@ -188,6 +190,8 @@ function build(options) {
     ],
     certDir,
   );
+  // The iOS app bundle reads the same PKCS#12 through `SecPKCS12Import`.
+  fs.copyFileSync(keystore, iosKeystore);
 
   const caCertificate = fs.readFileSync(caPem, 'utf8').trim();
   fs.mkdirSync(path.dirname(TS_OUTPUT), {recursive: true});
@@ -224,6 +228,7 @@ function build(options) {
   const caInfo = openssl(['x509', '-in', caPem, '-noout', '-subject', '-dates']).trim();
   process.stdout.write(`[mitm-cert] CA: ${caInfo.replace(/\n/g, ' | ')}\n`);
   process.stdout.write(`[mitm-cert] keystore: ${path.relative(PROJECT_ROOT, keystore)}\n`);
+  process.stdout.write(`[mitm-cert] keystore: ${path.relative(PROJECT_ROOT, iosKeystore)}\n`);
   process.stdout.write(
     `[mitm-cert] install ${path.relative(PROJECT_ROOT, caPem)} on the client to trust the interception\n`,
   );

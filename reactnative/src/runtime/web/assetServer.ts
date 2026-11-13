@@ -243,10 +243,10 @@ async function startWithHttpPolyfill(port: number): Promise<number> {
   return address ? address.port : port;
 }
 
-/** Starts a minimal HTTP/1.1 server on top of `react-native-tcp-socket`. */
-async function startWithTcpSocket(port: number): Promise<number> {
-  const TcpSocket = require('react-native-tcp-socket');
-  const instance = TcpSocket.createServer((socket: any) => {
+/** Starts a minimal HTTP/1.1 server on top of the native `Auto366Net` module. */
+async function startWithNativeNet(port: number): Promise<number> {
+  const {createNativeServer} = require('../native/net');
+  const instance = createNativeServer({}, (socket: any) => {
     let buffer = '';
     socket.on('error', () => {
       try {
@@ -298,10 +298,16 @@ async function startWithTcpSocket(port: number): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => reject(error);
     instance.once('error', onError);
-    instance.listen({port, host: HOST}, () => {
-      instance.removeListener('error', onError);
-      resolve();
-    });
+    instance.listen(port, HOST).then(
+      () => {
+        instance.removeListener('error', onError);
+        resolve();
+      },
+      (error: Error) => {
+        instance.removeListener('error', onError);
+        reject(error);
+      },
+    );
   });
   const address = instance.address();
   server = {
@@ -344,7 +350,7 @@ export async function startAssetServer(): Promise<string> {
           error,
         );
         try {
-          port = await startWithTcpSocket(candidate);
+          port = await startWithNativeNet(candidate);
           break;
         } catch (fallbackError) {
           console.error(

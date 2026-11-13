@@ -4,14 +4,12 @@
  * The client is what talks to the upstream server on behalf of the proxy, and
  * two of its behaviours are easy to break without noticing:
  *
- *  - `finishRequest()` must NOT call `socket.end()`. In
- *    `react-native-tcp-socket` `end()` is mapped to the native `destroy()`,
- *    i.e. it closes the whole connection instead of half-closing it. The
- *    request was therefore cut off before the response could be read - both
- *    for plain HTTP and for the HTTPS interception.
+ *  - `finishRequest()` must NOT close the socket. The response can only be
+ *    read while the connection is still open, so ending the request has to be
+ *    a write-only operation (the native layer handles the response read).
  *  - the connection is closed only after the response body was consumed.
  */
-import TcpSocket from 'react-native-tcp-socket';
+import {connectTcp, connectTls} from '../src/runtime/native/net';
 
 import {HttpClientRequest, httpRequest} from '../src/runtime/http/client';
 
@@ -59,19 +57,23 @@ beforeEach(() => {
   socket = new FakeSocket();
   onConnect = undefined;
 
-  const connect = TcpSocket.connect as unknown as jest.Mock;
-  connect.mockReset();
-  connect.mockImplementation((_options: any, callback: () => void) => {
-    onConnect = callback;
-    return socket;
-  });
+  const tcp = connectTcp as unknown as jest.Mock;
+  tcp.mockReset();
+  tcp.mockImplementation(
+    (_host: string, _port: number, callback: () => void) => {
+      onConnect = callback;
+      return socket;
+    },
+  );
 
-  const connectTLS = TcpSocket.connectTLS as unknown as jest.Mock;
-  connectTLS.mockReset();
-  connectTLS.mockImplementation((_options: any, callback: () => void) => {
-    onConnect = callback;
-    return socket;
-  });
+  const tls = connectTls as unknown as jest.Mock;
+  tls.mockReset();
+  tls.mockImplementation(
+    (_host: string, _port: number, _servername: string, callback: () => void) => {
+      onConnect = callback;
+      return socket;
+    },
+  );
 });
 
 function finishConnect(): void {
@@ -93,8 +95,8 @@ describe('HttpClientRequest', () => {
     finishConnect();
 
     expect(socket.writes.join('')).toContain('GET /api HTTP/1.1\r\n');
-    // Regression: `end()` in react-native-tcp-socket destroys the socket,
-    // which made every upstream response unreachable.
+    // Regression: closing the socket here made every upstream response
+    // unreachable.
     expect(socket.ended).toBe(false);
     expect(socket.destroyed).toBe(false);
   });
@@ -174,7 +176,7 @@ describe('HttpClientRequest', () => {
     expect(socket.destroyed).toBe(true);
   });
 
-  it('uses connectTLS for tls requests', () => {
+  it('uses the native TLS connector for tls requests', () => {
     const request = new HttpClientRequest({
       host: 'fs.up366.cn',
       path: '/',
@@ -184,12 +186,15 @@ describe('HttpClientRequest', () => {
     request.end();
     finishConnect();
 
-    expect(TcpSocket.connectTLS).toHaveBeenCalledTimes(1);
-    expect(TcpSocket.connectTLS).toHaveBeenCalledWith(
-      expect.objectContaining({servername: 'fs.up366.cn'}),
+    expect(connectTls).toHaveBeenCalledTimes(1);
+    expect(connectTls).toHaveBeenCalledWith(
+      'fs.up366.cn',
+      443,
+      'fs.up366.cn',
       expect.any(Function),
+      0,
     );
-    expect(TcpSocket.connect).not.toHaveBeenCalled();
+    expect(connectTcp).not.toHaveBeenCalled();
     expect(socket.ended).toBe(false);
   });
 });

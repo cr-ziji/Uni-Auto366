@@ -7,10 +7,20 @@ const archiver = require('archiver');
 
 module.exports = {
 async describeZip(file) {
+    // 注入包在下载阶段会被反复读取；按 mtime/size 缓存 md5，避免每次下载
+    // 都在 JS 线程里重新哈希几十上百 MB（安卓上这会让响应迟迟发不出去）。
+    const stat = await fs.stat(file);
+    const key = `${fs.realpathSync?.(file) || file}|${stat.size}|${stat.mtimeMs}`;
+    if (!this._zipHashCache) this._zipHashCache = new Map();
+    const cached = this._zipHashCache.get(key);
+    if (cached) return cached;
     const hash = require('crypto').createHash('md5');
     let size = 0;
     for await (const chunk of fs.createReadStream(file)) { hash.update(chunk); size += chunk.length; }
-    return { md5: hash.digest('hex'), size };
+    const result = { md5: hash.digest('hex'), size };
+    this._zipHashCache.set(key, result);
+    while (this._zipHashCache.size > 8) this._zipHashCache.delete(this._zipHashCache.keys().next().value);
+    return result;
   },
 async downloadWithTimeout(downloadUrl, savePath, timeout = 30000, redirects = 0, deadline = Date.now() + timeout, signal, onRedirect) {
     const url = new URL(downloadUrl);

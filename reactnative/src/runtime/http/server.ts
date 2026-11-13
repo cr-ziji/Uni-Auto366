@@ -1,5 +1,5 @@
 /**
- * 基于 `react-native-tcp-socket` 的极简 HTTP/1.1 服务端。
+ * 极简 HTTP/1.1 服务端（网络层由原生 `Auto366Net` 提供）。
  *
  * 只实现移动端移植需要的部分：
  *  - 请求首部解析 + `Content-Length` / chunked 正文；
@@ -10,9 +10,13 @@
  *
  * 请求正文在进入回调前已经完整缓冲：JS 线程无法在原生回调里把数据交给
  * 挂起的异步函数，因此先缓冲再回放更可靠。
+ *
+ * TLS 由原生层负责：传入 `options.tls` 后，原生服务端会额外启动一个只监听
+ * loopback 的 TLS 服务端，CONNECT 连接通过原生隧道接入后，以 `isSSL = true`
+ * 的普通连接回调回来，HTTP 解析与钩子链与明文完全一致。
  */
 import {Buffer} from 'buffer';
-import TcpSocket from 'react-native-tcp-socket';
+import {createNativeServer, NativeServer} from '../native/net';
 import {
   BodyReader,
   HttpHeaders,
@@ -35,6 +39,8 @@ export interface RawHttpRequest {
   socket: any;
   /** 请求是否为 `CONNECT`（代理隧道）。 */
   isConnect?: boolean;
+  /** 连接是否已经由原生层完成 TLS 终止（HTTPS 中间人）。 */
+  isSSL?: boolean;
   /**
    * 解析完首部（和正文）之后同一批数据里多出来的字节。
    *
@@ -46,7 +52,8 @@ export interface RawHttpRequest {
 
 export interface RawHttpResponse {
   writeHead(statusCode: number, statusMessage?: string, headers?: HttpHeaders): void;
-  write(chunk: any): void;
+  /** 写入正文；返回 `false` 表示底层连接已经不可写（调用方不应再补结束标记）。 */
+  write(chunk: any): boolean;
   end(chunk?: any): void;
   destroy(error?: Error): void;
   /** 交出底层连接，之后服务端不再管理这条连接。 */
@@ -63,8 +70,11 @@ export type RawRequestHandler = (
 ) => void | Promise<void>;
 
 export interface HttpServerOptions {
-  /** TLS 服务端参数（原生 keystore 资源）。桌面代码不使用，留作扩展。 */
-  tls?: {keystore?: any; [key: string]: any};
+  /**
+   * TLS 服务端参数。原生层从 APK / App bundle 里的 PKCS#12 读取证书，
+   * 不经过 JS，也不需要 `react-native-tcp-socket` 补丁。
+   */
+  tls?: {resource: string; password?: string};
   /** 整个请求（含响应）允许的最长毫秒数，0 表示不限制。 */
   requestTimeout?: number;
   /** keep-alive 连接的空闲毫秒数，0 表示不限制。 */
@@ -177,30 +187,32 @@ class ServerResponse implements RawHttpResponse {
     }
   }
 
-  write(chunk: any): void {
+  write(chunk: any): boolean {
     if (this.destroyed || this.finished) {
-      return;
+      return false;
     }
     if (!this.headersSent) {
       this.writeHead(this.statusCode);
     }
     if (this.noBody) {
-      return;
+      return true;
     }
     const data = toBuffer(chunk);
     if (!data.length) {
-      return;
+      return true;
     }
     try {
       if (this.chunked) {
-        this.socket.write(`${data.length.toString(16)}\r\n`);
-        this.socket.write(data);
-        this.socket.write('\r\n');
-      } else {
-        this.socket.write(data);
+        const head = this.socket.write(`${data.length.toString(16)}\r\n`);
+        const body = this.socket.write(data);
+        const tail = this.socket.write('\r\n');
+        return head !== false && body !== false && tail !== false;
       }
+      return this.socket.write(data) !== false;
     } catch {
-      // 忽略写入失败
+      // 写入失败说明连接已经不可用；返回 false 让上层断开而不是补一个
+      // “正常结束”的 chunked 终止块（那会让客户端把截断的 ZIP 当成功）。
+      return false;
     }
   }
 
@@ -209,7 +221,10 @@ class ServerResponse implements RawHttpResponse {
       return;
     }
     if (chunk !== undefined && chunk !== null) {
-      this.write(chunk);
+      if (!this.write(chunk)) {
+        this.destroy();
+        return;
+      }
     }
     if (!this.headersSent) {
       this.writeHead(this.statusCode);
@@ -263,9 +278,11 @@ class ServerResponse implements RawHttpResponse {
 
 /** 极简 HTTP/1.1 服务端。 */
 export class HttpServer {
-  private server: any = null;
+  private server: NativeServer | null = null;
   private readonly sockets = new Set<any>();
   private readonly options: HttpServerOptions;
+  /** 原生 TLS 服务端是否就绪（CONNECT 能否做中间人）。 */
+  private tlsReady = false;
 
   constructor(
     private readonly handler: RawRequestHandler,
@@ -274,26 +291,27 @@ export class HttpServer {
     this.options = options || {};
   }
 
+  /** 是否可以对 CONNECT 做 TLS 中间人。 */
+  get hasTls(): boolean {
+    return this.tlsReady;
+  }
+
   /** 监听端口，Promise 在监听成功后 resolve。 */
   listen(port: number, host: string = '0.0.0.0'): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false;
-      let server: any;
+      let server: NativeServer;
       try {
-        if (this.options.tls) {
-          server = TcpSocket.createTLSServer(this.options.tls as any, (socket: any) => {
-            this.handleConnection(socket);
-          });
-        } else {
-          server = TcpSocket.createServer({noDelay: true}, (socket: any) => {
-            this.handleConnection(socket);
-          });
-        }
+        server = createNativeServer(
+          {tls: this.options.tls},
+          (socket: any) => this.handleConnection(socket),
+        );
       } catch (error) {
         reject(normalizeSocketError(error));
         return;
       }
       server.on('listening', () => {
+        this.tlsReady = server.hasTls;
         if (!settled) {
           settled = true;
           resolve();
@@ -308,14 +326,12 @@ export class HttpServer {
         }
         console.error('[http] 服务端错误:', normalized);
       });
-      try {
-        server.listen({port, host});
-      } catch (error) {
+      server.listen(port, host).catch((error: Error) => {
         if (!settled) {
           settled = true;
           reject(normalizeSocketError(error));
         }
-      }
+      });
       this.server = server;
     });
   }
@@ -334,16 +350,13 @@ export class HttpServer {
     return new Promise(resolve => {
       const server = this.server;
       this.server = null;
+      this.tlsReady = false;
       this.closeAllConnections();
       if (!server) {
         resolve();
         return;
       }
-      try {
-        server.close(() => resolve());
-      } catch {
-        resolve();
-      }
+      server.close().then(() => resolve(), () => resolve());
     });
   }
 
@@ -462,6 +475,7 @@ export class HttpServer {
             body: Buffer.concat(bodyChunks),
             socket,
             isConnect: head!.method === 'CONNECT',
+            isSSL: !!socket?.isSSL,
             rest: buffer.length ? buffer : undefined,
           };
           const keepAlive = shouldKeepAlive(head!);

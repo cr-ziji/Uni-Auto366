@@ -1,9 +1,9 @@
 /**
  * Node `net` 兼容层（React Native）。
  *
- * 底层用 `react-native-tcp-socket`（原生 TCP）。桌面版代码本身没有直接用 `net`，
- * 但 `http` / `https` / `http-mitm-proxy` 这些第三方库会用到，所以这里补一个
- * Node 形状的最小实现：
+ * 底层使用原生模块 `Auto366Net`（Android Kotlin / iOS Swift），桌面版代码本身
+ * 没有直接用 `net`，但 `http` / `https` / `http-mitm-proxy` 这些第三方库会用到，
+ * 所以这里补一个 Node 形状的最小实现：
  *
  *  - `createServer(options?, connectionListener?)`
  *  - `connect(options?, connectListener?)` / `createConnection`
@@ -16,7 +16,12 @@
  */
 import {Buffer} from 'buffer';
 import {EventEmitter} from 'events';
-import TcpSocket from 'react-native-tcp-socket';
+import {
+  NativeServerOptions,
+  NativeTlsOptions,
+  connectTcp,
+  createNativeServer,
+} from '../../runtime/native/net';
 
 export interface SocketOptions {
   host?: string;
@@ -37,6 +42,8 @@ export interface NetOptions {
   noDelay?: boolean;
   keepAlive?: boolean;
   keepAliveInitialDelay?: number;
+  /** 原生 TLS 服务端（HTTPS 兼容层使用）。 */
+  tls?: NativeTlsOptions;
 }
 
 export interface AddressInfo {
@@ -266,6 +273,7 @@ export class Socket extends EventEmitter {
 /** Node 形状的 TCP 服务端。 */
 export class Server extends EventEmitter {
   private native: any = null;
+  private closed = false;
   private readonly options: NetOptions;
 
   constructor(
@@ -300,17 +308,21 @@ export class Server extends EventEmitter {
         ? callback
         : undefined;
     const resolvedHost = typeof host === 'string' ? host : '0.0.0.0';
+    this.closed = false;
     try {
-      this.native = TcpSocket.createServer(
-        {noDelay: this.options.noDelay ?? true, ...this.options},
-        (socket: any) => {
-          this.emit('connection', new Socket(socket));
-        },
-      );
+      const nativeOptions: NativeServerOptions = {
+        host: resolvedHost,
+        tls: this.options.tls,
+      };
+      this.native = createNativeServer(nativeOptions, (socket: any) => {
+        this.emit('connection', new Socket(socket));
+      });
       this.native.on('error', (error: any) => this.emit('error', error));
       this.native.on('listening', () => this.emit('listening'));
       this.native.on('close', () => this.emit('close'));
-      this.native.listen({port, host: resolvedHost});
+      this.native.listen(port, resolvedHost).catch((error: Error) => {
+        this.emit('error', error);
+      });
     } catch (error) {
       this.emit('error', error);
       return this;
@@ -334,11 +346,30 @@ export class Server extends EventEmitter {
   }
 
   close(callback?: (error?: Error) => void): this {
+    if (this.closed) {
+      callback?.();
+      return this;
+    }
+    this.closed = true;
+    const native = this.native;
+    this.native = null;
+    if (!native) {
+      this.emit('close');
+      callback?.();
+      return this;
+    }
     try {
-      this.native?.close?.((error?: Error) => {
-        this.emit('close');
-        callback?.(error);
-      });
+      // `NativeServer.close()` 自己会 emit `close`（上面的监听器转发给
+      // 本对象），这里只负责回调，避免同一个事件被发两次。
+      const outcome = native.close?.();
+      if (outcome && typeof outcome.then === 'function') {
+        outcome.then(
+          () => callback?.(),
+          (error: Error) => callback?.(error),
+        );
+      } else {
+        callback?.();
+      }
     } catch (error) {
       callback?.(error as Error);
     }
@@ -390,12 +421,18 @@ export function connect(
   const host = resolved.host || '127.0.0.1';
   const port = Number(resolved.port) || 0;
   const socket = new Socket();
+  socket.connecting = true;
   try {
-    const native = TcpSocket.connect({host, port}, () => {
-      socket.connecting = false;
-      socket.emit('connect');
-      resolvedListener?.(socket);
-    });
+    const native = connectTcp(
+      host,
+      port,
+      () => {
+        socket.connecting = false;
+        socket.emit('connect');
+        resolvedListener?.(socket);
+      },
+      Number(resolved.timeout) || 0,
+    );
     socket.attach(native);
   } catch (error) {
     setTimeout(() => socket.emit('error', error), 0);

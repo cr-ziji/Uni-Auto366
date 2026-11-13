@@ -1,5 +1,5 @@
 /**
- * 基于 `react-native-tcp-socket` 的极简 HTTP/1.1 客户端。
+ * 极简 HTTP/1.1 客户端（网络层由原生 `Auto366Net` 提供）。
  *
  * 与 Node 的差别：
  *  - 首部延迟到第一次 `write()`/`end()` 才真正发出，这样 `setHeader()` /
@@ -8,12 +8,12 @@
  *  - 没有连接池（`Agent` 只是占位）。
  *
  * 支持：
- *  - TLS（`options.tls`，走 `TcpSocket.connectTLS`）；
+ *  - TLS（`options.tls`，原生 `SSLContext` / Network.framework 直接握手）；
  *  - chunked 请求 / 响应正文；
  *  - 中间响应（`100 Continue` / `103 Early Hints`）自动跳过。
  */
 import {Buffer} from 'buffer';
-import TcpSocket from 'react-native-tcp-socket';
+import {connectTcp, connectTls} from '../native/net';
 import {
   BodyReader,
   HttpHeaders,
@@ -298,24 +298,22 @@ export class HttpClientRequest extends HttpEmitter {
       return;
     }
     try {
+      // 原生 `connectTls` 在 TCP 连接和 TLS 握手都完成后才回调，因此不会
+      // 出现旧实现里“TCP 刚连上就 write，结果 Socket is closed”的竞态。
       if (this.options.tls) {
-        this.socket = TcpSocket.connectTLS(
-          {
-            host: this.host,
-            port: this.port,
-            // 原生实现用 IP 建 socket，不传 servername 就不会发 SNI；
-            // Cloudflare / Supabase 这类按域名路由的服务端会直接握手失败。
-            servername: this.host,
-            ca: this.options.ca,
-            key: this.options.key,
-            cert: this.options.cert,
-          } as any,
+        this.socket = connectTls(
+          this.host,
+          this.port,
+          this.host,
           () => this.onReady(),
+          this.timeoutMs,
         );
       } else {
-        this.socket = TcpSocket.connect(
-          {host: this.host, port: this.port},
+        this.socket = connectTcp(
+          this.host,
+          this.port,
           () => this.onReady(),
+          this.timeoutMs,
         );
       }
     } catch (error) {
@@ -417,11 +415,9 @@ export class HttpClientRequest extends HttpEmitter {
         // 忽略
       }
     }
-    // 不要调用 `socket.end()`：`react-native-tcp-socket` 把 `end` 实现成
-    // `NativeModules.TcpSockets.end(id)` -> `TcpSocketClient.destroy()`，
-    // 也就是**关闭整条连接**（不是 Node 的半关闭）。请求一写完就关连接，
-    // 上游的响应就再也读不到了。这里只把请求发完，连接由响应结束时关闭
-    // （见 `process()`）。
+    // 请求正文已经写完，但不要调用 `socket.end()`：`NativeSocket.end()` 是
+    // 半关闭写方向，会向对端发 FIN；上游读到 EOF 后可能直接关闭连接，导致
+    // 响应还没读回来。连接由响应结束时主动销毁（见 `process()`）。
   }
 
   private onData(data: any): void {

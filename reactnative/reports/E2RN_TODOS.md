@@ -4,28 +4,28 @@
 
 ## P0 — 影响核心功能
 
-### 1. HTTPS 流量无法解密 → ✅ 已实现（2026-10，Android 真机验证）
+### 1. HTTPS 流量无法解密 → ✅ 已实现（2026-11，改为原生传输层）
 - **现状**：`src/stubs/http-mitm-proxy.ts` 现在真的做 HTTPS 中间人，不再是盲隧道。
-  - 代理启动时用 `react-native-tcp-socket` 的 `createTLSServer()` 在本机 loopback
-    上另起一个 TLS 服务端；证书来自打进 APK 的
-    `android/app/src/main/res/raw/auto366_mitm.p12`（`scripts/generate-mitm-cert.js`
-    用 openssl 生成：CA + 叶子证书，SAN 覆盖 `*.up366.cn` / `*.up366.com` /
-    `*.cyril.zone` 等，见脚本里的 `DNS_NAMES`）。
-  - 收到 `CONNECT host:443` 后回 `200 Connection Established`，把这条连接的密文
-    原样转发给本机 TLS 服务端；TLS 在 RN 侧终止后得到明文 HTTP，复用与明文代理
-    **完全相同**的钩子链（`onRequest` / `onRequestData` / `onRequestEnd` /
-    `onResponse` / `onResponseData` / `onResponseEnd`），只是 `ctx.isSSL = true`，
-    `captureUrl` 拼成 `https://...`。
-  - 上游请求由 `src/runtime/http/client.ts` 重新建立真正的 TLS 连接，因此规则
-    匹配、抓包、正文改写看到的都是明文。
-  - keystore 缺失 / TLS 服务端启动失败时**自动退回** CONNECT 盲隧道（只转发
+  - 代理启动时由原生模块 `Auto366Net`（Android Kotlin `SSLServerSocket` /
+    iOS Network.framework）在本机 loopback 上另起一个 TLS 服务端；证书来自
+    Android 的 `android/app/src/main/res/raw/auto366_mitm.p12` 和 iOS 的
+    `ios/Auto366/auto366_mitm.p12`（`scripts/generate-mitm-cert.js` 一次生成两份：
+    CA + 叶子证书，SAN 覆盖 `*.up366.cn` / `*.up366.com` / `*.cyril.zone` 等，
+    见脚本里的 `DNS_NAMES`）。
+  - 收到 `CONNECT host:443` 后回 `200 Connection Established`，JS 调用
+    `socket.tunnel({useTls: true})`，由原生层把整条连接桥接到本机 TLS 服务端；
+    字节搬运、TLS 终止、回放 CONNECT 首部后紧跟的 ClientHello 都在原生层完成，
+    不再经过 JS 双向转发密文。TLS 在原生层终止后以 `isSSL = true` 的普通连接
+    回调给 JS，复用与明文代理**完全相同**的钩子链（`onRequest` /
+    `onRequestData` / `onRequestEnd` / `onResponse` / `onResponseData` /
+    `onResponseEnd`），只是 `ctx.isSSL = true`，`captureUrl` 拼成 `https://...`。
+  - 上游请求由 `src/runtime/http/client.ts` 通过原生 TLS 客户端重新建立连接，
+    因此规则匹配、抓包、正文改写看到的都是明文。
+  - keystore 缺失 / 原生 TLS 服务端启动失败时**自动退回** CONNECT 盲隧道（只转发
     密文、不触发响应钩子），代理整体仍可用。
-- **必要补丁**：`scripts/patch-tcp-socket.js`（`postinstall` 自动执行、幂等）。
-  `react-native-tcp-socket` 原本把 PKCS#12 密码写死成空串，而 Android 的
-  BouncyCastle **无法**打开空密码的 keystore（加密库报 `password empty`，未加密
-  报 `OpenSSLRSAPrivateCrtKey cannot be cast to ...`）。补丁让 TLS options 可以
-  携带密码，keystore 密码固定为 `auto366-mitm`
-  （`src/mitm/ca-certificate.ts` 的 `MITM_KEYSTORE_PASSWORD`）。
+  - 不再需要 `react-native-tcp-socket`，也不再需要 `scripts/patch-tcp-socket.js`
+    或 `postinstall` 补丁；PKCS#12 密码固定为 `auto366-mitm`
+    （`src/mitm/ca-certificate.ts` 的 `MITM_KEYSTORE_PASSWORD`），由原生代码直接读取。
 - **客户端仍需信任根证书**：App 不能静默写系统信任库，`modules/proxy/cert.js`
   的替身 `src/shims/proxy-cert.ts` 改为把 CA 导出到
   `<documents>/.Auto366/Auto366-MITM-CA.pem` 并提示手动安装
@@ -79,11 +79,12 @@
 ## P2 — 体验与工程
 
 ### 9. 旧架构模块在新架构下的 interop
-- `react-native-fs` 2.20.0 与 `react-native-tcp-socket` 6.4.3 仍是旧式 NativeModule，
-  RN 0.88 只支持新架构，两者依赖 RN 的 **TurboModule interop 层**运行。
-- **状态**：Android 真机已验证可用（文件读写、本地服务器、TLS 服务端均正常）。
-  iOS 未验证；若出现问题，替换方案见 `NATIVE_MODULES_REPORT.md`
-  （`react-native-blob-util` / 自研原生模块）。
+- `react-native-fs` 2.20.0 仍是旧式 NativeModule，RN 0.88 只支持新架构，依赖 RN 的
+  **TurboModule interop 层**运行。网络层已经改为自研新架构兼容的 `Auto366Net`，
+  不再依赖 `react-native-tcp-socket`。
+- **状态**：Android 真机已验证文件读写与本地服务器；iOS 未验证。若 `react-native-fs`
+  出现问题，替换方案见 `NATIVE_MODULES_REPORT.md`（`react-native-blob-util` /
+  自建沙盒）。
 
 ### 10. 端口与网络接口
 - 本地资源服务器**优先**监听固定端口 `17866`（`src/runtime/web/assetServer.ts` 的
@@ -117,16 +118,43 @@
   npm 上的 TypeScript 7（tsgo）与 ESLint 10 尚未适配本工程。
 
 ### 16. 未完成的验证
-- 真机（Android）已完成：
+- Android 模拟器（API 36 / arm64）本次已完成：
+  - 本地资源服务器返回合法 HTTP（`HTTP/1.1 200` + `Content-Length`），
+    WebView 正常渲染桌面 UI；
+  - 通过代理直连 **40 MiB 响应**：下载完整，SHA-256 与源文件一致；
+  - **chunked 40 MiB 响应**（无 `Content-Length`）：下载完整，SHA-256 一致；
+  - **Range 续传**（`bytes=1000000-1999999`）：返回 `206`，切片内容一致；
+  - **HTTPS 中间人 20 MiB 下载**（CONNECT → 原生 TLS → 上游 TLS）：`200`，
+    速度约 1.8 MiB/s，日志显示“原生 TLS 中间人”。
+- 真机（Android）此前已完成：
   - 页面加载、`app.whenReady()` 生命周期、内置规则集导入、Analytics、
     本地资源服务器、WebView↔RN 双向 IPC；
   - 启动闪屏（WebView 按屏幕尺寸布局 + viewport 缩放，横竖屏都不留黑边）；
   - 图标字体（`document.fonts` 中 `bootstrap-icons` 为 `loaded`）；
   - `localStorage` 持久化（固定端口 + `am force-stop` 后重启仍保留）；
-  - HTTPS 中间人（`scripts/mitm-e2e-test.js`，CONNECT → TLS → 上游响应）。
-- 仍待验证：规则命中并触发动作、答案上传/下载、杀进程后状态恢复、iOS 全流程。
+  - HTTPS 中间人（`scripts/mitm-e2e-test.js`，CONNECT → 原生 TLS → 上游响应）；
+- iOS：`xcodebuild -workspace Auto366.xcworkspace -scheme Auto366 -sdk iphonesimulator`
+  已 `BUILD SUCCEEDED`（Swift + bridge + p12 资源均编译/打包通过），尚未做端到端下载。
+- 仍待验证：Android 真机全链路、天学网实际 ZIP 命中注入规则后的完整下载、
+  规则命中并触发动作、答案上传/下载、杀进程后状态恢复、iOS 端到端。
 
-### 17. 扩展规则市场请求被 CORS 拦截
+### 17. RN 的 `Buffer.subarray()` 返回普通 `Uint8Array`
+- 在 RN 的 Buffer 实现里，`buffer.subarray(a, b)` 返回的是 **`Uint8Array`**，
+  不是 Buffer。`Uint8Array.prototype.toString()` 会忽略编码参数，输出
+  `"72,84,84,80,..."` 这样的十进制字节串。
+- 两个曾导致 ZIP 失败的位置：
+  1. `NativeSocket.write()` 把 `subarray()` 直接放进写队列，再用
+     `toString('base64')` 编码 → 原生层按 base64 解码后得到完全错误的字节
+     （所有响应都损坏，WebView 报 `ERR_INVALID_HTTP_RESPONSE`）。
+     修复：入队前把 `subarray()` 的结果包成零拷贝的 `Buffer` 视图。
+  2. 大响应（> 8 MiB）落盘时 `CaptureBody.append()` 把上游 chunk 交给
+     `FileHandle.write()`，后者对 `subarray()` 结果调用 `.copy()` →
+     `TypeError: undefined is not a function`。修复：`capture.js` 与
+     `fs.ts` 的 `write` 都先统一成 Buffer。
+- 回归测试：`__tests__/native-net-write.test.ts`（模拟 RN 的 subarray 行为）、
+  `__tests__/fs.test.ts`（`FileHandle.write` 接收 Uint8Array 切片）。
+
+### 18. 扩展规则市场请求被 CORS 拦截
 - `renderer/pages/extensions/index.js` 直接 `fetch('https://366.cyril.qzz.io/api/rulesets')`。
 - 该服务固定返回 `Access-Control-Allow-Origin: https://366.cyril.zone`，
   既不匹配桌面的 `file://`（`Origin: null`）也不匹配移动端的 `http://127.0.0.1:<port>`。
@@ -134,7 +162,7 @@
 - **方案**（若要修复）：在本地资源服务器上加 `/__remote` 反向代理，
   用注入脚本改写 `fetch`/`XHR` 指向本地代理，由 RN 侧发起 HTTPS 请求。
 
-### 18. 生成物未纳入版本控制
+### 19. 生成物未纳入版本控制
 - `src/web-assets/assets.json` 与 `src/web-assets/files/**` 由
   `scripts/build-web-assets.js` 生成，`.gitignore` 已排除。
 - 全新 clone 后若跳过 `npm run assets`，Metro 会报
@@ -152,6 +180,7 @@
 - [x] 本地资源服务器 + WebView 页面加载正常（固定端口 `17866`）
 - [x] `localStorage` 重启后保留（协议同意状态不再重复弹出）
 - [x] 代理监听 + HTTPS 中间人（CONNECT → TLS 终止 → 上游响应，`scripts/mitm-e2e-test.js` PASS）
+- [x] 大响应传输：40 MiB 定长 / chunked、Range 续传、HTTPS 20 MiB（Android 模拟器，SHA-256 一致）
 - [ ] IPC `invoke` 与 `send` 全链路（renderer 初始化已跑通，其余待验）
 - [ ] 明文 HTTP / HTTPS 规则命中并触发动作（需要真实业务请求）
 - [ ] 客户端安装根证书后，业务 App 内的 HTTPS 请求可被解密

@@ -10,7 +10,7 @@ module.exports = {
   setupFiles: ['<rootDir>/jest.setup.js'],
   moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
   transformIgnorePatterns: [
-    'node_modules/(?!(?:@react-native|react-native|react-native-fs|react-native-tcp-socket|react-native-webview|react-native-url-polyfill|@react-native-community)/)',
+    'node_modules/(?!(?:@react-native|react-native|react-native-fs|react-native-webview|react-native-url-polyfill|@react-native-community)/)',
   ],
   moduleNameMapper: {
     // The ModuleMapper of `metro.config.js` is not active in Jest.
