@@ -192,6 +192,9 @@ async applyDynamicInjectRules(url, responseBody) {
 
 async handleDynamicInjectFileInfo(url, responseBody, rule) {
     let injectDir, cached = false;
+    // 出错时把阶段带进日志：下载/解压/注入/打包 失败的原因完全不同，
+    // 只报 "动态注入失败" 时无法判断该查哪一步。
+    let stage = '解析响应';
     try {
       let bodyStr = responseBody.toString();
       let jsonData;
@@ -232,15 +235,18 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
 
       const originalZipPath = path.join(injectDir, 'original.zip');
       const urls = [downloadUrl];
+      stage = '下载原始ZIP';
       await this.downloadWithTimeout(downloadUrl, originalZipPath, timeout, 0, Date.now() + timeout, this.abortController.signal, redirected => urls.push(redirected));
 
       this.sendProgress('extracting', '正在解压ZIP...', 30);
       const extractDir = path.join(injectDir, 'extracted');
       await fs.ensureDir(extractDir);
 
+      stage = '解压ZIP';
       await this.extractZip(originalZipPath, extractDir);
 
       this.sendProgress('injecting', '正在注入脚本...', 50);
+      stage = '读取注入脚本';
       const injectScriptPaths = await this.resolveInjectScripts(rule);
       if (!injectScriptPaths || injectScriptPaths.length === 0) {
         this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入: 未找到有效注入脚本` }));
@@ -269,6 +275,7 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
       for (const scriptPath of injectScriptPaths) {
         scripts.push({ name: path.basename(scriptPath), content: runtimePrelude + await fs.readFile(scriptPath, 'utf8') });
       }
+      stage = '写入注入脚本';
       for (const htmlFile of htmlFiles) {
         if (this.stopped) return responseBody;
         for (const script of scripts) {
@@ -279,9 +286,11 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
 
       this.sendProgress('packing', '正在重新打包...', 70);
       const injectedZipPath = path.join(injectDir, 'injected.zip');
+      stage = '重新打包';
       await this.repackZip(extractDir, injectedZipPath);
 
       this.sendProgress('modifying', '正在修改响应...', 90);
+      stage = '计算注入包校验值';
       const { md5: injectedMd5, size: injectedSize } = await this.describeZip(injectedZipPath);
       if (this.stopped) return responseBody;
       const previous = this.dynamicInjectTemp.get(requestKey);
@@ -312,7 +321,7 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
       return Buffer.from(bodyStr);
     } catch (error) {
       moduleLog.error('处理动态注入fileinfo失败:', error);
-      this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入失败: ${error.message}` }));
+      this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入失败（${stage}）: ${error.message}` }));
       this.sendProgress('error', '失败: ' + error.message);
       this.scheduleClose(3000);
       return responseBody;

@@ -91,7 +91,14 @@ export class Archiver extends EventEmitter {
       await this.collectDirectory(entry.path, entry.destination);
     }
     const level = this.options?.zlib?.level;
-    const data = zipSync(this.files as any, level === undefined ? undefined : ({level} as any));
+    // `fflate` only understands plain objects - handed a `Map` it silently
+    // packs zero entries, which produced 22 byte "empty" archives and made
+    // every repacked injection package useless.
+    const entries: Record<string, Uint8Array> = {};
+    for (const [name, content] of this.files) {
+      entries[name] = content;
+    }
+    const data = zipSync(entries, level === undefined ? undefined : ({level} as any));
     this.finalized = true;
     const destination = this.destination;
     if (!destination) {
@@ -128,12 +135,10 @@ export class Archiver extends EventEmitter {
   }
 
   private async collectDirectory(directoryPath: string, destination?: string | false): Promise<void> {
-    let entries: any[];
-    try {
-      entries = (await readdir(directoryPath, {withFileTypes: true})) as any;
-    } catch {
-      return;
-    }
+    // A directory that cannot be listed has to fail the archive: silently
+    // shipping an empty ZIP hides the problem until the page that consumes the
+    // package breaks.
+    const entries = (await readdir(directoryPath, {withFileTypes: true})) as any;
     for (const entry of entries) {
       const name: string = entry.name;
       const fullPath = join(directoryPath, name);
