@@ -214,7 +214,12 @@ export const PRELOAD_BRIDGE_SOURCE = `(function () {
       var url = '';
       if (typeof input === 'string') { url = input; }
       else if (input && typeof input.url === 'string') { url = input.url; }
-      if (!/^https?:\/\//i.test(url) || isSameOrigin(url)) {
+      // Kept free of regular expressions and escapes on purpose: this source is
+      // itself a template literal, so a regex written with escaped slashes would
+      // ship broken and take the whole injected script down with a syntax error.
+      var lowerUrl = url.toLowerCase();
+      var isHttp = lowerUrl.indexOf('http://') === 0 || lowerUrl.indexOf('https://') === 0;
+      if (!isHttp || isSameOrigin(url)) {
         return nativeFetch.apply(window, arguments);
       }
       try {

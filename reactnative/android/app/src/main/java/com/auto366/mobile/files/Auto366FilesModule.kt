@@ -16,6 +16,7 @@ import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 
 /**
  * The file picker / opener the Electron `dialog` and `shell` shims need.
@@ -43,7 +44,7 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
     reactContext.addActivityEventListener(
       object : BaseActivityEventListener() {
         override fun onActivityResult(
-          activity: Activity?,
+          activity: Activity,
           requestCode: Int,
           resultCode: Int,
           data: Intent?,
@@ -73,7 +74,7 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
       putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple)
       addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    val activity = currentActivity
+    val activity = reactContext.currentActivity
     if (activity == null) {
       promise.reject("E_NO_ACTIVITY", "the application has no foreground activity")
       return
@@ -89,7 +90,7 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
       promise.reject("E_BUSY", "a save dialog is already open")
       return
     }
-    val activity = currentActivity
+    val activity = reactContext.currentActivity
     if (activity == null) {
       promise.reject("E_NO_ACTIVITY", "the application has no foreground activity")
       return
@@ -111,7 +112,7 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
     try {
       val target = Uri.parse(uri)
       val bytes = Base64.decode(base64, Base64.DEFAULT)
-      reactContext.contentResolver.openOutputStream(target, "wt")?.use { stream ->
+      openForWrite(target)?.use { stream ->
         stream.write(bytes)
         stream.flush()
       } ?: run {
@@ -121,6 +122,23 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
       promise.resolve(true)
     } catch (error: Exception) {
       promise.reject("E_WRITE", error)
+    }
+  }
+
+  /**
+   * Opens a SAF document for writing.
+   *
+   * `"wt"` truncates the document, but the `t` flag only exists from API 29;
+   * older providers throw instead of ignoring it, so fall back to plain `"w"`.
+   * The caller always writes a freshly created document there, so a leftover
+   * tail is not a concern on those devices.
+   */
+  private fun openForWrite(uri: Uri): OutputStream? {
+    val resolver = reactContext.contentResolver
+    return try {
+      resolver.openOutputStream(uri, "wt")
+    } catch (_: Exception) {
+      resolver.openOutputStream(uri, "w")
     }
   }
 
