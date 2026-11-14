@@ -66,22 +66,39 @@ export async function bootstrapE2RN(): Promise<BootstrapResult> {
 
   pending = (async (): Promise<BootstrapResult> => {
     try {
+      // Start-up is the only place where a slow step blocks every IPC call
+      // (the WebView page is already running and calling `invoke`), so each
+      // stage is timed - "the app takes 40 s to start" is otherwise very hard
+      // to attribute.
+      const startedAt = Date.now();
+      let mark = startedAt;
+      const stage = (label: string) => {
+        const now = Date.now();
+        console.log(`[e2rn] startup: ${label} ${now - mark} ms`);
+        mark = now;
+      };
+
       // 1. the `process` global and the other Node globals (`Buffer`, ...)
       installProcessGlobals();
       installNodeGlobals();
+      stage('node globals');
 
       // 2. the writable sandbox (the desktop code reads files synchronously)
       await hydrateFileSystem();
+      stage('file system mirror');
 
       // 3. the local web-asset server
       await startAssetServer();
+      stage('asset server');
 
       // 4. mark Electron app ready before loading the original main process
       markAppReady();
+      stage('app ready');
 
       // 5. the original, unmodified main process
       requireDesktopMain();
-      console.log('[e2rn] the Auto366 main process has been started');
+      stage('desktop main process');
+      console.log(`[e2rn] the Auto366 main process has been started (${Date.now() - startedAt} ms)`);
       return {ok: true};
     } catch (error) {
       console.error('[e2rn] the Auto366 main process could not be started', error);

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Paths that may be handed to other apps through the FileProvider.
+
+  Android 7 rejects `file://` URIs in intents (FileUriExposedException), so
+  every "open / share this file" has to go through `content://` backed by this
+  provider. The entries mirror the directories react-native-fs uses:
+  `filesDir` (documents), `cacheDir` (temporary files and picked imports) and
+  the app-specific external directory.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="documents" path="." />
+    <cache-path name="cache" path="." />
+    <external-files-path name="external" path="." />
+    <external-cache-path name="external_cache" path="." />
+</paths>

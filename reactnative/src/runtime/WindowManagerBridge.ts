@@ -124,8 +124,22 @@ export function createIpcEvent(windowId: string, delivery: BridgeDelivery): IpcE
  * Injects a payload into the WebView of a window.
  *
  * The page side receives it through `window.__E2RN_RECEIVE__(payload)`.
+ *
+ * Delivery can fail while the window is still being mounted: the React tree
+ * renders before the WebView registers itself, so an early `ipcRenderer.invoke`
+ * reply had nowhere to go and was dropped. The page then waited for its own
+ * 30 s timeout, which looked like "everything hangs during start-up".
  */
 export function deliverToWebView(id: string, payload: any): boolean {
+  if (deliverOnce(id, payload)) {
+    return true;
+  }
+  retryDelivery(id, payload, 0);
+  return false;
+}
+
+/** Attempts a single delivery; `false` means "not possible right now". */
+function deliverOnce(id: string, payload: any): boolean {
   const webView = getWebView(id);
   if (!webView || typeof webView.injectJavaScript !== 'function') {
     return false;
@@ -143,6 +157,7 @@ export function deliverToWebView(id: string, payload: any): boolean {
     'if (window.__E2RN_RECEIVE__) { window.__E2RN_RECEIVE__(' +
     json +
     '); }' +
+    'else { console.warn("[e2rn] page has no receiver yet, payload dropped"); }' +
     '} catch (error) { console.error("[e2rn] bridge delivery failed", error); }' +
     '})();';
   try {
@@ -152,6 +167,32 @@ export function deliverToWebView(id: string, payload: any): boolean {
     return false;
   }
   return true;
+}
+
+const DELIVERY_RETRY_LIMIT = 40;
+const DELIVERY_RETRY_DELAY_MS = 50;
+
+function retryDelivery(id: string, payload: any, attempt: number): void {
+  if (attempt >= DELIVERY_RETRY_LIMIT) {
+    console.warn(
+      `[e2rn] dropped a bridge message for window ${id} after ${attempt} attempts`,
+      payload && payload.type,
+      payload && payload.channel,
+    );
+    return;
+  }
+  const timer = setTimeout(() => {
+    const alive = windowStore
+      .getState()
+      .windows.some(entry => entry.id === id);
+    if (!alive) {
+      return;
+    }
+    if (!deliverOnce(id, payload)) {
+      retryDelivery(id, payload, attempt + 1);
+    }
+  }, DELIVERY_RETRY_DELAY_MS);
+  timer.unref?.();
 }
 
 /** Clears a pending invocation and stops its timeout. */

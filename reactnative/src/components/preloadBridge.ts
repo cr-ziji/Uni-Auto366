@@ -163,6 +163,82 @@ export const PRELOAD_BRIDGE_SOURCE = `(function () {
     removeAllListeners: removeAllListeners,
     post: post
   };
+
+  // The page is served from http://127.0.0.1:<asset port>, so every request to
+  // another origin is cross-origin and needs CORS headers from the server. The
+  // rule-set API (366.cyril.qzz.io) does not send them for the download
+  // endpoints, which broke "get extension rule set" / upload / download even
+  // though the desktop build had no such restriction.
+  //
+  // Cross-origin calls are therefore relayed through a same-origin endpoint of
+  // the asset server; the main context issues the real request with the Node
+  // http shim and streams the answer back unchanged.
+  var PROXY_PATH = '/__e2rn/proxy';
+
+  function isSameOrigin(url) {
+    try {
+      var parsed = new URL(url, window.location.href);
+      return parsed.origin === window.location.origin;
+    } catch (error) {
+      return true;
+    }
+  }
+
+  function copyHeaders(source) {
+    var headers = {};
+    if (!source) { return headers; }
+    if (typeof Headers !== 'undefined' && source instanceof Headers) {
+      source.forEach(function (value, name) { headers[name] = value; });
+      return headers;
+    }
+    if (Array.isArray(source)) {
+      for (var index = 0; index < source.length; index += 1) {
+        headers[String(source[index][0])] = String(source[index][1]);
+      }
+      return headers;
+    }
+    for (var name in source) {
+      if (Object.prototype.hasOwnProperty.call(source, name)) {
+        headers[name] = String(source[name]);
+      }
+    }
+    return headers;
+  }
+
+  function installFetchRelay() {
+    var nativeFetch = window.fetch;
+    if (typeof nativeFetch !== 'function' || window.__E2RN_FETCH_RELAY__) { return; }
+    window.__E2RN_FETCH_RELAY__ = true;
+
+    window.fetch = function (input, init) {
+      var url = '';
+      if (typeof input === 'string') { url = input; }
+      else if (input && typeof input.url === 'string') { url = input.url; }
+      if (!/^https?:\/\//i.test(url) || isSameOrigin(url)) {
+        return nativeFetch.apply(window, arguments);
+      }
+      try {
+        var options = init || {};
+        var body = options.body;
+        // FormData / Blob / ArrayBuffer are encoded by the browser while sending
+        // the same-origin request; the relay forwards the body (and the
+        // generated content-type, boundary included) untouched.
+        return nativeFetch.call(window, PROXY_PATH + '?url=' + encodeURIComponent(url), {
+          method: options.method || (input && input.method) || 'GET',
+          headers: copyHeaders(options.headers),
+          body: body,
+          mode: 'same-origin',
+          credentials: options.credentials || 'omit',
+          cache: 'no-store'
+        });
+      } catch (error) {
+        console.warn('[e2rn] fetch relay failed, using a direct request', error);
+        return nativeFetch.apply(window, arguments);
+      }
+    };
+  }
+
+  installFetchRelay();
 })();`;
 
 export default PRELOAD_BRIDGE_SOURCE;

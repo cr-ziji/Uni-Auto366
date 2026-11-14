@@ -199,6 +199,199 @@ function headersFor(response: AssetResponse, bodyLength: number): Record<string,
   };
 }
 
+/**
+ * Same-origin endpoint that forwards a request to an absolute URL.
+ *
+ * The renderer runs in a WebView served from `http://127.0.0.1:<port>`, so
+ * every call to the rule-set API (`https://366.cyril.qzz.io/...`) is a
+ * cross-origin request and is blocked by the browser unless the server sends
+ * CORS headers - which it does not for the download endpoints. The desktop
+ * build had `webSecurity` semantics of its own, so the renderer never had to
+ * care.
+ *
+ * `window.fetch` is patched in the preload to route cross-origin calls here;
+ * the request is then issued from the main context (the Node `http` shim),
+ * which is not subject to CORS at all, and the response is relayed back
+ * unchanged (status, headers, bytes).
+ */
+export const PROXY_PATH = '/__e2rn/proxy';
+
+/** Headers that belong to a single connection and must not be relayed. */
+const DROPPED_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'host',
+  'content-length',
+  // Ask the upstream for the identity encoding: the body is relayed as is,
+  // and a `content-encoding` header on an already decoded body would make the
+  // browser fail to parse it.
+  'accept-encoding',
+  'origin',
+  'referer',
+]);
+
+function readRequestBody(request: any): Promise<Buffer> {
+  if (request.readableEnded || request.complete) {
+    return Promise.resolve(Buffer.alloc(0));
+  }
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    request.on('data', (chunk: any) => chunks.push(Buffer.from(chunk)));
+    request.on('end', () => resolve(Buffer.concat(chunks)));
+    request.on('error', reject);
+  });
+}
+
+export function relayHeaders(source: Record<string, any>, bodyLength: number): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(source ?? {})) {
+    const name = rawName.toLowerCase();
+    if (DROPPED_HEADERS.has(name) || name === 'content-encoding') {
+      continue;
+    }
+    if (rawValue === undefined || rawValue === null) {
+      continue;
+    }
+    headers[name] = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue);
+  }
+  headers['content-length'] = String(bodyLength);
+  headers['access-control-allow-origin'] = '*';
+  return headers;
+}
+
+const PROXY_TIMEOUT_MS = 60000;
+
+export async function handleProxy(request: any, response: any, search: string): Promise<void> {
+  const reply = (status: number, message: string) => {
+    try {
+      const body = Buffer.from(message, 'utf8');
+      response.writeHead(status, {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Length': body.length,
+        'Access-Control-Allow-Origin': '*',
+      });
+      response.end(body);
+    } catch {
+      // The client may already be gone.
+    }
+  };
+
+  const target = new URLSearchParams(search).get('url') ?? '';
+  let parsed: URL;
+  try {
+    parsed = new URL(target);
+  } catch {
+    reply(400, `invalid proxy target: ${target}`);
+    return;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    reply(400, `unsupported proxy protocol: ${parsed.protocol}`);
+    return;
+  }
+
+  let body: Buffer;
+  try {
+    body = await readRequestBody(request);
+  } catch (error: any) {
+    reply(400, `could not read the request body: ${error?.message ?? error}`);
+    return;
+  }
+
+  const http = require('../../polyfills/node/http');
+  const https = require('../../polyfills/node/https');
+  const transport = parsed.protocol === 'https:' ? https : http;
+
+  const headers: Record<string, string> = {};
+  for (const [rawName, rawValue] of Object.entries(request.headers ?? {})) {
+    const name = rawName.toLowerCase();
+    if (DROPPED_HEADERS.has(name) || rawValue === undefined) {
+      continue;
+    }
+    headers[name] = Array.isArray(rawValue) ? rawValue.join(', ') : String(rawValue);
+  }
+  if (body.length > 0) {
+    headers['content-length'] = String(body.length);
+  }
+
+  await new Promise<void>(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve();
+    };
+
+    let upstream: any;
+    try {
+      upstream = transport.request(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+          path: `${parsed.pathname}${parsed.search}`,
+          method: String(request.method ?? 'GET').toUpperCase(),
+          headers,
+        },
+        (res: any) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: any) => chunks.push(Buffer.from(chunk)));
+          res.on('end', () => {
+            const payload = Buffer.concat(chunks);
+            try {
+              response.writeHead(
+                res.statusCode ?? 502,
+                relayHeaders(res.headers ?? {}, payload.length),
+              );
+              response.end(payload);
+            } catch {
+              // The client may already be gone.
+            }
+            finish();
+          });
+          res.on('error', (error: Error) => {
+            reply(502, `upstream error: ${error.message}`);
+            finish();
+          });
+        },
+      );
+    } catch (error: any) {
+      reply(500, `could not start the upstream request: ${error?.message ?? error}`);
+      finish();
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        upstream.destroy();
+      } catch {
+        // Ignore.
+      }
+      reply(504, `proxy timeout after ${PROXY_TIMEOUT_MS} ms`);
+      finish();
+    }, PROXY_TIMEOUT_MS);
+    timer.unref?.();
+
+    upstream.on('error', (error: Error) => {
+      clearTimeout(timer);
+      reply(502, `upstream error: ${error.message}`);
+      finish();
+    });
+    upstream.on('close', () => clearTimeout(timer));
+
+    if (body.length > 0) {
+      upstream.write(body);
+    }
+    upstream.end();
+  });
+}
+
 /** The request handler that is shared by both server implementations. */
 function handleRequest(request: any, response: any): void {
   const method = String(request.method ?? 'GET').toUpperCase();
@@ -209,6 +402,12 @@ function handleRequest(request: any, response: any): void {
   if (method === 'OPTIONS') {
     response.writeHead(204, headersFor({status: 204, contentType: 'text/plain', body: null}, 0));
     response.end();
+    return;
+  }
+
+  if (pathname === PROXY_PATH) {
+    const queryIndex = target.indexOf('?');
+    void handleProxy(request, response, queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
     return;
   }
 
@@ -270,6 +469,29 @@ async function startWithNativeNet(port: number): Promise<number> {
       const target = String(parts[1] ?? '/');
       const pathname = target.split('?')[0];
       const headOnly = method === 'HEAD';
+      if (pathname === PROXY_PATH) {
+        // This fallback parses the request head only (and accumulates bytes as
+        // UTF-8), so it cannot relay a request body reliably. Report it
+        // explicitly instead of answering with an empty 404.
+        const message = Buffer.from(
+          'The native fallback server cannot proxy requests; the http polyfill must be available.',
+          'utf8',
+        );
+        socket.write(
+          [
+            'HTTP/1.1 501 Not Implemented',
+            'Content-Type: text/plain; charset=utf-8',
+            `Content-Length: ${message.length}`,
+            'Access-Control-Allow-Origin: *',
+            'Connection: close',
+            '',
+            '',
+          ].join('\r\n'),
+        );
+        socket.write(message);
+        socket.end();
+        return;
+      }
       const result = buildAssetResponse(pathname, headOnly, readVirtualWidth(target));
       const body = result.body ?? Buffer.alloc(0);
       const reason = result.status === 200 ? 'OK' : 'Not Found';

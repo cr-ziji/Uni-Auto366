@@ -1,10 +1,26 @@
 /**
  * `dialog` - the Electron dialog shim.
  *
- * React Native has no native file picker or message box, therefore the
- * dialogs are resolved with the "cancelled" result. The desktop code already
- * handles a cancelled dialog, so the ported application keeps working.
+ * The file dialogs are backed by the native picker (`Auto366Files`): picking a
+ * file opens the system document picker and copies the result into the app
+ * cache, saving opens the system "create document" dialog and remembers the
+ * destination, so the bytes a caller writes into the sandbox are relayed there
+ * (see `fs.persistFile`). Message boxes use React Native `Alert`.
+ *
+ * When the native module is not available (iOS, tests) everything degrades to
+ * "cancelled", which the ported desktop code already handles.
  */
+import {Alert} from 'react-native';
+
+import {fileDirectory} from '../../runtime/paths';
+import {
+  isFilePickerAvailable,
+  pickFiles,
+  pickSaveTarget,
+  registerSaveTarget,
+  saveToDownloads,
+} from '../../runtime/native/files';
+import {loadIntoMirror} from '../../polyfills/node/fs';
 
 export interface MessageBoxOptions {
   type?: 'none' | 'info' | 'error' | 'question' | 'warning';
@@ -57,45 +73,164 @@ function messageOf(options: MessageBoxOptions | string, detail?: string): string
   return parts.length > 0 ? parts.join('\n') : '';
 }
 
+/** Turns the `filters` of a dialog into a MIME type for the native picker. */
+function mimeFromFilters(filters?: Array<{name: string; extensions: string[]}>): string {
+  const extension = filters?.[0]?.extensions?.[0]?.toLowerCase();
+  const byExtension: Record<string, string> = {
+    zip: 'application/zip',
+    json: 'application/json',
+    txt: 'text/plain',
+    log: 'text/plain',
+    html: 'text/html',
+    pdf: 'application/pdf',
+    js: 'text/javascript',
+    csv: 'text/csv',
+  };
+  return extension ? byExtension[extension] ?? '*/*' : '*/*';
+}
+
+/** Keeps a user supplied name usable as a file name. */
+function safeFileName(name: string | undefined, fallback: string): string {
+  const cleaned = String(name ?? '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+    .replace(/^\.+$/, '')
+    .trim();
+  return cleaned || fallback;
+}
+
+/** Base name of a desktop path (`C:\a\b.zip` / `/a/b.zip`). */
+function baseNameOf(filePath: string | undefined): string {
+  const segments = String(filePath ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter(Boolean);
+  return segments.pop() ?? '';
+}
+
+/** Directory of the virtual path (the save dialog only hands out such paths). */
+const EXPORT_DIRECTORY = `${fileDirectory}/exports`;
+
 export const dialog = {
-  /** Shows a message box - the user cannot interact with it on mobile. */
+  /** Shows a native alert; the button index becomes `response`. */
   async showMessageBox(options: MessageBoxOptions | string, detail?: string): Promise<MessageBoxResult> {
-    console.warn(`[e2rn] dialog.showMessageBox() is not supported on mobile: ${messageOf(options, detail)}`);
-    return {response: 0, checkboxChecked: false};
+    const settings: MessageBoxOptions = typeof options === 'string' ? {message: options} : options ?? {};
+    const buttons = settings.buttons && settings.buttons.length > 0 ? settings.buttons : ['确定'];
+    const cancelId = typeof settings.cancelId === 'number' ? settings.cancelId : buttons.length - 1;
+    const message = messageOf(options, detail);
+
+    return new Promise<MessageBoxResult>(resolve => {
+      let settled = false;
+      const finish = (response: number) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve({response, checkboxChecked: false});
+      };
+      Alert.alert(
+        settings.title || 'Auto366',
+        message,
+        // Android renders at most three buttons; keep the label order.
+        buttons.slice(0, 3).map((text, index) => ({
+          text: String(text),
+          onPress: () => finish(index),
+        })),
+        {cancelable: true, onDismiss: () => finish(cancelId)},
+      );
+    });
   },
 
-  /** Synchronous variant of {@link showMessageBox}. */
+  /** Synchronous variant - not possible with a native alert, picks the default. */
   showMessageBoxSync(options: MessageBoxOptions | string, detail?: string): number {
-    console.warn(`[e2rn] dialog.showMessageBoxSync() is not supported on mobile: ${messageOf(options, detail)}`);
-    return 0;
+    console.warn(`[e2rn] dialog.showMessageBoxSync() falls back to the first button: ${messageOf(options, detail)}`);
+    return typeof options === 'object' && typeof options.defaultId === 'number'
+      ? options.defaultId
+      : 0;
   },
 
-  /** Shows an error box - the message is written to the log instead. */
+  /** Shows an error box. */
   showErrorBox(title: string, content: string): void {
     console.error(`[e2rn] ${title}: ${content}`);
+    Alert.alert(String(title || 'Auto366'), String(content ?? ''));
   },
 
-  /** Opens the file picker - always cancelled on mobile. */
-  async showOpenDialog(_options?: OpenDialogOptions): Promise<OpenDialogResult> {
-    console.warn('[e2rn] dialog.showOpenDialog() is not supported on mobile.');
-    return {canceled: true, filePaths: []};
+  /** Opens the system document picker; the picked files land in the cache. */
+  async showOpenDialog(options?: OpenDialogOptions): Promise<OpenDialogResult> {
+    if (!isFilePickerAvailable()) {
+      console.warn('[e2rn] dialog.showOpenDialog() is not available on this platform.');
+      return {canceled: true, filePaths: []};
+    }
+    const properties = options?.properties ?? [];
+    if (properties.includes('openDirectory')) {
+      // Android has no "pick a directory and get a writable path" concept; the
+      // Storage Access Framework only hands out `content://` URIs.
+      console.warn('[e2rn] picking a directory is not supported on mobile.');
+      return {canceled: true, filePaths: []};
+    }
+    try {
+      const picked = await pickFiles({multiple: properties.includes('multiSelections')});
+      const filePaths = picked.map(entry => entry.path);
+      // The ported code reads the selection with `readFileSync`, which only
+      // sees the in-memory mirror - load the bytes in so that works.
+      await Promise.all(filePaths.map(path => loadIntoMirror(path).catch(() => false)));
+      return {canceled: filePaths.length === 0, filePaths};
+    } catch (error) {
+      console.error('[e2rn] dialog.showOpenDialog() failed', error);
+      return {canceled: true, filePaths: []};
+    }
   },
 
-  /** Synchronous variant of {@link showOpenDialog}. */
+  /** Synchronous variant of {@link showOpenDialog} - not supported. */
   showOpenDialogSync(_options?: OpenDialogOptions): string[] | undefined {
     return undefined;
   },
 
-  /** Opens the save dialog - always cancelled on mobile. */
-  async showSaveDialog(_options?: SaveDialogOptions): Promise<SaveDialogResult> {
-    console.warn('[e2rn] dialog.showSaveDialog() is not supported on mobile.');
-    return {canceled: true, filePath: undefined, filePaths: []};
+  /**
+   * Opens the system "create document" dialog.
+   *
+   * The returned path is inside the app sandbox (the only place the `fs` shim
+   * can write to); the destination URI is remembered, so the bytes written to
+   * that path are relayed into the document the user picked.
+   */
+  async showSaveDialog(options?: SaveDialogOptions): Promise<SaveDialogResult> {
+    if (!isFilePickerAvailable()) {
+      console.warn('[e2rn] dialog.showSaveDialog() is not available on this platform.');
+      return {canceled: true, filePath: undefined, filePaths: []};
+    }
+    const suggested = safeFileName(
+      baseNameOf(options?.defaultPath) || options?.title,
+      'export.bin',
+    );
+    try {
+      const target = await pickSaveTarget(suggested, mimeFromFilters(options?.filters));
+      if (!target) {
+        return {canceled: true, filePath: undefined, filePaths: []};
+      }
+      const localPath = `${EXPORT_DIRECTORY}/${safeFileName(target.name, suggested)}`;
+      registerSaveTarget(localPath, target.uri);
+      return {canceled: false, filePath: localPath, filePaths: [localPath]};
+    } catch (error) {
+      console.error('[e2rn] dialog.showSaveDialog() failed', error);
+      return {canceled: true, filePath: undefined, filePaths: []};
+    }
   },
 
-  /** Synchronous variant of {@link showSaveDialog}. */
+  /** Synchronous variant of {@link showSaveDialog} - not supported. */
   showSaveDialogSync(_options?: SaveDialogOptions): string | undefined {
     return undefined;
   },
 };
 
 export default dialog;
+
+/** Copies a sandbox file into the public Downloads folder (mobile only). */
+export async function exportToDownloads(
+  path: string,
+  fileName?: string,
+): Promise<string | null> {
+  if (!isFilePickerAvailable()) {
+    return null;
+  }
+  const name = safeFileName(fileName || baseNameOf(path), 'export.bin');
+  return saveToDownloads(path, name);
+}

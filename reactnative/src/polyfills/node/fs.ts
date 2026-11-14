@@ -30,6 +30,7 @@
 import RNFS from 'react-native-fs';
 import {Buffer} from 'buffer';
 import {Readable, Writable} from 'stream';
+import {flushPendingSave} from '../../runtime/native/files';
 import {
   appDataDirectory,
   temporaryDirectory,
@@ -228,6 +229,22 @@ function assetKeyFor(target: string): string | null {
 
 /** In-memory copy of every file of the writable sandbox. */
 const fileMirror = new Map<string, Buffer>();
+/**
+ * Files that live on the device but are deliberately NOT mirrored in memory.
+ *
+ * Appending used to read the whole file, concatenate and write it back, which
+ * is O(size) per append: the log writer appends every 40 ms, so once the log
+ * reached a few megabytes each batch copied and persisted the entire file on
+ * the single JS thread. Startup produces a burst of log lines, and every IPC
+ * reply (which is delivered through `WebView.injectJavaScript`) ended up
+ * queued behind those copies - the renderer then reported "IPC timeout".
+ *
+ * Files above {@link MIRROR_APPEND_LIMIT} therefore stop being mirrored: they
+ * are appended on the device directly and read back asynchronously.
+ */
+const deviceOnlyFiles = new Set<string>();
+/** Size above which a file is no longer kept in the in-memory mirror. */
+const MIRROR_APPEND_LIMIT = 512 * 1024;
 /** In-memory copy of every known directory of the writable sandbox. */
 const directoryMirror = new Set<string>();
 /** Pending device writes, one queue per path. */
@@ -306,6 +323,41 @@ async function ensureDeviceDirectory(directory: string): Promise<void> {
 async function persistFile(target: string, buffer: Buffer): Promise<void> {
   await ensureDeviceDirectory(dirnameOf(target));
   await RNFS.writeFile(target, buffer.toString('base64'), 'base64');
+  // A path returned by `dialog.showSaveDialog()` stands for a document the
+  // user picked through the system dialog; the sandbox copy is only the
+  // intermediate step, the bytes have to reach that document as well.
+  try {
+    await flushPendingSave(target, buffer);
+  } catch {
+    /* the sandbox copy still exists, `shell.openPath` can open it */
+  }
+}
+
+/**
+ * Appends on the device without rewriting the file.
+ *
+ * `writeFile` takes the entire content, so the previous `appendFile` had to
+ * read the file back, concatenate and write everything again - for the log
+ * writer that meant copying and persisting megabytes every 40 ms.
+ */
+async function appendDeviceFile(target: string, addition: Buffer): Promise<void> {
+  await ensureDeviceDirectory(dirnameOf(target));
+  const payload = addition.toString('base64');
+  const nativeAppend = (RNFS as any).appendFile;
+  if (typeof nativeAppend !== 'function') {
+    const current = (await readDeviceFile(target)) ?? Buffer.alloc(0);
+    await persistFile(target, Buffer.concat([current, addition]));
+    return;
+  }
+  try {
+    await nativeAppend.call(RNFS, target, payload, 'base64');
+  } catch (error) {
+    // React-native-fs creates the file on append on Android but not on iOS.
+    if (await deviceExists(target)) {
+      throw error;
+    }
+    await RNFS.writeFile(target, payload, 'base64');
+  }
 }
 
 async function readDeviceFile(target: string): Promise<Buffer | null> {
@@ -480,6 +532,16 @@ function readFileBytesSync(target: string): Buffer {
   if (mirrored) {
     return mirrored;
   }
+  if (deviceOnlyFiles.has(resolved)) {
+    // Only the tail of this file is known; returning it would be wrong and
+    // loading the whole thing synchronously is what made the log writer slow.
+    throw createError(
+      'EBUSY',
+      'read',
+      resolved,
+      'file is only stored on the device (too large to mirror), use the async API',
+    );
+  }
   const asset = readAsset(resolved, 'buffer');
   if (asset !== null) {
     return Buffer.isBuffer(asset) ? asset : Buffer.from(asset);
@@ -488,8 +550,7 @@ function readFileBytesSync(target: string): Buffer {
 }
 
 /** Asynchronous read: mirror, device, bundled assets. */
-async function readFileBytesAsync(target: string): Promise<Buffer> {
-  const resolved = resolveTarget(target);
+async function readFileBytesAsync(target: string): Promise<Buffer> {  const resolved = resolveTarget(target);
   if (isInside(virtualAppRoot, resolved)) {
     const asset = readAsset(resolved, 'buffer');
     if (asset === null) {
@@ -541,6 +602,29 @@ function ensureParentDirectories(target: string): void {
 function storeFile(target: string, buffer: Buffer): void {
   ensureParentDirectories(target);
   fileMirror.set(target, buffer);
+  deviceOnlyFiles.delete(target);
+}
+
+/**
+ * Loads an existing device file into the synchronous mirror.
+ *
+ * Files that come from outside the application (a document picked through the
+ * system picker) exist only on the device, while the ported desktop code reads
+ * them with `readFileSync` - which can only see the mirror. Copying the bytes
+ * in keeps those call sites working without writing to the device again.
+ */
+export async function loadIntoMirror(target: string): Promise<boolean> {
+  const resolved = resolveTarget(target);
+  if (fileMirror.has(resolved)) {
+    return true;
+  }
+  const bytes = await readDeviceFile(resolved);
+  if (!bytes) {
+    return false;
+  }
+  fileMirror.set(resolved, bytes);
+  deviceOnlyFiles.delete(resolved);
+  return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -614,7 +698,7 @@ export function existsSync(target: string): boolean {
   if (isInside(virtualAppRoot, resolved)) {
     return assetExists(resolved);
   }
-  if (fileMirror.has(resolved) || directoryMirror.has(resolved)) {
+  if (fileMirror.has(resolved) || directoryMirror.has(resolved) || deviceOnlyFiles.has(resolved)) {
     return true;
   }
   return assetExists(resolved);
@@ -691,10 +775,33 @@ export async function appendFile(
   assertWritable(resolved);
   const encoding = typeof options === 'string' ? options : options?.encoding;
   const addition = toBuffer(data, encoding);
-  const current = fileMirror.get(resolved) ?? (await readDeviceFile(resolved)) ?? Buffer.alloc(0);
-  const buffer = Buffer.concat([current, addition]);
-  storeFile(resolved, buffer);
-  await queueWrite(resolved, () => persistFile(resolved, buffer));
+  mirrorAppend(resolved, addition);
+  await queueWrite(resolved, () => appendDeviceFile(resolved, addition));
+}
+
+/**
+ * Keeps the in-memory mirror in sync with an append, without ever copying a
+ * large file again.
+ *
+ * Three cases:
+ *  - the file is mirrored and small  -> concatenate (synchronous readers see it);
+ *  - the file is not mirrored at all -> mark it device-only, because only the
+ *    tail is known and a partial mirror would return wrong content;
+ *  - the file is mirrored but large  -> drop the mirror for the same reason.
+ */
+function mirrorAppend(resolved: string, addition: Buffer): void {
+  const mirrored = fileMirror.get(resolved);
+  if (!mirrored) {
+    ensureParentDirectories(resolved);
+    deviceOnlyFiles.add(resolved);
+    return;
+  }
+  if (mirrored.length + addition.length <= MIRROR_APPEND_LIMIT) {
+    fileMirror.set(resolved, Buffer.concat([mirrored, addition]));
+    return;
+  }
+  fileMirror.delete(resolved);
+  deviceOnlyFiles.add(resolved);
 }
 
 export function appendFileSync(
@@ -706,10 +813,8 @@ export function appendFileSync(
   assertWritable(resolved);
   const encoding = typeof options === 'string' ? options : options?.encoding;
   const addition = toBuffer(data, encoding);
-  const current = fileMirror.get(resolved) ?? Buffer.alloc(0);
-  const buffer = Buffer.concat([current, addition]);
-  storeFile(resolved, buffer);
-  queueWrite(resolved, () => persistFile(resolved, buffer)).catch(error =>
+  mirrorAppend(resolved, addition);
+  queueWrite(resolved, () => appendDeviceFile(resolved, addition)).catch(error =>
     reportPersistenceError(resolved, error),
   );
 }
@@ -771,6 +876,11 @@ function removeFromMirror(target: string): void {
   for (const key of Array.from(fileMirror.keys())) {
     if (key === target || key.startsWith(prefix)) {
       fileMirror.delete(key);
+    }
+  }
+  for (const key of Array.from(deviceOnlyFiles)) {
+    if (key === target || key.startsWith(prefix)) {
+      deviceOnlyFiles.delete(key);
     }
   }
   for (const key of Array.from(directoryMirror)) {
@@ -925,10 +1035,11 @@ export const lstatSync = statSync;
 
 export async function unlink(target: string): Promise<void> {
   const resolved = resolveTarget(target);
-  if (!fileMirror.has(resolved) && !(await deviceExists(resolved))) {
+  if (!fileMirror.has(resolved) && !deviceOnlyFiles.has(resolved) && !(await deviceExists(resolved))) {
     throw enoent(resolved, 'unlink');
   }
   fileMirror.delete(resolved);
+  deviceOnlyFiles.delete(resolved);
   await queueWrite(resolved, async () => {
     try {
       await RNFS.unlink(resolved);
@@ -943,10 +1054,11 @@ export async function unlink(target: string): Promise<void> {
 
 export function unlinkSync(target: string): void {
   const resolved = resolveTarget(target);
-  if (!fileMirror.has(resolved)) {
+  if (!fileMirror.has(resolved) && !deviceOnlyFiles.has(resolved)) {
     throw enoent(resolved, 'unlink');
   }
   fileMirror.delete(resolved);
+  deviceOnlyFiles.delete(resolved);
   queueWrite(resolved, async () => {
     try {
       await RNFS.unlink(resolved);
@@ -1002,6 +1114,9 @@ export async function rename(source: string, destination: string): Promise<void>
   if (buffer) {
     fileMirror.delete(from);
     storeFile(to, buffer);
+  } else if (deviceOnlyFiles.has(from)) {
+    deviceOnlyFiles.delete(from);
+    deviceOnlyFiles.add(to);
   }
   await queueWrite(to, async () => {
     await ensureDeviceDirectory(dirnameOf(to));
@@ -1025,6 +1140,9 @@ export function renameSync(source: string, destination: string): void {
   if (buffer) {
     fileMirror.delete(from);
     storeFile(to, buffer);
+  } else if (deviceOnlyFiles.has(from)) {
+    deviceOnlyFiles.delete(from);
+    deviceOnlyFiles.add(to);
   }
   queueWrite(to, async () => {
     await ensureDeviceDirectory(dirnameOf(to));
@@ -1770,6 +1888,7 @@ const fs = {
   fdatasyncSync,
   hydrateFileSystem,
   flushPendingWrites,
+  loadIntoMirror,
   lstat,
   lstatSync,
   mkdir,
