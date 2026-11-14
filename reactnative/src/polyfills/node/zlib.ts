@@ -33,6 +33,14 @@ export function inflateSync(data: string | Uint8Array): Buffer {
   return Buffer.from(fflateInflate(toBytes(data)));
 }
 
+/**
+ * ZIP stores raw deflate (no zlib wrapper), which is exactly what fflate's
+ * `deflate`/`inflate` do — the "raw" variants are therefore aliases here.
+ * `modules/injection/zip.js` needs them to rewrite archives in place.
+ */
+export const deflateRawSync = deflateSync;
+export const inflateRawSync = inflateSync;
+
 export function unzlibSync(data: string | Uint8Array): Buffer {
   return Buffer.from(fflateUnzlib(toBytes(data)));
 }

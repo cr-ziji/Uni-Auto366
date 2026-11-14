@@ -7,6 +7,8 @@ const archiver = require('archiver');
 // 这个文件里的方法会被挂到 InjectionManager.prototype 上，作用域仍属于本模块，
 // 所以日志器必须在这里声明（之前只在 index.js 声明，下载容错分支引用它会直接 ReferenceError）。
 const moduleLog = require('../logging').create('注入');
+const {isMobile} = require('../app/platform');
+const {applyInjectScript} = require('./zip');
 
 module.exports = {
 /** 流是否被提前关闭（移动端 socket 语义导致，见 downloadWithTimeout）。 */
@@ -98,7 +100,8 @@ async downloadWithTimeout(downloadUrl, savePath, timeout = 30000, redirects = 0,
       if (response.statusCode !== 200) { response.resume(); throw new Error('下载失败: HTTP ' + response.statusCode); }
       created = true;
       try {
-        await require('stream/promises').pipeline(response, fs.createWriteStream(savePath));
+        // 移动端这个包紧接着就交给注入流程，落盘只是白花一次整包 base64 桥写。
+        await require('stream/promises').pipeline(response, fs.createWriteStream(savePath, {persist: !isMobile}));
       } catch (error) {
         // 移动端的响应流由原生 socket 回调驱动：正文读满后底层连接的 close 可能
         // 先于 'end' 到达，pipeline 的 end-of-stream 判定于是报 Premature close，
@@ -182,36 +185,9 @@ async findAllHtmlFiles(dir) {
   },
 
 async injectScriptIntoHtml(htmlFilePath, scriptFileName) {
-    let content = await fs.readFile(htmlFilePath, 'utf-8');
-
-    // 听说页会在正文脚本里立刻加载 jquery.recordwave.js / exam-pc-v1.js。
-    // 若仍用 createElement 异步追加，录音库可能先缓存真实 getUserMedia，
-    // 后续再替换 navigator.mediaDevices 已经来不及。直接放到 body 起始处，
-    // 利用普通 script 的解析阻塞语义保证假麦克风先完成接管。
-    if (scriptFileName === 'auto-listening.js') {
-      const directTag = `<script src="./${scriptFileName}"></script>`;
-      if (!content.includes(directTag)) {
-        content = content.replace(/<body(\s[^>]*)?>/i, (bodyTag) => bodyTag + directTag);
-      }
-      await fs.writeFile(htmlFilePath, content, 'utf-8');
-      return;
-    }
-
-    const injectCode = `var s = document.createElement('script');s.src='./${scriptFileName}';document.body.appendChild(s);`;
-
-    if (content.includes('loadFile.load()')) {
-      content = content.replace(
-        /\.then\s*\(\s*function\s*\(\s*\)\s*\{/g,
-        '.then(function(){' + injectCode
-      );
-    } else {
-      content = content.replace(
-        /<\/body>/i,
-        '<script>' + injectCode + '</script></body>'
-      );
-    }
-
-    await fs.writeFile(htmlFilePath, content, 'utf-8');
+    const content = await fs.readFile(htmlFilePath, 'utf-8');
+    // 注入规则和原地改写（zip.js）必须完全一致，否则两条路径行为不同。
+    await fs.writeFile(htmlFilePath, applyInjectScript(content, scriptFileName), 'utf-8');
   },
 
 repackZip(sourceDir, outputPath) {

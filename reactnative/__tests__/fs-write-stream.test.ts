@@ -67,4 +67,11 @@ describe('fs.createWriteStream', () => {
     await closed;
     expect(await fsPoly.promises.readFile(target, 'utf8')).toBe('PK\u0003\u0004partial');
   });
+
+  it('keeps persist:false files in the memory mirror only', async () => {
+    const target = `${dir}/mirror-only.bin`;
+    await write(target, ['abc', 'def'], {persist: false});
+    expect(await fsPoly.promises.readFile(target, 'utf8')).toBe('abcdef');
+    expect(await fsPoly.exists(target)).toBe(true);
+  });
 });

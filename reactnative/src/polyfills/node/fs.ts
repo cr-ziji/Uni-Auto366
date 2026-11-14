@@ -1408,6 +1408,9 @@ export function createWriteStream(target: string, options?: any): Writable {
   const resolved = resolveTarget(target);
   const flags = String(options?.flags ?? 'w');
   const appendMode = flags.includes('a');
+  // `persist: false` 只写内存镜像、不落盘：移动端把下载到的临时 ZIP 紧接着就要
+  // 交给注入流程，整包 base64 过桥写一次既慢又占内存，进程内用完即弃就够了。
+  const persist = options?.persist !== false;
   // 每次 write 都是一块数据，必须累积。之前默认 flags（'w'）每块都整份覆盖镜像，
   // 多块写入的结果只剩最后一块：下载的 ZIP / archiver 打出的包因此永远是坏的。
   const chunks: Buffer[] = [];
@@ -1424,9 +1427,11 @@ export function createWriteStream(target: string, options?: any): Writable {
       : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
     chunks.length = 0;
     fileMirror.set(resolved, content);
-    queueWrite(resolved, () => persistFile(resolved, content)).catch(error =>
-      reportPersistenceError(resolved, error),
-    );
+    if (persist) {
+      queueWrite(resolved, () => persistFile(resolved, content)).catch(error =>
+        reportPersistenceError(resolved, error),
+      );
+    }
   };
 
   const stream = new Writable({
