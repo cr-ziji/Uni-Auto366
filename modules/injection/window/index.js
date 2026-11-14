@@ -63,7 +63,8 @@ sendProgress(step, message, percent) {
       }
       this.safeIpcSend('rule-log', moduleLog.event({
         type: step === 'error' ? 'error' : (step === 'done' ? 'success' : 'info'),
-        message: `[动态注入] ${message} (${percent || 0}%)`
+        // 失败/完成时没有百分比，别再打出误导性的 (0%)。
+        message: `[动态注入] ${message}${typeof percent === 'number' ? ` (${percent}%)` : ''}`
       }));
     } catch (error) {}
   },

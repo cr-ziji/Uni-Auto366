@@ -236,7 +236,7 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
       const originalZipPath = path.join(injectDir, 'original.zip');
       const urls = [downloadUrl];
       stage = '下载原始ZIP';
-      await this.downloadWithTimeout(downloadUrl, originalZipPath, timeout, 0, Date.now() + timeout, this.abortController.signal, redirected => urls.push(redirected));
+      await this.downloadWithRetry(downloadUrl, originalZipPath, timeout, this.abortController.signal, redirected => urls.push(redirected));
 
       this.sendProgress('extracting', '正在解压ZIP...', 30);
       const extractDir = path.join(injectDir, 'extracted');

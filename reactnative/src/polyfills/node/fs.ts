@@ -1407,22 +1407,56 @@ export function createReadStream(target: string, options?: any): Readable {
 export function createWriteStream(target: string, options?: any): Writable {
   const resolved = resolveTarget(target);
   const flags = String(options?.flags ?? 'w');
+  const appendMode = flags.includes('a');
+  // 每次 write 都是一块数据，必须累积。之前默认 flags（'w'）每块都整份覆盖镜像，
+  // 多块写入的结果只剩最后一块：下载的 ZIP / archiver 打出的包因此永远是坏的。
+  const chunks: Buffer[] = [];
+  let flushed = false;
+
+  const flush = () => {
+    if (flushed) {
+      return;
+    }
+    flushed = true;
+    const head = appendMode ? fileMirror.get(resolved) ?? Buffer.alloc(0) : null;
+    const content = head && head.length
+      ? Buffer.concat([head, ...chunks])
+      : chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
+    chunks.length = 0;
+    fileMirror.set(resolved, content);
+    queueWrite(resolved, () => persistFile(resolved, content)).catch(error =>
+      reportPersistenceError(resolved, error),
+    );
+  };
+
   const stream = new Writable({
     highWaterMark: options?.highWaterMark,
     write(chunk: any, _encoding: any, callback: (error?: Error | null) => void) {
       try {
-        const buffer = toBuffer(chunk);
-        const current = fileMirror.get(resolved);
-        if (!current || !flags.includes('a')) {
-          fileMirror.set(resolved, buffer);
-        } else {
-          fileMirror.set(resolved, Buffer.concat([current, buffer]));
-        }
+        chunks.push(toBuffer(chunk));
         ensureParentDirectories(resolved);
         callback();
       } catch (error) {
         callback(error as Error);
       }
+    },
+    final(callback: (error?: Error | null) => void) {
+      try {
+        flush();
+        callback();
+      } catch (error) {
+        callback(error as Error);
+      }
+    },
+    destroy(error: Error | null, callback: (error?: Error | null) => void) {
+      // 中途失败（下载被截断）时也保留已写入的部分，否则调用方看到的文件是空的，
+      // 连"收到多少字节"都查不出来。
+      try {
+        flush();
+      } catch {
+        /* the destroy callback still reports the original error */
+      }
+      callback(error);
     },
   }) as any;
 
@@ -1434,10 +1468,6 @@ export function createWriteStream(target: string, options?: any): Writable {
 
   let closed = false;
   stream.on('finish', () => {
-    const buffer = fileMirror.get(resolved) ?? Buffer.alloc(0);
-    queueWrite(resolved, () => persistFile(resolved, buffer)).catch(error =>
-      reportPersistenceError(resolved, error),
-    );
     if (!closed) {
       closed = true;
       stream.emit('close');
