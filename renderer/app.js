@@ -196,7 +196,10 @@ class Auto366App {
       if (window.electronAPI && window.electronAPI.getUiMode) {
         const uiMode = await window.electronAPI.getUiMode();
         document.documentElement.setAttribute('data-ui', uiMode);
-        
+
+        // data-ui 确定后同步移动端默认面板（启动默认停在「监听日志」）
+        this.eventManager?.syncMobileDefaultPanel?.();
+
         if (uiMode === 'simple') {
           document.documentElement.setAttribute('data-simple-page', 'menu');
           await this.rulesUI.renderSimpleHomeRulesets();
@@ -357,6 +360,8 @@ class Auto366App {
 
     // 每5次启动显示一次
     if (newCount % 5 === 0) {
+      // 重复调用时先清掉旧的，否则同一个 id 会叠出多层、后加的那层定位也不对
+      document.getElementById('donation-modal')?.remove();
       const modal = document.createElement('div');
       modal.id = 'donation-modal';
       modal.className = 'modal modal--donation';

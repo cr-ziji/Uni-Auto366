@@ -35,12 +35,19 @@ export default class TutorialManager {
   }
   steps() {
     const simple = document.documentElement.dataset.ui === 'simple';
+    // 移动端移除了 data-desktop-only 的桌面入口（自动寻找缓存、增强模式），
+    // 这些步骤既没有可点击的目标，文案也不该再让用户去找不存在的按钮。
+    const mobile = document.documentElement.getAttribute('data-e2rn-mobile') === '1';
     return [
       { title: '欢迎使用 Auto366', text: '本教学将手把手带领你学习 Auto366 的使用。', welcome: true },
       { title: '打开设置', text: '点击高亮的「设置」。接下来先找到天学网的缓存目录。', selector: this.navigation('settings'), click: true },
-      { title: '先用自动寻找', text: '配置缓存时，优先点「自动寻找」，确认找到的是天学网正在使用的 Up366StudentFiles。没有找到时，再用旁边的「浏览」手动选择。现在只需认识入口。', view: 'settings', selector: '#autoFindCacheBtn', acknowledge: true },
+      mobile
+        ? { title: '缓存目录', text: '设置页里能看到当前缓存目录。移动端由系统分配应用私有存储，不需要手动选择路径，这里只需认识入口。', view: 'settings', acknowledge: true }
+        : { title: '先用自动寻找', text: '配置缓存时，优先点「自动寻找」，确认找到的是天学网正在使用的 Up366StudentFiles。没有找到时，再用旁边的「浏览」手动选择。现在只需认识入口。', view: 'settings', selector: '#autoFindCacheBtn', acknowledge: true },
       { title: '启动代理', text: '使用时先点「启动代理」，等状态显示已启动。失败时查看日志中的端口或证书提示。教程中不用实际启动。', selector: '#toggleProxyBtn', acknowledge: true },
-      { title: '新版天学网必须开启增强模式', text: '先确认代理已启动，再点高亮的闪电按钮开启增强模式。新版天学网必须使用此模式；确认接入列表包含天学网进程。首次可能需要下载资源和管理员权限。', selector: '#toggleTunBtn', acknowledge: true },
+      mobile
+        ? { title: '接入方式', text: '移动端由系统网络和本地代理接手，不需要开启桌面端的增强模式。先确认代理已启动，再打开题目即可。', acknowledge: true }
+        : { title: '新版天学网必须开启增强模式', text: '先确认代理已启动，再点高亮的闪电按钮开启增强模式。新版天学网必须使用此模式；确认接入列表包含天学网进程。首次可能需要下载资源和管理员权限。', selector: '#toggleTunBtn', acknowledge: true },
       { title: '打开规则集', text: '点击高亮的「规则集」。只开启当前题型需要的规则，保留兼容性保护。', selector: this.navigation('rules'), click: true },
       { title: simple ? '认识规则卡片' : '认识规则开关', text: simple ? '点击规则卡片会启用这一组并进入答案页。高亮只是位置示例，实际使用时按题型选择，不要全部开启。' : '名称右侧的开关控制整组规则，点击名称可展开子规则。高亮只是位置示例，实际使用时按题型选择，不要全部开启。', view: 'rules', selector: simple ? '#rules-view .rule-group--clickable .rule-group__name' : '#rules-view .rule-group__name .toggle', acknowledge: true },
       { title: '了解 AI 答案获取', text: '未支持的题型可在这里尝试 AI 获取。它会将脱敏样本发给所选 AI，仍可能含个人信息。新规则在这里预览，核对答案后才启用；此功能可选。', view: 'settings', selector: '#answerLearningEnabled', acknowledge: true },
@@ -48,7 +55,9 @@ export default class TutorialManager {
       { title: '查看答案', text: '点击高亮的「答案获取」。AI 新规则的待确认预览仍在设置页。', selector: this.navigation('answers'), click: true },
       { title: '确认获取开关', text: '打开题目前保持此开关开启，结果可复制或导出。遇到异常优先清缓存并重启；仍无结果时，再检查代理、增强模式、适用规则和此开关。', view: 'answers', selector: '#answers-view .view-panel__controls .toggle', acknowledge: true },
       { title: '遇到异常先清缓存并重启', text: '先结束正在进行的作答，确认缓存目录正确。点击顶部「清理缓存」，在日志区确认提示中短按「清理并重启」，之后重新打开题目；长按是仅清理。此处只学习入口，不必实际清理。', selector: '#clearCacheBtn', acknowledge: true },
-      { title: '新版仍报错时，先回退并还原', text: '清缓存重启后仍报兼容或连接错误：先回退旧版天学网，执行「还原天学网设置」，重启天学网，再启动 Auto366 代理并开启高亮的增强模式。仍异常时查看日志，不要反复修改端口或重置证书。', selector: '#toggleTunBtn', acknowledge: true },
+      mobile
+        ? { title: '仍报错时的排查顺序', text: '清缓存并重启后仍然报兼容或连接错误：先确认代理已启动、适用规则已开启，再重新打开题目。仍异常时查看监听日志，不要反复修改端口或重置证书。', acknowledge: true }
+        : { title: '新版仍报错时，先回退并还原', text: '清缓存重启后仍报兼容或连接错误：先回退旧版天学网，执行「还原天学网设置」，重启天学网，再启动 Auto366 代理并开启高亮的增强模式。仍异常时查看日志，不要反复修改端口或重置证书。', selector: '#toggleTunBtn', acknowledge: true },
       { title: '使用前的小测验', text: '每题选一个答案，全部答对即可完成。答错后可根据提示修改。', quiz: true },
     ];
   }
@@ -183,7 +192,8 @@ export default class TutorialManager {
     document.getElementById('tutorialDescription').textContent = step.text;
     document.getElementById('tutorialFeedback').textContent = '';
     document.getElementById('tutorialPrevBtn').disabled = this.currentPage === 0;
-    document.getElementById('tutorialLocateBtn').hidden = !step.selector;
+    // 目标不在当前 DOM 里时「查找按钮」点了也没用，直接不显示
+    document.getElementById('tutorialLocateBtn').hidden = !step.selector || !document.querySelector(step.selector);
     document.getElementById('tutorialAcknowledge').hidden = !step.acknowledge;
     document.querySelector('#tutorialAcknowledge span').textContent = '我已了解';
     document.getElementById('tutorialUnderstood').checked = this.visited.has(this.currentPage);
@@ -209,8 +219,14 @@ export default class TutorialManager {
   updateNext() {
     if (!this.modal || this.modal.hidden) return;
     const step = this.steps()[this.currentPage];
-    const ready = step.click || step.acknowledge ? this.visited.has(this.currentPage) && !!this.target?.getClientRects().length : true;
     const button = document.getElementById('tutorialNextBtn');
+    // 「我已了解」只要勾选就算确认；点击型步骤必须真的点到高亮入口。
+    // 目标元素不存在时不能让教程卡死——移动端会移除 data-desktop-only 的
+    // 桌面入口（自动寻找缓存、增强模式），这些步骤在手机上只能阅读。
+    const missing = !!step.selector && !document.querySelector(step.selector);
+    const ready = step.click || step.acknowledge
+      ? missing || this.visited.has(this.currentPage)
+      : true;
     button.disabled = !ready;
     button.textContent = step.quiz ? this.passed ? '完成教程' : '检查答案' : step.welcome ? '开始学习' : ready ? '下一步' : step.click ? '请点击高亮入口' : '请确认已理解';
   }

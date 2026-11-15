@@ -34,4 +34,8 @@
 @import "./overlay/modal-donation.css";
 @import "./overlay/agreement.css";
 
+/* 移动端（React Native 宿主）响应式布局。所有规则都限定在
+   html[data-e2rn-mobile="1"] 下，桌面端不会命中。 */
+@import "./mobile/app-mobile.css";
+
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; } }

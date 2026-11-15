@@ -1,6 +1,7 @@
 import navigationMethods from './navigation.js';
 import layoutMethods from './layout.js';
 import titlebarMethods from './titlebar.js';
+import mobileMethods from './mobile.js';
 
 class EventManager {
   constructor(state) {
@@ -16,6 +17,7 @@ class EventManager {
     this.initWindowTitlebar();
     this.initImportAnswer();
     this.initLogButtons();
+    this.initMobileLayout();
   }
 
   // 初始化日志相关按钮
@@ -80,5 +82,5 @@ class EventManager {
 }
 
 // Submodules share this feature's instance; existing method contracts stay unchanged.
-Object.assign(EventManager.prototype, navigationMethods, layoutMethods, titlebarMethods);
+Object.assign(EventManager.prototype, navigationMethods, layoutMethods, titlebarMethods, mobileMethods);
 export default EventManager;

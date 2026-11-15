@@ -233,3 +233,8 @@ html[data-ui="simple"] .sidebar {
 html[data-ui="simple"][data-simple-page="app"] .main {
     overflow-x: visible;
 }
+
+/* 移动端专属的「监听日志」导航项，桌面端隐藏（由 mobile/app-mobile.css 显示） */
+.sidebar__item--mobile-logs {
+    display: none;
+}

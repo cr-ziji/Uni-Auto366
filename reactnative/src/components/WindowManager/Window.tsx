@@ -2,15 +2,19 @@
  * Renders a single Electron window as a `react-native-webview`.
  *
  * The desktop application renders its UI in a 1400x900 (or 875x1010 in the
- * "simple" mode) Chromium window. On a phone the WebView fills the whole
- * available area and the *page* is scaled by the WebView itself: its viewport
- * meta declares the desktop width and `scalesPageToFit` fits that width onto
- * the screen. No React Native `transform` is involved - a transformed WebView
- * would be rasterised at 1400x900 dp (~4200x2700 physical pixels) and every
- * repaint would flicker.
+ * "simple" mode) Chromium window. The renderer itself ships a responsive
+ * mobile layout: on a phone the asset server keeps `width=device-width`, adds
+ * `data-e2rn-mobile="1"` to the document and the WebView lays the page out at
+ * the real device width (no page scale, no React Native `transform` - a
+ * transformed WebView would be rasterised at 1400x900 dp and every repaint
+ * would flicker).
+ *
+ * The desktop layout is still available (and used for the auxiliary windows
+ * of a desktop build) through the virtual width query parameter, which is
+ * what the `viewport.ts` helpers compute.
  */
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
-import {StyleSheet, View} from 'react-native';
+import {Platform, StyleSheet, View} from 'react-native';
 import {WebView, type WebViewMessageEvent} from 'react-native-webview';
 
 import {PRELOAD_BRIDGE_SOURCE} from '../preloadBridge';
@@ -18,7 +22,7 @@ import {buildPreloadScript} from '../../runtime/preload';
 import {handleBridgeMessage} from '../../runtime/WindowManagerBridge';
 import type {WindowState} from '../../runtime/windowState';
 import {getAssetServerBaseUrl, getAssetUrl, startAssetServer} from '../../runtime/web/assetServer';
-import {withVirtualWidth} from '../../runtime/web/virtualWidth';
+import {withMobileLayout, withVirtualWidth} from '../../runtime/web/virtualWidth';
 import {registerWebView, unregisterWebView} from '../../runtime/webviewRegistry';
 import {notifyWindowLoaded} from '../../shims/electron/browserWindow';
 import {useAppTheme} from '../../theme/useAppTheme';
@@ -143,13 +147,27 @@ export function Window({window, containerWidth, containerHeight}: WindowProps) {
     };
   }, [windowId, servedUrl, assetPath]);
 
+  // The renderer is a responsive mobile UI: the asset server keeps
+  // `width=device-width`, marks the document with `data-e2rn-mobile="1"` and
+  // the mobile stylesheet takes over. No page scaling is involved.
+  const mobileLayout = Platform.OS === 'android' || Platform.OS === 'ios';
+
   // The page is scaled by the WebView, therefore the URL carries the width of
   // the desktop window (`?e2rn_vw=1400`). The asset server rewrites the
   // viewport meta of the HTML with it.
-  const pageUrl = useMemo(
-    () => (source ? withVirtualWidth(source, layout.virtualWidth) : ''),
-    [source, layout.virtualWidth],
-  );
+  const pageUrl = useMemo(() => {
+    if (!source) {
+      return '';
+    }
+    if (mobileLayout) {
+      // Only the local asset server serves the renderer HTML - a remote page
+      // (for example a rule set console) must keep its URL, including any
+      // query parameters that are part of its own contract.
+      const base = getAssetServerBaseUrl();
+      return base && source.startsWith(base) ? withMobileLayout(source, true) : source;
+    }
+    return withVirtualWidth(source, layout.virtualWidth);
+  }, [source, layout.virtualWidth, mobileLayout]);
 
   // Make the WebView known to the Electron shims.
   useEffect(() => {
@@ -226,7 +244,7 @@ export function Window({window, containerWidth, containerHeight}: WindowProps) {
           allowUniversalAccessFromFileURLs
           mixedContentMode="always"
           setSupportMultipleWindows={false}
-          scalesPageToFit
+          scalesPageToFit={!mobileLayout}
           setBuiltInZoomControls={false}
           setDisplayZoomControls={false}
           injectedJavaScriptBeforeContentLoaded={preloadScript}

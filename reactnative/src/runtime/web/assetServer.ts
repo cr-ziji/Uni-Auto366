@@ -18,7 +18,7 @@
 import {Buffer} from 'buffer';
 
 import {getWebAssetBuffer, getWebAssetContentType, listWebAssets} from '../../web-assets';
-import {readVirtualWidth} from './virtualWidth';
+import {isMobileLayout, readVirtualWidth} from './virtualWidth';
 
 const HOST = '127.0.0.1';
 
@@ -150,11 +150,58 @@ export function rewriteViewportMeta(html: string, virtualWidth: number): string 
   return `${meta}\n${html}`;
 }
 
+/**
+ * Rewrites the HTML of the renderer for the responsive mobile layout.
+ *
+ * The page keeps `width=device-width` (the WebView is told not to use a wide
+ * viewport, so one CSS pixel is one device independent pixel), the document
+ * is marked with `data-e2rn-mobile="1"` - every rule of
+ * `styles/mobile/app-mobile.css` is scoped to that attribute - and the
+ * desktop titlebar padding is removed before the stylesheet has loaded, which
+ * otherwise shows up as a flash of a 36 px tall empty strip.
+ *
+ * The desktop build loads `index.html` from disk and never passes through
+ * this function, so its markup is untouched.
+ */
+export function rewriteMobileHtml(html: string): string {
+  const meta =
+    '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">';
+  const earlyStyle =
+    '<style>html[data-e2rn-mobile="1"]{--titlebar-height:0px}html[data-e2rn-mobile="1"] body{padding-top:0}</style>';
+
+  let result = html;
+  if (VIEWPORT_META.test(result)) {
+    result = result.replace(VIEWPORT_META, meta);
+  } else {
+    const head = /<head\b[^>]*>/i;
+    result = head.test(result)
+      ? result.replace(head, match => `${match}\n    ${meta}`)
+      : `${meta}\n${result}`;
+  }
+
+  // Mark the document (once) so the mobile stylesheet can take over.
+  if (!/<html\b[^>]*\bdata-e2rn-mobile\b/i.test(result)) {
+    const htmlTag = /<html\b[^>]*>/i;
+    result = htmlTag.test(result)
+      ? result.replace(htmlTag, match => `${match.slice(0, -1)} data-e2rn-mobile="1">`)
+      : result;
+  }
+
+  const head = /<head\b[^>]*>/i;
+  if (!/--titlebar-height\s*:\s*0px/.test(result) && head.test(result)) {
+    result = result.replace(head, match => `${match}\n    ${earlyStyle}`);
+  } else if (!/--titlebar-height\s*:\s*0px/.test(result)) {
+    result = `${earlyStyle}\n${result}`;
+  }
+  return result;
+}
+
 /** Builds the response for a request path. */
 export function buildAssetResponse(
   pathname: string,
   headOnly: boolean,
   virtualWidth?: number | null,
+  mobile?: boolean,
 ): AssetResponse {
   const name = resolveAssetPath(pathname);
   if (!name) {
@@ -175,12 +222,15 @@ export function buildAssetResponse(
     };
   }
   const contentType = getWebAssetContentType(name);
-  if (virtualWidth && /html/i.test(contentType)) {
+  if (/html/i.test(contentType) && (mobile || virtualWidth)) {
     const html = buffer.toString('utf8');
+    const rewritten = mobile
+      ? rewriteMobileHtml(html)
+      : rewriteViewportMeta(html, virtualWidth as number);
     return {
       status: 200,
       contentType,
-      body: headOnly ? null : Buffer.from(rewriteViewportMeta(html, virtualWidth), 'utf8'),
+      body: headOnly ? null : Buffer.from(rewritten, 'utf8'),
     };
   }
   return {
@@ -477,7 +527,12 @@ export function handleRequest(request: any, response: any): void | Promise<void>
     return handleProxy(request, response, queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
   }
 
-  const result = buildAssetResponse(pathname, headOnly, readVirtualWidth(target));
+  const result = buildAssetResponse(
+    pathname,
+    headOnly,
+    readVirtualWidth(target),
+    isMobileLayout(target),
+  );
   const body = result.body ?? Buffer.alloc(0);
   response.writeHead(result.status, headersFor(result, body.length));
   response.end(headOnly ? undefined : body);
@@ -558,7 +613,12 @@ async function startWithNativeNet(port: number): Promise<number> {
         socket.end();
         return;
       }
-      const result = buildAssetResponse(pathname, headOnly, readVirtualWidth(target));
+      const result = buildAssetResponse(
+        pathname,
+        headOnly,
+        readVirtualWidth(target),
+        isMobileLayout(target),
+      );
       const body = result.body ?? Buffer.alloc(0);
       const reason = result.status === 200 ? 'OK' : 'Not Found';
       const responseHead = [
@@ -702,5 +762,6 @@ export default {
   resolveAssetPath,
   buildAssetResponse,
   rewriteViewportMeta,
+  rewriteMobileHtml,
   stopAssetServer,
 };

@@ -1,6 +1,9 @@
 class StateManager {
   constructor() {
-    this.currentView = 'proxy';
+    // 启动时 index.html 默认展示的是「答案获取」面板，这里必须与 DOM 一致。
+    // 原来写的是 'proxy'，而这个视图早已不存在，移动端的底部导航会按它同步
+    // 选中态，结果是启动后一个导航项都没选中。
+    this.currentView = 'answers';
     this.isProxyRunning = false;
     this.isCapturing = false;
     this.requestDataMap = new Map();
