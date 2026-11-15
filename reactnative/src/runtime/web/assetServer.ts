@@ -17,7 +17,7 @@
  */
 import {Buffer} from 'buffer';
 
-import {getWebAssetBytes, getWebAssetContentType, listWebAssets} from '../../web-assets';
+import {getWebAssetBuffer, getWebAssetContentType, listWebAssets} from '../../web-assets';
 import {readVirtualWidth} from './virtualWidth';
 
 const HOST = '127.0.0.1';
@@ -164,8 +164,10 @@ export function buildAssetResponse(
       body: headOnly ? null : Buffer.from('Not Found', 'utf8'),
     };
   }
-  const bytes = getWebAssetBytes(name);
-  if (!bytes) {
+  // `getWebAssetBuffer` caches the decoded body; the renderer asks for the
+  // same CSS/JS/font files several times per page load.
+  const buffer = getWebAssetBuffer(name);
+  if (!buffer) {
     return {
       status: 404,
       contentType: 'text/plain; charset=utf-8',
@@ -174,7 +176,7 @@ export function buildAssetResponse(
   }
   const contentType = getWebAssetContentType(name);
   if (virtualWidth && /html/i.test(contentType)) {
-    const html = Buffer.from(bytes).toString('utf8');
+    const html = buffer.toString('utf8');
     return {
       status: 200,
       contentType,
@@ -184,7 +186,7 @@ export function buildAssetResponse(
   return {
     status: 200,
     contentType,
-    body: headOnly ? null : Buffer.from(bytes),
+    body: headOnly ? null : buffer,
   };
 }
 
@@ -237,7 +239,13 @@ const DROPPED_HEADERS = new Set([
 ]);
 
 function readRequestBody(request: any): Promise<Buffer> {
-  if (request.readableEnded || request.complete) {
+  // The http polyfill buffers the whole request body before the handler runs and
+  // only replays it afterwards, so the bytes are already on the request object.
+  // Reading the stream here would either wait forever or return nothing.
+  if (Buffer.isBuffer(request.body)) {
+    return Promise.resolve(request.body);
+  }
+  if (request.readableEnded) {
     return Promise.resolve(Buffer.alloc(0));
   }
   return new Promise<Buffer>((resolve, reject) => {
@@ -248,11 +256,22 @@ function readRequestBody(request: any): Promise<Buffer> {
   });
 }
 
-export function relayHeaders(source: Record<string, any>, bodyLength: number): Record<string, string> {
+export function relayHeaders(
+  source: Record<string, any>,
+  bodyLength: number,
+  options?: {keepContentEncoding?: boolean},
+): Record<string, string> {
+  const keepEncoding = options?.keepContentEncoding === true;
   const headers: Record<string, string> = {};
   for (const [rawName, rawValue] of Object.entries(source ?? {})) {
     const name = rawName.toLowerCase();
-    if (DROPPED_HEADERS.has(name) || name === 'content-encoding') {
+    if (name === 'content-encoding') {
+      // The body is relayed either decoded (header dropped) or untouched
+      // (header kept, see `decodeUpstreamBody`). Never strip it blindly.
+      if (!keepEncoding) {
+        continue;
+      }
+    } else if (DROPPED_HEADERS.has(name)) {
       continue;
     }
     if (rawValue === undefined || rawValue === null) {
@@ -263,6 +282,36 @@ export function relayHeaders(source: Record<string, any>, bodyLength: number): R
   headers['content-length'] = String(bodyLength);
   headers['access-control-allow-origin'] = '*';
   return headers;
+}
+
+/**
+ * Decodes a gzip/deflate upstream body.
+ *
+ * The request asks for `identity`, but a CDN is allowed to ignore that and
+ * compress anyway. Relaying those bytes while dropping `content-encoding`
+ * makes the page read a gzip stream as JSON (`Unexpected end of JSON input`),
+ * so the payload is decoded here. When decoding is impossible (brotli, or a
+ * body that is not actually compressed) the header is kept instead, which
+ * lets the WebView decompress it.
+ */
+function decodeUpstreamBody(
+  payload: Buffer,
+  encoding: string,
+): {payload: Buffer; decoded: boolean} {
+  if (payload.length === 0) {
+    return {payload, decoded: true};
+  }
+  if (encoding !== 'gzip' && encoding !== 'x-gzip' && encoding !== 'deflate') {
+    return {payload, decoded: false};
+  }
+  try {
+    const zlib = require('../../polyfills/node/zlib');
+    const result =
+      encoding === 'deflate' ? zlib.inflateSync(payload) : zlib.gunzipSync(payload);
+    return {payload: Buffer.from(result), decoded: true};
+  } catch {
+    return {payload, decoded: false};
+  }
 }
 
 const PROXY_TIMEOUT_MS = 60000;
@@ -318,6 +367,9 @@ export async function handleProxy(request: any, response: any, search: string): 
   if (body.length > 0) {
     headers['content-length'] = String(body.length);
   }
+  // The relay hands the bytes straight to the page, so ask for an
+  // uncompressed answer instead of the `gzip, deflate` the WebView sends.
+  headers['accept-encoding'] = 'identity';
 
   await new Promise<void>(resolve => {
     let settled = false;
@@ -343,13 +395,20 @@ export async function handleProxy(request: any, response: any, search: string): 
           const chunks: Buffer[] = [];
           res.on('data', (chunk: any) => chunks.push(Buffer.from(chunk)));
           res.on('end', () => {
-            const payload = Buffer.concat(chunks);
+            const upstreamHeaders = res.headers ?? {};
+            const encoding = String(upstreamHeaders['content-encoding'] ?? '')
+              .trim()
+              .toLowerCase();
+            const decoded = decodeUpstreamBody(Buffer.concat(chunks), encoding);
             try {
               response.writeHead(
                 res.statusCode ?? 502,
-                relayHeaders(res.headers ?? {}, payload.length),
+                relayHeaders(upstreamHeaders, decoded.payload.length, {
+                  // Keep the header only when the bytes are still compressed.
+                  keepContentEncoding: Boolean(encoding) && !decoded.decoded,
+                }),
               );
-              response.end(payload);
+              response.end(decoded.payload);
             } catch {
               // The client may already be gone.
             }
@@ -392,8 +451,16 @@ export async function handleProxy(request: any, response: any, search: string): 
   });
 }
 
-/** The request handler that is shared by both server implementations. */
-function handleRequest(request: any, response: any): void {
+/**
+ * The request handler that is shared by both server implementations.
+ *
+ * The returned promise MUST be handed back to the server: the polyfill closes
+ * any response that is still open once the handler returns, so an un-awaited
+ * proxy call used to be answered with an empty `200` (the page then failed with
+ * `Unexpected end of JSON input`) and the real reply was written to a response
+ * that had already ended.
+ */
+export function handleRequest(request: any, response: any): void | Promise<void> {
   const method = String(request.method ?? 'GET').toUpperCase();
   const target = String(request.url ?? '/');
   const pathname = target.split('?')[0];
@@ -407,8 +474,7 @@ function handleRequest(request: any, response: any): void {
 
   if (pathname === PROXY_PATH) {
     const queryIndex = target.indexOf('?');
-    void handleProxy(request, response, queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
-    return;
+    return handleProxy(request, response, queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
   }
 
   const result = buildAssetResponse(pathname, headOnly, readVirtualWidth(target));

@@ -9,7 +9,13 @@
  * The API intentionally mirrors the `fs` subset used by the ported modules.
  */
 import {Buffer} from 'buffer';
-import {getWebAssetBytes, getWebAssetText, listWebAssets} from './index';
+import {
+  getWebAssetBuffer,
+  getWebAssetSize,
+  getWebAssetText,
+  hasWebAsset,
+  listWebAssets,
+} from './index';
 
 /** Virtual root of the read-only application directory. */
 export const virtualAppRoot = '/app';
@@ -75,7 +81,9 @@ export function assetExistsSync(target: string): boolean {
   if (directoryCache.has(key)) {
     return true;
   }
-  return getWebAssetText(key) !== null || getWebAssetBytes(key) !== null;
+  // The index knows every path, so `existsSync` never has to decode the
+  // payload - the ported code calls it for every rule set file on start-up.
+  return hasWebAsset(key);
 }
 
 export function assetIsDirectorySync(target: string): boolean {
@@ -98,7 +106,7 @@ export function assetReadFileSync(target: string, encoding?: string): string | B
       return text;
     }
   }
-  const bytes = getWebAssetBytes(key);
+  const bytes = getWebAssetBuffer(key);
   if (!bytes) {
     throw enoent(target);
   }
@@ -132,12 +140,12 @@ export function assetStatSync(target: string): AssetStat {
       isDirectory: () => true,
     };
   }
-  const bytes = getWebAssetBytes(key);
-  if (!bytes) {
+  const size = getWebAssetSize(key);
+  if (size === null) {
     throw enoent(target);
   }
   return {
-    size: bytes.length,
+    size,
     mtime: new Date(0),
     isFile: () => true,
     isDirectory: () => false,

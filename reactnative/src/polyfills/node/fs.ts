@@ -30,7 +30,7 @@
 import RNFS from 'react-native-fs';
 import {Buffer} from 'buffer';
 import {Readable, Writable} from 'stream';
-import {flushPendingSave} from '../../runtime/native/files';
+import {flushPendingSave, isSyncReadAvailable, readFileSyncBlocking} from '../../runtime/native/files';
 import {
   appDataDirectory,
   temporaryDirectory,
@@ -230,7 +230,8 @@ function assetKeyFor(target: string): string | null {
 /** In-memory copy of every file of the writable sandbox. */
 const fileMirror = new Map<string, Buffer>();
 /**
- * Files that live on the device but are deliberately NOT mirrored in memory.
+ * Files that live on the device but are deliberately NOT mirrored in memory,
+ * mapped to their size (`-1` when it is not known).
  *
  * Appending used to read the whole file, concatenate and write it back, which
  * is O(size) per append: the log writer appends every 40 ms, so once the log
@@ -241,12 +242,84 @@ const fileMirror = new Map<string, Buffer>();
  *
  * Files above {@link MIRROR_APPEND_LIMIT} therefore stop being mirrored: they
  * are appended on the device directly and read back asynchronously.
+ *
+ * The start-up mirror reuses the same state for the files it skips because of
+ * {@link MIRROR_CONTENT_LIMIT} / {@link MIRROR_TOTAL_LIMIT}: their content must
+ * not be pulled into memory, but they still have to show up in `readdirSync`,
+ * `statSync` and `existsSync`.
  */
-const deviceOnlyFiles = new Set<string>();
+const deviceOnlyFiles = new Map<string, number>();
 /** Size above which a file is no longer kept in the in-memory mirror. */
 const MIRROR_APPEND_LIMIT = 512 * 1024;
+
+/**
+ * Number of device reads that may be in flight while the sandbox is mirrored.
+ *
+ * Every read is one round trip over the React Native bridge, so a strictly
+ * sequential walk costs ~10 ms per file: a data directory with a few thousand
+ * extracted files took the better part of a minute, and every IPC call made by
+ * the page meanwhile ran into its 30 s timeout.
+ */
+const HYDRATE_CONCURRENCY = 16;
+
+/**
+ * `true` when the native build provides the blocking read.
+ *
+ * Without it a deferred file cannot be read synchronously at all, so the old
+ * (slow but correct) behaviour is kept: mirror everything that fits an 8 MB
+ * per-file / 64 MB total budget. That happens when the JS bundle is reloaded
+ * over an APK that predates `Auto366Files.readFileBase64Sync`.
+ */
+const SYNC_READ_AVAILABLE = isSyncReadAvailable();
+
+/**
+ * Largest single file whose bytes are copied into the mirror at start-up.
+ *
+ * The mirror exists only to make the *synchronous* API fast for the handful of
+ * files the main process reads while booting (settings, rule metadata, UI
+ * mode). Everything else can be read on demand: `readFileSync` falls back to
+ * the native blocking read, so there is no reason to copy a 40 MB resource file
+ * through the bridge before the first screen is drawn.
+ */
+const MIRROR_CONTENT_LIMIT = SYNC_READ_AVAILABLE ? 256 * 1024 : 8 * 1024 * 1024;
+
+/**
+ * Budget for the start-up mirror. Files are mirrored smallest first, so the
+ * settings, rules and rule metadata always make it in; whatever does not fit
+ * the budget stays on the device (see {@link deviceOnlyFiles}).
+ *
+ * This used to be 64 MB, and that was the whole cost of the slow boot: the
+ * bytes cross the bridge twice (device -> base64 string -> Buffer) and a phone
+ * with a downloaded resource pack or an extracted answer package spent 15 s
+ * reproducing tens of megabytes that the boot never touched.
+ */
+const MIRROR_TOTAL_LIMIT = SYNC_READ_AVAILABLE ? 8 * 1024 * 1024 : 64 * 1024 * 1024;
+
+/**
+ * Largest file that `readFileSync` will pull from the device in one blocking
+ * call. Above this the blocking read would freeze the UI thread longer than
+ * the caller expects, and such files are always media/packages that the code
+ * reads through the asynchronous API anyway.
+ */
+const SYNC_READ_LIMIT = 32 * 1024 * 1024;
+
 /** In-memory copy of every known directory of the writable sandbox. */
 const directoryMirror = new Set<string>();
+
+/**
+ * Subtrees that are never mirrored, whatever their file sizes.
+ *
+ * `resources/` holds downloaded resource packs (the TTS model, the TUN bundle)
+ * and `logs/` holds append-only log files - neither is ever read synchronously
+ * during boot, and both can be dozens of megabytes. Their *entries* are still
+ * recorded so `readdirSync` / `statSync` / `existsSync` keep working.
+ *
+ * Only applied when the native blocking read exists: otherwise these files
+ * could not be read synchronously at all.
+ */
+const DEFERRED_DIRECTORIES = SYNC_READ_AVAILABLE
+  ? [`${appDataDirectory}/resources`, `${appDataDirectory}/logs`]
+  : [];
 /** Pending device writes, one queue per path. */
 const writeQueues = new Map<string, Promise<void>>();
 
@@ -473,6 +546,18 @@ function mirrorChildren(directory: string): Map<string, MirrorChild> {
     }
     children.set(rest, {isDirectory: false, size: buffer.length});
   }
+  // Device-only files are not mirrored, but a directory listing must still
+  // show them - otherwise `readdirSync` silently hides large files.
+  for (const [file, size] of deviceOnlyFiles) {
+    if (!file.startsWith(prefix)) {
+      continue;
+    }
+    const rest = file.slice(prefix.length);
+    if (!rest || rest.includes('/')) {
+      continue;
+    }
+    children.set(rest, {isDirectory: false, size: size >= 0 ? size : 0});
+  }
   for (const known of directoryMirror) {
     if (!known.startsWith(prefix)) {
       continue;
@@ -533,13 +618,27 @@ function readFileBytesSync(target: string): Buffer {
     return mirrored;
   }
   if (deviceOnlyFiles.has(resolved)) {
-    // Only the tail of this file is known; returning it would be wrong and
-    // loading the whole thing synchronously is what made the log writer slow.
+    // Not mirrored on purpose (see MIRROR_CONTENT_LIMIT / DEFERRED_DIRECTORIES).
+    // The desktop code calls `readFileSync` for these, so read them on demand
+    // through the native blocking call instead of failing with EBUSY.
+    const size = deviceOnlyFiles.get(resolved) ?? 0;
+    if (size <= SYNC_READ_LIMIT) {
+      const bytes = readFileSyncBlocking(resolved);
+      if (bytes) {
+        // Keep it for the next read: the answer parser walks the same files
+        // repeatedly, and a second blocking bridge call is pure waste.
+        if (bytes.length <= MIRROR_CONTENT_LIMIT) {
+          fileMirror.set(resolved, bytes);
+          deviceOnlyFiles.delete(resolved);
+        }
+        return bytes;
+      }
+    }
     throw createError(
       'EBUSY',
       'read',
       resolved,
-      'file is only stored on the device (too large to mirror), use the async API',
+      'file is only stored on the device, use the async API for files this large',
     );
   }
   const asset = readAsset(resolved, 'buffer');
@@ -631,26 +730,111 @@ export async function loadIntoMirror(target: string): Promise<boolean> {
 /* Hydration                                                                  */
 /* -------------------------------------------------------------------------- */
 
-async function hydrateDirectory(directory: string): Promise<void> {
+interface HydrationStats {
+  directories: number;
+  files: number;
+  mirrored: number;
+  mirroredBytes: number;
+  deferred: number;
+  deferredBytes: number;
+}
+
+/** A file whose content is a candidate for the start-up mirror. */
+interface HydrationCandidate {
+  path: string;
+  size: number;
+}
+
+/**
+ * Limits concurrent bridge calls.
+ *
+ * Every `RNFS.*` call crosses the React Native bridge, so the pool is what
+ * turns a per-file round trip into a handful of parallel ones.
+ */
+function createWorkPool(limit: number): <T>(task: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  const acquire = (): Promise<void> => {
+    if (active < limit) {
+      active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>(resolve => waiting.push(resolve));
+  };
+  const release = (): void => {
+    const next = waiting.shift();
+    if (next) {
+      next();
+      return;
+    }
+    active -= 1;
+  };
+  return async function run<T>(task: () => Promise<T>): Promise<T> {
+    await acquire();
+    try {
+      return await task();
+    } finally {
+      release();
+    }
+  };
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  if (bytes >= 1024) {
+    return `${Math.round(bytes / 1024)} KB`;
+  }
+  return `${bytes} B`;
+}
+
+/** Reads a file that is known to exist, without the extra `exists()` call. */
+async function readDeviceFileDirect(target: string): Promise<Buffer | null> {
+  try {
+    const base64 = await RNFS.readFile(target, 'base64');
+    return Buffer.from(base64, 'base64');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Walks a directory tree and collects what to mirror.
+ *
+ * Only directory entries are read here: the contents are loaded in a second
+ * pass, ordered by size, so that a huge cache file cannot delay the settings
+ * and rules the synchronous API needs during boot.
+ */
+async function collectHydrationCandidates(
+  directory: string,
+  candidates: HydrationCandidate[],
+  stats: HydrationStats,
+  run: <T>(task: () => Promise<T>) => Promise<T>,
+): Promise<void> {
   const normalized = normalizePath(directory);
   directoryMirror.add(normalized);
   let entries: any[] = [];
   try {
-    entries = await RNFS.readDir(normalized);
+    entries = await run(() => RNFS.readDir(normalized));
   } catch {
     return;
   }
+  const subdirectories: string[] = [];
   for (const entry of entries) {
     const entryPath = normalizePath(entry.path ?? `${normalized}/${entry.name}`);
     if (entry.isDirectory?.()) {
-      await hydrateDirectory(entryPath);
+      subdirectories.push(entryPath);
       continue;
     }
-    const buffer = await readDeviceFile(entryPath);
-    if (buffer) {
-      fileMirror.set(entryPath, buffer);
-    }
+    candidates.push({path: entryPath, size: typeof entry.size === 'number' ? entry.size : 0});
   }
+  stats.directories += subdirectories.length;
+  await Promise.all(
+    subdirectories.map(subdirectory =>
+      collectHydrationCandidates(subdirectory, candidates, stats, run),
+    ),
+  );
 }
 
 /**
@@ -658,8 +842,17 @@ async function hydrateDirectory(directory: string): Promise<void> {
  *
  * Has to be awaited before the desktop sources are evaluated, otherwise the
  * synchronous `fs` API cannot see the files of the previous session.
+ *
+ * The mirror used to load **every** byte of the data directory, one file per
+ * bridge round trip and in a strictly sequential loop. On a phone with an
+ * extracted answer package or a cached resource package in there, that took
+ * ~50 s, and every `ipcRenderer.invoke` issued by the page timed out meanwhile.
+ * The content is now bounded (per file and in total) and read in parallel, and
+ * anything that does not fit stays on the device, where the asynchronous API
+ * reads it on demand.
  */
 export async function hydrateFileSystem(): Promise<void> {
+  const startedAt = Date.now();
   try {
     await ensureDeviceDirectory(appDataDirectory);
   } catch (error) {
@@ -672,7 +865,77 @@ export async function hydrateFileSystem(): Promise<void> {
   }
   directoryMirror.add(appDataDirectory);
   directoryMirror.add(temporaryDirectory);
-  await hydrateDirectory(appDataDirectory);
+
+  const stats: HydrationStats = {
+    directories: 0,
+    files: 0,
+    mirrored: 0,
+    mirroredBytes: 0,
+    deferred: 0,
+    deferredBytes: 0,
+  };
+  const run = createWorkPool(HYDRATE_CONCURRENCY);
+  const candidates: HydrationCandidate[] = [];
+  await collectHydrationCandidates(appDataDirectory, candidates, stats, run);
+
+  // Smallest first: `config.json`, the rule sets and the small metadata files
+  // the main process reads synchronously are served from memory, while the
+  // budget is spent on the files that are actually needed.
+  candidates.sort((left, right) => left.size - right.size);
+
+  /** Bytes per top-level directory, for the "where did the disk go" log. */
+  const deferredByDirectory = new Map<string, number>();
+  let reservedBytes = 0;
+  await Promise.all(
+    candidates.map(candidate =>
+      run(async () => {
+        stats.files += 1;
+        const root = candidate.path.slice(appDataDirectory.length + 1).split('/')[0] || '.';
+        const isDeferredDirectory = DEFERRED_DIRECTORIES.some(
+          directory =>
+            candidate.path === directory || candidate.path.startsWith(`${directory}/`),
+        );
+        const exceedsFileLimit = candidate.size > MIRROR_CONTENT_LIMIT;
+        const exceedsBudget = reservedBytes + candidate.size > MIRROR_TOTAL_LIMIT;
+        if (isDeferredDirectory || exceedsFileLimit || exceedsBudget) {
+          deviceOnlyFiles.set(candidate.path, candidate.size);
+          stats.deferred += 1;
+          stats.deferredBytes += candidate.size;
+          deferredByDirectory.set(
+            root,
+            (deferredByDirectory.get(root) ?? 0) + candidate.size,
+          );
+          return;
+        }
+        // Reserve before the read so the budget stays exact with parallel work.
+        reservedBytes += candidate.size;
+        const buffer = await readDeviceFileDirect(candidate.path);
+        if (!buffer) {
+          reservedBytes -= candidate.size;
+          stats.files -= 1;
+          return;
+        }
+        fileMirror.set(candidate.path, buffer);
+        stats.mirrored += 1;
+        stats.mirroredBytes += buffer.length;
+      }),
+    ),
+  );
+
+  console.log(
+    `[e2rn] fs: ${stats.files} files in ${stats.directories} directories, ` +
+      `${stats.mirrored} mirrored (${formatBytes(stats.mirroredBytes)}), ` +
+      `${stats.deferred} kept on the device (${formatBytes(stats.deferredBytes)}) ` +
+      `in ${Date.now() - startedAt} ms`,
+  );
+  if (deferredByDirectory.size > 0) {
+    const summary = [...deferredByDirectory]
+      .sort((left, right) => right[1] - left[1])
+      .slice(0, 4)
+      .map(([name, bytes]) => `${name} ${formatBytes(bytes)}`)
+      .join(', ');
+    console.log(`[e2rn] fs: deferred by directory - ${summary}`);
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -793,7 +1056,11 @@ function mirrorAppend(resolved: string, addition: Buffer): void {
   const mirrored = fileMirror.get(resolved);
   if (!mirrored) {
     ensureParentDirectories(resolved);
-    deviceOnlyFiles.add(resolved);
+    const known = deviceOnlyFiles.get(resolved);
+    deviceOnlyFiles.set(
+      resolved,
+      known !== undefined && known >= 0 ? known + addition.length : -1,
+    );
     return;
   }
   if (mirrored.length + addition.length <= MIRROR_APPEND_LIMIT) {
@@ -801,7 +1068,7 @@ function mirrorAppend(resolved: string, addition: Buffer): void {
     return;
   }
   fileMirror.delete(resolved);
-  deviceOnlyFiles.add(resolved);
+  deviceOnlyFiles.set(resolved, mirrored.length + addition.length);
 }
 
 export function appendFileSync(
@@ -878,7 +1145,7 @@ function removeFromMirror(target: string): void {
       fileMirror.delete(key);
     }
   }
-  for (const key of Array.from(deviceOnlyFiles)) {
+  for (const key of Array.from(deviceOnlyFiles.keys())) {
     if (key === target || key.startsWith(prefix)) {
       deviceOnlyFiles.delete(key);
     }
@@ -974,6 +1241,10 @@ function statFromMirror(resolved: string): FileStats | null {
   const buffer = fileMirror.get(resolved);
   if (buffer) {
     return createStats(buffer.length, false);
+  }
+  const deviceOnlySize = deviceOnlyFiles.get(resolved);
+  if (deviceOnlySize !== undefined) {
+    return createStats(deviceOnlySize >= 0 ? deviceOnlySize : 0, false);
   }
   if (directoryMirror.has(resolved)) {
     return createStats(0, true);
@@ -1115,8 +1386,9 @@ export async function rename(source: string, destination: string): Promise<void>
     fileMirror.delete(from);
     storeFile(to, buffer);
   } else if (deviceOnlyFiles.has(from)) {
+    const size = deviceOnlyFiles.get(from) ?? -1;
     deviceOnlyFiles.delete(from);
-    deviceOnlyFiles.add(to);
+    deviceOnlyFiles.set(to, size);
   }
   await queueWrite(to, async () => {
     await ensureDeviceDirectory(dirnameOf(to));
@@ -1141,8 +1413,9 @@ export function renameSync(source: string, destination: string): void {
     fileMirror.delete(from);
     storeFile(to, buffer);
   } else if (deviceOnlyFiles.has(from)) {
+    const size = deviceOnlyFiles.get(from) ?? -1;
     deviceOnlyFiles.delete(from);
-    deviceOnlyFiles.add(to);
+    deviceOnlyFiles.set(to, size);
   }
   queueWrite(to, async () => {
     await ensureDeviceDirectory(dirnameOf(to));

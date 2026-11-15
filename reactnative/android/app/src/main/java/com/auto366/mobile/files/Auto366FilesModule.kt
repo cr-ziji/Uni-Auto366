@@ -217,6 +217,33 @@ class Auto366FilesModule(private val reactContext: ReactApplicationContext) :
     }
   }
 
+  /**
+   * 同步读一个沙箱文件，返回 base64（空串表示文件不存在）。
+   *
+   * Node 的 `fs.readFileSync` 在桌面端是一次普通的同步系统调用。RN 没有同步
+   * 文件 API，polyfill 只能把整个数据目录预先读进内存镜像，否则会抛 EBUSY。
+   * 数据目录里有下载的资源包和解压后的答案包时，这份镜像动辄几十 MB，而这些
+   * 字节要分片经过 bridge 两次（原生 -> JS 字符串 -> Buffer），启动时能占十几秒。
+   *
+   * 有了这个方法，镜像只需要覆盖启动阶段真正用同步 API 的小文件，其余文件在
+   * 第一次 `readFileSync` 时按需同步读取即可，语义与桌面端一致。
+   *
+   * 必须返回非 void（RN 的 TurboModule interop 要求「同步 <=> 非 void」）。
+   */
+  @ReactMethod(isBlockingSynchronousMethod = true)
+  fun readFileBase64Sync(path: String): String {
+    return try {
+      val file = File(path)
+      if (!file.isFile) {
+        ""
+      } else {
+        Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+      }
+    } catch (error: Throwable) {
+      ""
+    }
+  }
+
   private fun finishPick(resultCode: Int, data: Intent?) {
     val promise = pickPromise ?: return
     pickPromise = null

@@ -8,6 +8,7 @@
  * shims keep the previous behaviour instead of crashing.
  */
 import {NativeModules} from 'react-native';
+import {Buffer} from 'buffer';
 
 interface PickedFile {
   path: string;
@@ -143,6 +144,39 @@ export async function saveToDownloads(
   return native.saveToDownloads(path, fileName, mimeType ?? null);
 }
 
+/**
+ * Synchronous read of a sandbox file.
+ *
+ * Returns `null` when the native blocking method is missing (older build, iOS,
+ * tests) or when the file cannot be read, so the caller can fall back to the
+ * previous behaviour instead of throwing a different error.
+ */
+export function readFileSyncBlocking(path: string): Buffer | null {
+  const native = filesModule() as (FilesModule & {
+    readFileBase64Sync?: (path: string) => string;
+  }) | null;
+  if (!native || typeof native.readFileBase64Sync !== 'function') {
+    return null;
+  }
+  try {
+    const base64 = native.readFileBase64Sync(path);
+    if (typeof base64 !== 'string' || base64.length === 0) {
+      return null;
+    }
+    return Buffer.from(base64, 'base64');
+  } catch {
+    return null;
+  }
+}
+
+/** `true` when {@link readFileSyncBlocking} can work on this build. */
+export function isSyncReadAvailable(): boolean {
+  const native = filesModule() as (FilesModule & {
+    readFileBase64Sync?: (path: string) => string;
+  }) | null;
+  return !!native && typeof native.readFileBase64Sync === 'function';
+}
+
 export default {
   isFilePickerAvailable,
   pickFiles,
@@ -153,4 +187,6 @@ export default {
   openFile,
   shareFile,
   saveToDownloads,
+  readFileSyncBlocking,
+  isSyncReadAvailable,
 };

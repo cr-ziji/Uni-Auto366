@@ -243,6 +243,82 @@ export const PRELOAD_BRIDGE_SOURCE = `(function () {
     };
   }
 
+  // The React Native shell paints the safe area (status bar, notch, gesture
+  // bar), the status bar icons and the splash screen. It has to use the same
+  // colours as the page, otherwise the UI is framed by a black/white strip.
+  //
+  // The page knows its colour mode through <html data-theme="dark|light">
+  // (set by the inline script in index.html, changed by the theme switch), so
+  // that attribute is reported on start-up and on every later change. Pages
+  // that do not declare the attribute (for example an injected third party
+  // page) are ignored on purpose - they must not repaint the shell.
+  var reportedTheme = null;
+
+  function reportTheme() {
+    try {
+      var root = typeof document === 'undefined' ? null : document.documentElement;
+      if (!root || typeof root.getAttribute !== 'function') { return; }
+      var theme = root.getAttribute('data-theme');
+      if (theme !== 'dark' && theme !== 'light') { return; }
+      if (theme === reportedTheme) { return; }
+      reportedTheme = theme;
+      post({
+        marker: BRIDGE_MESSAGE,
+        version: PROTOCOL_VERSION,
+        type: 'theme',
+        theme: theme
+      });
+    } catch (error) {
+      console.warn('[e2rn] theme report failed', error);
+    }
+  }
+
+  function installThemeReporter() {
+    // The attribute is usually not set yet when this script runs (it is
+    // injected at document start), the observer below catches that first
+    // value as well - the immediate call only handles a page that already
+    // rendered.
+    reportTheme();
+
+    try {
+      var root = typeof document === 'undefined' ? null : document.documentElement;
+      if (root && typeof MutationObserver === 'function') {
+        var observer = new MutationObserver(function () { reportTheme(); });
+        observer.observe(root, {attributes: true, attributeFilter: ['data-theme']});
+      }
+    } catch (error) {
+      console.warn('[e2rn] theme observer failed', error);
+    }
+
+    try {
+      if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+        document.addEventListener('DOMContentLoaded', reportTheme);
+      }
+      if (typeof window.addEventListener === 'function') {
+        window.addEventListener('load', reportTheme);
+      }
+    } catch (error) {
+      // No DOM events available - the observer above is enough.
+    }
+
+    // "Follow the system" mode changes the attribute without any DOM event,
+    // the media query listener keeps the shell in sync with it.
+    try {
+      if (typeof window.matchMedia === 'function') {
+        var query = window.matchMedia('(prefers-color-scheme: dark)');
+        if (query && typeof query.addEventListener === 'function') {
+          query.addEventListener('change', reportTheme);
+        } else if (query && typeof query.addListener === 'function') {
+          query.addListener(reportTheme);
+        }
+      }
+    } catch (error) {
+      // matchMedia is optional.
+    }
+  }
+
+  installThemeReporter();
+
   installFetchRelay();
 })();`;
 

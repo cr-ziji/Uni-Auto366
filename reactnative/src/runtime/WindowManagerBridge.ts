@@ -28,6 +28,8 @@ import {
 } from './protocol';
 import {windowStore} from './windowStore';
 import {getWebView} from './webviewRegistry';
+import {whenStartupComplete} from './startupGate';
+import {setPageTheme} from '../theme/themeStore';
 
 export {BRIDGE_MESSAGE, createBridgeMessage, parseBridgeMessage, serializeBridgeMessage};
 export type {BridgeMessage, BridgePayload};
@@ -169,8 +171,8 @@ function deliverOnce(id: string, payload: any): boolean {
   return true;
 }
 
-const DELIVERY_RETRY_LIMIT = 40;
-const DELIVERY_RETRY_DELAY_MS = 50;
+const DELIVERY_RETRY_LIMIT = 100;
+const DELIVERY_RETRY_DELAY_MS = 100;
 
 function retryDelivery(id: string, payload: any, attempt: number): void {
   if (attempt >= DELIVERY_RETRY_LIMIT) {
@@ -218,6 +220,7 @@ export function getPendingInvocationCount(): number {
  *  - `invoke` -> `ipcBus.emitAsync(channel, event, ...args)`, the result is
  *    delivered back to the page.
  *  - `send`   -> `ipcBus.emit(channel, event, ...args)`.
+ *  - `theme`  -> the colour mode of the page, used by the native shell.
  */
 export function handleBridgeMessage(id: string, raw: string): void {
   const message = parseBridgeMessage(raw);
@@ -229,6 +232,11 @@ export function handleBridgeMessage(id: string, raw: string): void {
   switch (message.type) {
     case 'hello':
     case 'ready':
+      return;
+    case 'theme':
+      // The shell (safe area, status bar, splash) is painted by React Native,
+      // so it has to know which colour mode the page applied.
+      setPageTheme(message.theme);
       return;
     case 'invoke':
       void handleInvoke(windowId, message);
@@ -247,7 +255,12 @@ function handleSend(windowId: string, message: BridgeMessage): void {
     return;
   }
   const event = createIpcEvent(windowId, 'send');
-  ipcBus.emit(channel, event, ...(message.args ?? []));
+  const args = message.args ?? [];
+  // A `send` fired during boot would hit a channel that has no listener yet;
+  // the event is replayed once the main process finished registering.
+  void whenStartupComplete().then(() => {
+    ipcBus.emit(channel, event, ...args);
+  });
 }
 
 async function handleInvoke(windowId: string, message: BridgeMessage): Promise<void> {
@@ -259,19 +272,25 @@ async function handleInvoke(windowId: string, message: BridgeMessage): Promise<v
   const event = createIpcEvent(windowId, 'invoke');
 
   const pending: PendingInvocation = {windowId, id, timer: null};
-  pending.timer = setTimeout(() => {
-    pendingInvocations.delete(id);
-    deliverToWebView(windowId, {
-      type: 'reply',
-      id,
-      channel,
-      ok: false,
-      error: 'timeout',
-    });
-  }, IPC_INVOKE_TIMEOUT_MS);
   pendingInvocations.set(id, pending);
 
   try {
+    // Hold the call back while the main process is still booting: otherwise
+    // `emitAsync` finds no handler and answers `undefined`, which the page
+    // reports as a broken IPC channel. The response timeout only starts once
+    // the call was actually handed to the bus.
+    await whenStartupComplete();
+    pending.timer = setTimeout(() => {
+      pendingInvocations.delete(id);
+      deliverToWebView(windowId, {
+        type: 'reply',
+        id,
+        channel,
+        ok: false,
+        error: 'timeout',
+      });
+    }, IPC_INVOKE_TIMEOUT_MS);
+
     const value = await ipcBus.emitAsync(channel, event, ...(message.args ?? []));
     settlePending(id);
     deliverToWebView(windowId, {

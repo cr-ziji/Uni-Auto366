@@ -4,24 +4,33 @@
  *
  * The desktop app loads `index.html`, `styles/`, `renderer/`, `rulesets/` and
  * `preload/` straight from the file system. React Native has no equivalent of
- * a browsable application directory, so the files are embedded into a single
- * manifest (`src/web-assets/assets.json`) that the local HTTP server reads
- * from memory at runtime.
+ * a browsable application directory, so the files are embedded into the bundle
+ * that the local HTTP server reads from memory at runtime.
  *
- * Text payloads are stored as UTF-8, binary payloads as base64, so that the
- * manifest can be consumed with a plain `JSON.parse`.
+ * Two artifacts are produced:
+ *
+ *  - `index.json`   every path plus its size and whether it is binary. A few
+ *                   kilobytes, so the start-up path can parse it eagerly.
+ *  - `payload.json` one deflate+base64 blob holding all the file contents.
+ *
+ * The split matters: the payload used to be a single 2.4 MB JSON module, and
+ * Hermes parsed/allocated all of it on the first `require` - during start-up,
+ * before the first page request could be served. Now the payload is only
+ * decoded on the first *content* request, and it is ~2x smaller on the wire
+ * because it is deflated.
  *
  * Usage:
- *   node scripts/build-web-assets.js [--source <electron-root>] [--out <file>]
+ *   node scripts/build-web-assets.js [--source <electron-root>] [--out-dir <dir>]
  */
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 const DEFAULT_SOURCE = path.resolve(PROJECT_ROOT, '..');
-const DEFAULT_OUTPUT = path.join(PROJECT_ROOT, 'src', 'web-assets', 'assets.json');
+const DEFAULT_OUTPUT_DIR = path.join(PROJECT_ROOT, 'src', 'web-assets');
 
 /** Files and directories that are copied verbatim (relative to the source root). */
 const ENTRIES = [
@@ -55,10 +64,8 @@ const ENTRIES = [
     from: path.join('node_modules', 'bootstrap-icons', 'font', 'fonts', 'bootstrap-icons.woff2'),
     to: path.join('node_modules', 'bootstrap-icons', 'font', 'fonts', 'bootstrap-icons.woff2'),
   },
-  {
-    from: path.join('node_modules', 'bootstrap-icons', 'font', 'fonts', 'bootstrap-icons.woff'),
-    to: path.join('node_modules', 'bootstrap-icons', 'font', 'fonts', 'bootstrap-icons.woff'),
-  },
+  // The legacy `.woff` is a fallback for browsers older than 2016. The
+  // WebView ships woff2 support, and the file is 235 KB of the payload.
 ];
 
 /**
@@ -70,6 +77,30 @@ const ENTRIES = [
 const EXCLUDED = [
   /\.ps1$/i,
   /\.DS_Store$/i,
+];
+
+/**
+ * Directories whose content is only usable by the desktop runtime.
+ *
+ * `resources/` used to be copied wholesale, which pulled 107 MB into
+ * `assets.json` (143 MB after base64/JSON escaping). The manifest is a plain
+ * JS module, so the whole payload had to be parsed by Hermes on the first
+ * `require` - that alone accounted for most of the startup delay, and none of
+ * these files can even be executed on a phone:
+ *
+ *  - `resources/tts`         sherpa-onnx models (a 41 MB `model.onnx`) that
+ *                            `modules/tts` loads through `child_process.fork()`.
+ *  - `resources/tun`         `mihomo-windows-amd64-compatible.exe` + `wintun.dll`.
+ *  - `resources/openspeedy`  Windows PE injector (`*.exe` / `*.dll`) + sources.
+ *
+ * The renderer only ever references the images in `resources/` (`qq.jpg`,
+ * `*_prize.jpg`) and `resources/agreements/`, so nothing that is left out is
+ * reachable from a page.
+ */
+const DESKTOP_ONLY_DIRECTORIES = [
+  'resources/tts/',
+  'resources/tun/',
+  'resources/openspeedy/',
 ];
 
 const TEXT_EXTENSIONS = new Set([
@@ -92,16 +123,16 @@ const TEXT_EXTENSIONS = new Set([
 const BINARY_EXTENSIONS = new Set(['.woff', '.woff2', '.ttf', '.otf', '.eot', '.zip', '.gz']);
 
 function parseArgs(argv) {
-  const options = {source: DEFAULT_SOURCE, out: DEFAULT_OUTPUT};
+  const options = {source: DEFAULT_SOURCE, outDir: DEFAULT_OUTPUT_DIR};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--source' || arg === '-s') {
       options.source = path.resolve(argv[++i] || '');
-    } else if (arg === '--out' || arg === '-o') {
-      options.out = path.resolve(argv[++i] || '');
+    } else if (arg === '--out-dir' || arg === '-o') {
+      options.outDir = path.resolve(argv[++i] || '');
     } else if (arg === '--help' || arg === '-h') {
       process.stdout.write(
-        'Usage: node scripts/build-web-assets.js [--source <electron-root>] [--out <file>]\n',
+        'Usage: node scripts/build-web-assets.js [--source <electron-root>] [--out-dir <dir>]\n',
       );
       process.exit(0);
     }
@@ -130,7 +161,11 @@ function isLosslessUtf8(buffer) {
 }
 
 function isExcluded(relativePath) {
-  return EXCLUDED.some(pattern => pattern.test(relativePath));
+  if (EXCLUDED.some(pattern => pattern.test(relativePath))) {
+    return true;
+  }
+  const lower = relativePath.toLowerCase();
+  return DESKTOP_ONLY_DIRECTORIES.some(directory => lower.startsWith(directory));
 }
 
 function walk(directory, baseDirectory, files) {
@@ -159,13 +194,23 @@ function collect(source) {
     }
     if (entry.dir) {
       const collected = [];
-      walk(absolute, absolute, collected);
+      // Walk relative to the *source root* rather than the entry directory.
+      // Otherwise `resources/tts/model.onnx` is seen as `tts/model.onnx` and
+      // the desktop-only directory rules can never match it.
+      walk(absolute, source, collected);
       const prefix = entry.to.split(path.sep).join('/');
       for (const file of collected) {
         // Keep the tree layout: `resources/agreements/version.json` must not
         // collapse to `version.json`, otherwise the ported code cannot resolve
         // `<app>/resources/...` or `<app>/rulesets/...` at runtime.
-        files.set(`${prefix}/${file.relative}`, file.absolute);
+        const key =
+          entry.from === entry.to
+            ? file.relative
+            : `${prefix}/${path
+                .relative(absolute, file.absolute)
+                .split(path.sep)
+                .join('/')}`;
+        files.set(key, file.absolute);
       }
       continue;
     }
@@ -265,7 +310,8 @@ function build() {
 
   const files = collect(options.source);
   const rulesetAssets = verifyRulesetAssets(options.source, files);
-  const manifest = {generatedAt: new Date().toISOString(), files: {}};
+  const index = {generatedAt: new Date().toISOString(), files: {}};
+  const payload = {};
   let rawBytes = 0;
   let binaryFiles = 0;
 
@@ -273,45 +319,77 @@ function build() {
     const absolute = files.get(name);
     const buffer = fs.readFileSync(absolute);
     rawBytes += buffer.length;
-    if (isTextFile(name) && isLosslessUtf8(buffer)) {
-      manifest.files[name] = {encoding: 'utf8', data: buffer.toString('utf8')};
-    } else {
+    const binary = !(isTextFile(name) && isLosslessUtf8(buffer));
+    // `[size, binary]` keeps the index tiny: it is parsed on every start-up.
+    index.files[name] = [buffer.length, binary ? 1 : 0];
+    if (binary) {
       binaryFiles += 1;
-      manifest.files[name] = {encoding: 'base64', data: buffer.toString('base64')};
+      payload[name] = buffer.toString('base64');
+    } else {
+      payload[name] = buffer.toString('utf8');
     }
   }
 
-  fs.mkdirSync(path.dirname(options.out), {recursive: true});
-  fs.writeFileSync(options.out, JSON.stringify(manifest), 'utf8');
+  fs.mkdirSync(options.outDir, {recursive: true});
+  const indexPath = path.join(options.outDir, 'index.json');
+  const payloadPath = path.join(options.outDir, 'payload.json');
+  fs.writeFileSync(indexPath, JSON.stringify(index), 'utf8');
 
-  // A sibling declaration keeps TypeScript from parsing the multi-megabyte
-  // manifest (it would otherwise infer a type for every inlined string).
-  const declaration = path.join(
-    path.dirname(options.out),
-    `${path.basename(options.out)}.d.ts`,
-  );
+  // 文件内容压缩成一个字符串：Hermes 解析 1.4 MB 的字面量比解析 2.4 MB 的
+  // 对象字面量便宜得多（后者要为每个字符串建对象属性），deflate 之后体积
+  // 也小一半。
+  const serialized = JSON.stringify(payload);
+  const deflated = zlib.deflateRawSync(Buffer.from(serialized, 'utf8'), {level: 9});
   fs.writeFileSync(
-    declaration,
+    payloadPath,
+    JSON.stringify({data: deflated.toString('base64')}),
+    'utf8',
+  );
+
+  // Sibling declarations keep TypeScript from inferring a type for the payload.
+  fs.writeFileSync(
+    path.join(options.outDir, 'index.json.d.ts'),
     [
       '/**',
       ' * Generated by scripts/build-web-assets.js - do not edit by hand.',
-      ' * The declaration keeps `tsc` from inferring types for the inlined payload.',
       ' */',
-      'declare const manifest: {',
+      'declare const index: {',
       '  generatedAt: string;',
-      '  files: Record<string, {encoding: "utf8" | "base64"; data: string}>;',
+      '  files: Record<string, [number, 0 | 1]>;',
       '};',
-      'export default manifest;',
+      'export default index;',
+      '',
+    ].join('\n'),
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(options.outDir, 'payload.json.d.ts'),
+    [
+      '/**',
+      ' * Generated by scripts/build-web-assets.js - do not edit by hand.',
+      ' */',
+      'declare const payload: {data: string};',
+      'export default payload;',
       '',
     ].join('\n'),
     'utf8',
   );
 
-  const manifestBytes = fs.statSync(options.out).size;
+  const manifestBytes = fs.statSync(indexPath).size;
+  const payloadBytes = fs.statSync(payloadPath).size;
   process.stdout.write(
-    `[web-assets] ${files.size} files (${binaryFiles} binary), ${formatBytes(rawBytes)} raw -> ${formatBytes(manifestBytes)} manifest\n`,
+    `[web-assets] ${files.size} files (${binaryFiles} binary), ${formatBytes(rawBytes)} raw -> ` +
+      `${formatBytes(manifestBytes)} index + ${formatBytes(payloadBytes)} payload\n`,
   );
-  process.stdout.write(`[web-assets] written to ${options.out}\n`);
+  process.stdout.write(`[web-assets] written to ${options.outDir}\n`);
+
+  const skipped = desktopOnlyBytes(options.source);
+  if (skipped > 0) {
+    process.stdout.write(
+      `[web-assets] kept out of the bundle: ${formatBytes(skipped)} ` +
+        `(${DESKTOP_ONLY_DIRECTORIES.map(d => d.replace(/\/$/, '')).join(', ')})\n`,
+    );
+  }
 
   if (rulesetAssets.expected > 0) {
     const packaged = rulesetAssets.expected - rulesetAssets.missing.length;
@@ -336,6 +414,40 @@ function formatBytes(bytes) {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+/** Sums the size of the desktop-only directories, for the summary line. */
+function desktopOnlyBytes(source) {
+  let total = 0;
+  for (const directory of DESKTOP_ONLY_DIRECTORIES) {
+    const absolute = path.join(source, directory);
+    if (!fs.existsSync(absolute)) {
+      continue;
+    }
+    const stack = [absolute];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(current, {withFileTypes: true});
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const entryPath = path.join(current, entry.name);
+        if (entry.isDirectory()) {
+          stack.push(entryPath);
+        } else if (entry.isFile()) {
+          try {
+            total += fs.statSync(entryPath).size;
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+    }
+  }
+  return total;
 }
 
 try {

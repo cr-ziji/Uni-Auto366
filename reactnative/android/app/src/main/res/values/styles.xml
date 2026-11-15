@@ -4,6 +4,14 @@
     <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
         <!-- Customize your theme here. -->
         <item name="android:editTextBackground">@drawable/rn_edit_text_material</item>
+        <!--
+          Colour of the launch window. Android 12+ uses it as the background of
+          the system splash screen (the application icon is the default splash
+          icon), older versions show it until React Native renders its first
+          frame. The day/night variants live in `values/colors.xml` and
+          `values-night/colors.xml`.
+        -->
+        <item name="android:windowBackground">@color/app_window_background</item>
     </style>
 
 </resources>

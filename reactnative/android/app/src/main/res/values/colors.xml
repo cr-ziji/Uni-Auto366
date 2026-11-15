@@ -1,0 +1,15 @@
+<resources>
+
+    <!--
+      Background of the launch (splash) window - the colour the system paints
+      before React Native has rendered its first frame.
+
+      It has to match the native shell (`reactnative/src/theme/appTheme.ts`),
+      which paints the safe area around the WebView in the same colour, so the
+      launch window, the splash screen and the loaded UI form one surface.
+      Deliberately not pure white: the page itself is #ffffff, a shell of the
+      same brightness would look like part of the page.
+    -->
+    <color name="app_window_background">#F5F5F5</color>
+
+</resources>

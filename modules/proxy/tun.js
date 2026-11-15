@@ -295,9 +295,10 @@ ${processRules || '  - MATCH,DIRECT'}
   // 启动 TUN（启动 mihomo 进程）
   async start() {
     // 移动端既没有 mihomo/wintun，也不允许创建虚拟网卡：直接拒绝，避免触发资源下载。
+    // 不发送 `rule-log`：控制栏会自动尝试开启一次增强模式，把一条必然失败的
+    // 警告写进日志面板只会让用户以为应用出了故障。
     if (isMobile) {
-      this.safeIpcSend('rule-log', moduleLog.event({ type: 'warning', message: `[TUN] ${unsupported('TUN 增强模式')}` }));
-      return { success: false, message: unsupported('TUN 增强模式') };
+      return { success: false, message: unsupported('TUN 增强模式'), unsupported: true };
     }
 
     if (this.isRunning) {

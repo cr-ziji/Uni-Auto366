@@ -11,17 +11,16 @@
  *      gesture bar), and
  *   3. renders the window manager.
  *
+ * The splash / loading screen shows the application icon as the loading
+ * animation, and every surface the shell paints itself (safe area, splash
+ * background, status bar) borrows the colour mode of the page - see
+ * `src/theme`.
+ *
  * @format
  */
 
 import React, {useEffect, useState} from 'react';
-import {
-  ActivityIndicator,
-  StatusBar,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import {StatusBar, StyleSheet, Text, View} from 'react-native';
 import {
   SafeAreaProvider,
   initialWindowMetrics,
@@ -29,7 +28,9 @@ import {
 } from 'react-native-safe-area-context';
 
 import {startAuto366} from './src/auto366-main/entry';
+import {AppIconLoader} from './src/components/AppIconLoader';
 import {WindowManager} from './src/components/WindowManager/WindowManager';
+import {useAppTheme} from './src/theme/useAppTheme';
 
 type BootState = 'starting' | 'running' | 'failed';
 
@@ -37,6 +38,7 @@ function AppContent(): React.JSX.Element {
   const [state, setState] = useState<BootState>('starting');
   const [message, setMessage] = useState('正在启动 Auto366…');
   const insets = useSafeAreaInsets();
+  const theme = useAppTheme();
 
   useEffect(() => {
     let cancelled = false;
@@ -69,14 +71,18 @@ function AppContent(): React.JSX.Element {
   }, []);
 
   return (
-    // The outer view stays full-bleed and black, the content is inset by the
-    // safe area so that the desktop UI is never covered by the status bar,
-    // the notch or the gesture bar.
-    <View style={styles.root}>
+    // The outer view stays full-bleed (it also paints behind the status bar
+    // and the gesture bar), the content is inset by the safe area so that the
+    // desktop UI is never covered by the notch or the gesture bar.
+    //
+    // Both surfaces use the colour of the page instead of black/white: the
+    // safe area then looks like a continuation of the UI, not like a frame.
+    <View style={[styles.root, {backgroundColor: theme.background}]}>
       <View
         style={[
           styles.safeArea,
           {
+            backgroundColor: theme.background,
             paddingTop: insets.top,
             paddingBottom: insets.bottom,
             paddingLeft: insets.left,
@@ -87,10 +93,10 @@ function AppContent(): React.JSX.Element {
           <WindowManager />
         ) : (
           <View style={styles.placeholder}>
-            {state === 'starting' ? (
-              <ActivityIndicator size="large" color="#ffffff" />
-            ) : null}
-            <Text style={styles.message}>{message}</Text>
+            {state === 'starting' ? <AppIconLoader size={88} /> : null}
+            <Text style={[styles.message, {color: theme.textMuted}]}>
+              {message}
+            </Text>
           </View>
         )}
       </View>
@@ -99,9 +105,15 @@ function AppContent(): React.JSX.Element {
 }
 
 function App(): React.JSX.Element {
+  const theme = useAppTheme();
+
   return (
     <SafeAreaProvider initialMetrics={initialWindowMetrics}>
-      <StatusBar barStyle="light-content" />
+      <StatusBar
+        barStyle={theme.statusBarStyle}
+        animated
+        showHideTransition="fade"
+      />
       <AppContent />
     </SafeAreaProvider>
   );
@@ -110,7 +122,6 @@ function App(): React.JSX.Element {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#000000',
   },
   safeArea: {
     flex: 1,
@@ -122,8 +133,7 @@ const styles = StyleSheet.create({
     padding: 24,
   },
   message: {
-    marginTop: 16,
-    color: '#ffffff',
+    marginTop: 20,
     fontSize: 15,
     textAlign: 'center',
   },

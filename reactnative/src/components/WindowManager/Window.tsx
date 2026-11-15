@@ -21,6 +21,7 @@ import {getAssetServerBaseUrl, getAssetUrl, startAssetServer} from '../../runtim
 import {withVirtualWidth} from '../../runtime/web/virtualWidth';
 import {registerWebView, unregisterWebView} from '../../runtime/webviewRegistry';
 import {notifyWindowLoaded} from '../../shims/electron/browserWindow';
+import {useAppTheme} from '../../theme/useAppTheme';
 import {
   BASE_HEIGHT,
   BASE_WIDTH,
@@ -106,6 +107,9 @@ export interface WindowProps {
 export function Window({window, containerWidth, containerHeight}: WindowProps) {
   const webViewRef = useRef<any>(null);
   const [source, setSource] = useState<string>('');
+  // Paints behind the WebView, therefore it has to match the page: a black
+  // backdrop flashed through between two paints of a light page.
+  const theme = useAppTheme();
 
   const windowId = window.id;
   const servedUrl = window.servedUrl;
@@ -203,7 +207,11 @@ export function Window({window, containerWidth, containerHeight}: WindowProps) {
 
   return (
     <View
-      style={[styles.container, window.visible ? styles.visible : styles.hidden]}
+      style={[
+        styles.container,
+        {backgroundColor: theme.background},
+        window.visible ? styles.visible : styles.hidden,
+      ]}
       pointerEvents={window.visible ? 'auto' : 'none'}>
       {pageUrl ? (
         <WebViewComponent
@@ -240,7 +248,8 @@ const styles = StyleSheet.create({
     right: 0,
     bottom: 0,
     overflow: 'hidden',
-    backgroundColor: '#000000',
+    // Overridden at render time with the colour of the current page theme.
+    backgroundColor: '#16181c',
   },
   visible: {
     opacity: 1,

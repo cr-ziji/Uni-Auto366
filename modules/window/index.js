@@ -153,6 +153,19 @@ class WindowManager {
 
   // 将 HTML 内容导出为 PDF 缓冲区
   async exportHtmlToPdf(htmlContent) {
+    // 移动端没有 Chromium 的 `printToPDF`（Android WebView 不能把页面栅格化
+    // 成 PDF），但导出本身还是可以做：把同一份 HTML 交给用户，浏览器打开后
+    // 可以直接"打印为 PDF"，也能直接分享。返回 `format: 'html'` 让调用方
+    // 换掉扩展名和过滤器。
+    if (platformInfo.isMobile) {
+      return {
+        success: true,
+        format: 'html',
+        htmlBuffer: Buffer.from(String(htmlContent ?? ''), 'utf8'),
+        note: '移动端无法直接生成 PDF，已导出为 HTML（可用浏览器打印成 PDF）',
+      };
+    }
+
     let hiddenWindow = null;
     try {
       hiddenWindow = new BrowserWindow({

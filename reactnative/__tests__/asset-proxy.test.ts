@@ -1,6 +1,9 @@
 import {Buffer} from 'buffer';
 import {EventEmitter} from 'events';
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const {gzipSync} = require('../src/polyfills/node/zlib');
+
 /**
  * The renderer is served from `http://127.0.0.1:<port>`, so the rule-set API
  * (`https://366.cyril.qzz.io/...`) is a cross-origin request and the WebView
@@ -52,7 +55,7 @@ function fakeClientResponse() {
   } as any;
 }
 
-function fakeUpstream(status: number, headers: Record<string, string>, body: string) {
+function fakeUpstream(status: number, headers: Record<string, string>, body: string | Buffer) {
   return (options: any, callback: any) => {
     const request = new EventEmitter() as any;
     request.write = jest.fn();
@@ -62,7 +65,7 @@ function fakeUpstream(status: number, headers: Record<string, string>, body: str
       response.statusCode = status;
       response.headers = headers;
       callback(response);
-      response.emit('data', Buffer.from(body, 'utf8'));
+      response.emit('data', Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8'));
       response.emit('end');
     };
     return request;
@@ -75,11 +78,14 @@ describe('the same-origin request relay', () => {
   });
 
   it('forwards business headers, drops connection headers and relays the body', async () => {
+    const json = '{"success":true}';
     mockUpstreamRequest.mockImplementation(
       fakeUpstream(
         200,
         {'content-type': 'application/json', 'content-encoding': 'gzip', connection: 'keep-alive'},
-        '{"success":true}',
+        // A CDN may compress even though the relay asks for `identity`; the
+        // page must still receive plain JSON.
+        gzipSync(json),
       ),
     );
 
@@ -98,15 +104,34 @@ describe('the same-origin request relay', () => {
     expect(options.headers['x-custom']).toBe('kept');
     // These would either break the request or produce a body the page cannot read.
     expect(options.headers.host).toBeUndefined();
-    expect(options.headers['accept-encoding']).toBeUndefined();
+    expect(options.headers['accept-encoding']).toBe('identity');
     expect(options.headers.origin).toBeUndefined();
 
     expect(response.writeHead).toHaveBeenCalled();
     const [status, headers] = response.writeHead.mock.calls[0];
     expect(status).toBe(200);
     expect(headers['content-encoding']).toBeUndefined();
-    expect(headers['content-length']).toBe(String(Buffer.byteLength('{"success":true}')));
-    expect(Buffer.concat(response.chunks).toString('utf8')).toBe('{"success":true}');
+    expect(headers['content-length']).toBe(String(Buffer.byteLength(json)));
+    expect(Buffer.concat(response.chunks).toString('utf8')).toBe(json);
+  });
+
+  it('keeps the encoding header when the body cannot be decoded', async () => {
+    mockUpstreamRequest.mockImplementation(
+      fakeUpstream(
+        200,
+        {'content-type': 'application/json', 'content-encoding': 'br'},
+        '{"success":true}',
+      ),
+    );
+    const response = fakeClientResponse();
+    await handleProxy(
+      fakeClientRequest(),
+      response,
+      `url=${encodeURIComponent('https://366.cyril.qzz.io/api/rulesets')}`,
+    );
+    // Brotli has no polyfill here: the bytes are passed through untouched, so
+    // the header has to survive or the WebView would read them as plain JSON.
+    expect(response.writeHead.mock.calls[0][1]['content-encoding']).toBe('br');
   });
 
   it('relays an error status instead of turning it into a success', async () => {

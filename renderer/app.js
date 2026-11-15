@@ -100,8 +100,8 @@ class Auto366App {
       // 显示赞赏弹窗
       if (settingsStorage.getItem('tutorial-completed') === 'true') this.showDonationModal();
 
-      // 自动启动天学网进程监控
-      if (window.electronAPI.startProcessMonitor) {
+      // 自动启动天学网进程监控（仅桌面端：移动端没有 up366.exe / PowerShell）
+      if (!this.isMobilePlatform && window.electronAPI.startProcessMonitor) {
         window.electronAPI.startProcessMonitor();
       }
 

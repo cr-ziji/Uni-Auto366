@@ -51,8 +51,25 @@ interface RawResponse {
   body: Buffer;
 }
 
-/** Performs a single HTTPS request and buffers the whole response. */
-function request(
+/** 连接被对端重置 / 半关闭：换个新连接重试通常就能成功。 */
+function isRetryable(error: any): boolean {
+  const code = String(error?.code ?? '');
+  const message = String(error?.message ?? '');
+  if (code === 'ECONNRESET' || code === 'EPIPE' || code === 'ETIMEDOUT') {
+    return true;
+  }
+  return /ECONNRESET|EPIPE|socket hang up|connection reset|ECONNABORTED/i.test(message);
+}
+
+/**
+ * Performs a single HTTPS request and buffers the whole response.
+ *
+ * `Content-Length` is always sent: Supabase sits behind Kong, which answers a
+ * `Transfer-Encoding: chunked` object upload by closing the connection (the
+ * client then reports `connect reset`). 请求正文长度在发首部之前就已经知道，
+ * 所以没有理由使用 chunked。
+ */
+function requestOnce(
   url: string,
   method: string,
   headers: Record<string, string>,
@@ -60,13 +77,21 @@ function request(
 ): Promise<RawResponse> {
   return new Promise((resolve, reject) => {
     const target = new URL(url);
+    const finalHeaders: Record<string, string> = {...headers};
+    if (body) {
+      finalHeaders['Content-Length'] = String(body.length);
+    } else if (method === 'POST' || method === 'PUT' || method === 'PATCH') {
+      finalHeaders['Content-Length'] = '0';
+    }
+    // 大文件上传时 30 s 太短（一份答案 ZIP 有几 MB），给 120 s。
+    const requestTimeout = 120000;
     const req = https.request(
       {
         hostname: target.hostname,
         port: target.port ? Number(target.port) : 443,
         path: `${target.pathname}${target.search}`,
         method,
-        headers,
+        headers: finalHeaders,
       },
       (res: any) => {
         const chunks: Buffer[] = [];
@@ -78,7 +103,7 @@ function request(
       },
     );
     req.on('error', reject);
-    req.setTimeout?.(30000, () => {
+    req.setTimeout?.(requestTimeout, () => {
       req.destroy?.(new Error('[E2RN] the Supabase request timed out'));
     });
     if (body) {
@@ -86,6 +111,36 @@ function request(
     }
     req.end();
   });
+}
+
+/** 一次请求 + 断连重试（Supabase 偶发 reset 时不会让用户看到失败）。 */
+async function request(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  body?: Buffer,
+): Promise<RawResponse> {
+  let lastError: any = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await requestOnce(url, method, headers, body);
+    } catch (error) {
+      lastError = error;
+      if (!isRetryable(error) || attempt === 2) {
+        break;
+      }
+      // 已经在尝试新连接了，这里只做一点退避。
+      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+  }
+  const failure: any = lastError ?? new Error('the Supabase request failed');
+  // 传输层错误（一个字节的响应都没收到）。`ECONNRESET` 出现在这里通常是网络
+  // 按域名重置了 TLS 握手（例如对 `*.supabase.co` 的屏蔽），而不是服务端返回
+  // 的错误。打上标记，让上层能给出一句可操作的提示，而不是裸的 "connect reset"。
+  if (failure && typeof failure === 'object' && !failure.status) {
+    failure.blocked = true;
+  }
+  throw failure;
 }
 
 function toError(response: RawResponse): SupabaseError | null {
@@ -144,6 +199,8 @@ export function createClient(url: string, anonKey: string): SupabaseClient {
             'POST',
             headers({
               'Content-Type': options?.contentType ?? 'application/octet-stream',
+              Accept: 'application/json',
+              'cache-control': 'max-age=3600',
               'x-upsert': options?.upsert ? 'true' : 'false',
             }),
             payload,
@@ -151,7 +208,14 @@ export function createClient(url: string, anonKey: string): SupabaseClient {
           const error = toError(response);
           return {data: error ? null : parseJson(response), error};
         } catch (error: any) {
-          return {data: null, error: {message: error?.message ?? String(error)}};
+          return {
+            data: null,
+            error: {
+              message: error?.message ?? String(error),
+              code: error?.code,
+              blocked: error?.blocked === true,
+            },
+          };
         }
       },
 

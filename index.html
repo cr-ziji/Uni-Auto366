@@ -435,7 +435,7 @@
                                     <span>启动时自动开启代理</span>
                                 </label>
                             </div>
-                            <div class="setting-item">
+                            <div class="setting-item" data-desktop-only>
                                 <div class="setting-item__content">
                                     <button type="button" id="resetCertificateBtn" class="btn--danger">
                                         <i class="bi bi-arrow-counterclockwise"></i>
@@ -488,11 +488,11 @@
 
                             <div class="setting-item">
                                 <input type="text" id="cachePathInput" class="form-input" placeholder="选择缓存路径">
-                                <button id="browseCacheBtn" class="btn--ghost">
+                                <button id="browseCacheBtn" class="btn--ghost" data-desktop-only>
                                     <i class="bi bi-folder"></i>
                                     <span>浏览</span>
                                 </button>
-                                <button id="autoFindCacheBtn" class="btn--ghost">
+                                <button id="autoFindCacheBtn" class="btn--ghost" data-desktop-only>
                                     <i class="bi bi-search"></i>
                                     <span>自动寻找</span>
                                 </button>
