@@ -1,6 +1,18 @@
 const moduleLog = require('../logging').create('证书');
 const { execText: exec } = require('../app/process-text');
+const { isMobile } = require('../app/platform');
 const fs = require('fs-extra');
+
+/**
+ * 移动端没有可写入的系统根证书库。
+ *
+ * 证书本身（`ca.pem`）仍由 MITM 代理生成和使用，只是"导入受信任的根证书
+ * 颁发机构"这一步没有对应能力：Android 需要用户手动安装，iOS 需要描述文件。
+ * 所有导入/删除逻辑都通过 PowerShell 或 certutil 实现，在手机上调用只会
+ * spawn 失败并把一堆错误写进日志（代理启动时也会调用 importCertificate，
+ * 每次失败还要等命令超时），因此在入口处直接跳过。
+ */
+const CERTIFICATE_STORE_UNAVAILABLE = '移动端无法自动导入系统根证书，请在系统设置中手动信任 Auto366 的 CA 证书';
 
 class CertificateManager {
   constructor() {
@@ -8,6 +20,11 @@ class CertificateManager {
   }
 
   async importCertificate() {
+    if (isMobile) {
+      // `success: true` on purpose: the proxy must keep starting, and the
+      // renderer shows this as an informational note rather than a failure.
+      return { success: true, status: 'skipped', message: CERTIFICATE_STORE_UNAVAILABLE };
+    }
     try {
       if (!await this.certificateExists()) {
         moduleLog.log('证书文件不存在:', this.certPath);
@@ -51,6 +68,9 @@ class CertificateManager {
   }
 
   async isCertificateAlreadyImported() {
+    if (isMobile) {
+      return false;
+    }
     return new Promise((resolve) => {
       const command = `powershell -ExecutionPolicy Bypass -Command "try { $certs = Get-ChildItem -Path 'Cert:\\LocalMachine\\Root' | Where-Object { $_.Subject -like '*node-mitmproxy*' -or $_.Subject -like '*mitmproxy*' -or $_.FriendlyName -like '*node-mitmproxy*' -or $_.FriendlyName -like '*mitmproxy*' }; $count = ($certs | Measure-Object).Count; if ($count -gt 0) { Write-Host 'FOUND:' $count } else { Write-Host 'NOT_FOUND' } } catch { Write-Host 'ERROR:' $_.Exception.Message }"`;
       
@@ -73,6 +93,9 @@ class CertificateManager {
   }
 
   async addCertificateToStore() {
+    if (isMobile) {
+      return { success: true, status: 'skipped', message: CERTIFICATE_STORE_UNAVAILABLE };
+    }
     return new Promise(async (resolve) => {
       // 首先尝试PowerShell方法
       const powershellResult = await this.tryPowerShellImport();
@@ -200,6 +223,9 @@ class CertificateManager {
   }
 
   async forceImportCertificate() {
+    if (isMobile) {
+      return { success: true, status: 'skipped', message: CERTIFICATE_STORE_UNAVAILABLE };
+    }
     try {
       if (!await this.certificateExists()) {
         moduleLog.log('证书文件不存在:', this.certPath);
@@ -224,6 +250,19 @@ class CertificateManager {
   }
 
   async resetCertificate() {
+    if (isMobile) {
+      // Nothing to clean up: the app never wrote to the system trust store.
+      // Reporting success keeps the settings page from showing a failure for
+      // a feature that simply does not exist on this platform.
+      return {
+        success: true,
+        deleted: 0,
+        imported: false,
+        skipped: true,
+        errors: [],
+        message: CERTIFICATE_STORE_UNAVAILABLE,
+      };
+    }
     const results = { deleted: 0, imported: false, errors: [] };
 
     try {

@@ -36,8 +36,17 @@ export const IPC_INVOKE_TIMEOUT_MS = 30000;
  *  - `event`   main -> renderer: `webContents.send(channel, ...args)`
  *  - `hello`   renderer -> main: handshake (the page is alive)
  *  - `ready`   renderer -> main: the page finished loading
+ *  - `theme`   renderer -> main: the page applied another colour mode, so the
+ *              native shell (safe area, status bar) can follow it
  */
-export type BridgeMessageType = 'invoke' | 'send' | 'reply' | 'event' | 'hello' | 'ready';
+export type BridgeMessageType =
+  | 'invoke'
+  | 'send'
+  | 'reply'
+  | 'event'
+  | 'hello'
+  | 'ready'
+  | 'theme';
 
 export interface BridgeMessage {
   /** Message kind. */
@@ -50,6 +59,8 @@ export interface BridgeMessage {
   id?: string;
   /** Id of the window the message originates from. */
   windowId?: string;
+  /** Colour mode reported by a `theme` message (`light` / `dark`). */
+  theme?: string;
   /** Protocol version (only sent by `hello`). */
   version?: number;
   /** Marker so that foreign messages can be ignored. */
@@ -128,6 +139,9 @@ function normalizeBridgeMessage(parsed: Record<string, unknown>): BridgeMessage 
   }
   if (typeof parsed.windowId === 'string' || typeof parsed.windowId === 'number') {
     message.windowId = String(parsed.windowId);
+  }
+  if (typeof parsed.theme === 'string') {
+    message.theme = parsed.theme;
   }
   if (typeof parsed.version === 'number') {
     message.version = parsed.version;

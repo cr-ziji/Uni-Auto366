@@ -42,13 +42,18 @@ jest.mock('react-native-fs', () => {
       }
       return ok(encoding ? content.toString(encoding) : content);
     }),
-    writeFile: jest.fn((target, data) => {
-      files.set(target, toBuffer(data));
+    writeFile: jest.fn((target, data, encoding) => {
+      files.set(
+        target,
+        encoding === 'base64' ? Buffer.from(String(data), 'base64') : toBuffer(data),
+      );
       return ok();
     }),
-    appendFile: jest.fn((target, data) => {
+    appendFile: jest.fn((target, data, encoding) => {
       const current = files.get(target) ?? Buffer.alloc(0);
-      files.set(target, Buffer.concat([current, toBuffer(data)]));
+      const addition =
+        encoding === 'base64' ? Buffer.from(String(data), 'base64') : toBuffer(data);
+      files.set(target, Buffer.concat([current, addition]));
       return ok();
     }),
     unlink: jest.fn(target => {

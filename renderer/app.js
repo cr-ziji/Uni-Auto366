@@ -41,6 +41,9 @@ class Auto366App {
       // 暴露方法到全局（必须在最前面，因为HTML中的onclick依赖这些方法）
       this.exposeMethods();
 
+      // 按运行平台裁剪界面（移动端去掉窗口按钮、进程加速、增强模式入口）
+      await this.applyPlatformLayout();
+
       // 初始化颜色模式切换（尽早, 保证按钮联动与系统跟随）
       this.themeUI.init();
 
@@ -97,8 +100,8 @@ class Auto366App {
       // 显示赞赏弹窗
       if (settingsStorage.getItem('tutorial-completed') === 'true') this.showDonationModal();
 
-      // 自动启动天学网进程监控
-      if (window.electronAPI.startProcessMonitor) {
+      // 自动启动天学网进程监控（仅桌面端：移动端没有 up366.exe / PowerShell）
+      if (!this.isMobilePlatform && window.electronAPI.startProcessMonitor) {
         window.electronAPI.startProcessMonitor();
       }
 
@@ -121,6 +124,31 @@ class Auto366App {
       moduleLog.error('应用初始化失败:', error);
       this.logManager.addErrorLog('应用初始化失败: ' + error.message, "界面");
     }
+  }
+
+  /**
+   * 按运行平台裁剪界面。
+   *
+   * 主进程的 get-platform 返回真实的 process.platform：桌面是 win32/darwin，
+   * 移动端是 android/ios。移动端没有窗口按钮（窗口由系统管理）、进程加速
+   * （依赖 OpenSpeedy 注入器注入 up366.exe）和 TUN 增强模式（依赖 mihomo 与
+   * wintun），这些入口在 index.html 中标记为 data-desktop-only，这里整体移除，
+   * 避免用户点到必然失败的按钮。
+   */
+  async applyPlatformLayout() {
+    let info = null;
+    try {
+      info = await window.electronAPI?.getPlatform?.();
+    } catch (_) {
+      // 旧版主进程没有该接口，按桌面端处理
+    }
+    const platform = info?.platform || 'unknown';
+    const isMobile = info?.isMobile === true || platform === 'android' || platform === 'ios';
+    this.platform = platform;
+    this.isMobilePlatform = isMobile;
+    document.documentElement.dataset.auto366Platform = platform;
+    if (!isMobile) return;
+    document.querySelectorAll('[data-desktop-only]').forEach(node => node.remove());
   }
 
   // 初始化全局设置
@@ -168,7 +196,10 @@ class Auto366App {
       if (window.electronAPI && window.electronAPI.getUiMode) {
         const uiMode = await window.electronAPI.getUiMode();
         document.documentElement.setAttribute('data-ui', uiMode);
-        
+
+        // data-ui 确定后同步移动端默认面板（启动默认停在「监听日志」）
+        this.eventManager?.syncMobileDefaultPanel?.();
+
         if (uiMode === 'simple') {
           document.documentElement.setAttribute('data-simple-page', 'menu');
           await this.rulesUI.renderSimpleHomeRulesets();
@@ -329,6 +360,8 @@ class Auto366App {
 
     // 每5次启动显示一次
     if (newCount % 5 === 0) {
+      // 重复调用时先清掉旧的，否则同一个 id 会叠出多层、后加的那层定位也不对
+      document.getElementById('donation-modal')?.remove();
       const modal = document.createElement('div');
       modal.id = 'donation-modal';
       modal.className = 'modal modal--donation';

@@ -28,6 +28,10 @@ module.exports = {
     '^node:events$': 'events',
     '^node:buffer$': 'buffer',
     '^node:stream$': 'stream-browserify',
+    // The original Electron sources live outside `rootDir`; Babel injects
+    // `@babel/runtime` helpers there and Jest cannot resolve them from that
+    // folder (Metro maps them explicitly, see metro.config.js).
+    '^@babel/runtime/(.*)$': '<rootDir>/node_modules/@babel/runtime/$1',
   },
   testPathIgnorePatterns: ['/node_modules/', '/android/', '/ios/'],
 };

@@ -28,6 +28,8 @@ import {
 } from './protocol';
 import {windowStore} from './windowStore';
 import {getWebView} from './webviewRegistry';
+import {whenStartupComplete} from './startupGate';
+import {setPageTheme} from '../theme/themeStore';
 
 export {BRIDGE_MESSAGE, createBridgeMessage, parseBridgeMessage, serializeBridgeMessage};
 export type {BridgeMessage, BridgePayload};
@@ -124,8 +126,22 @@ export function createIpcEvent(windowId: string, delivery: BridgeDelivery): IpcE
  * Injects a payload into the WebView of a window.
  *
  * The page side receives it through `window.__E2RN_RECEIVE__(payload)`.
+ *
+ * Delivery can fail while the window is still being mounted: the React tree
+ * renders before the WebView registers itself, so an early `ipcRenderer.invoke`
+ * reply had nowhere to go and was dropped. The page then waited for its own
+ * 30 s timeout, which looked like "everything hangs during start-up".
  */
 export function deliverToWebView(id: string, payload: any): boolean {
+  if (deliverOnce(id, payload)) {
+    return true;
+  }
+  retryDelivery(id, payload, 0);
+  return false;
+}
+
+/** Attempts a single delivery; `false` means "not possible right now". */
+function deliverOnce(id: string, payload: any): boolean {
   const webView = getWebView(id);
   if (!webView || typeof webView.injectJavaScript !== 'function') {
     return false;
@@ -143,6 +159,7 @@ export function deliverToWebView(id: string, payload: any): boolean {
     'if (window.__E2RN_RECEIVE__) { window.__E2RN_RECEIVE__(' +
     json +
     '); }' +
+    'else { console.warn("[e2rn] page has no receiver yet, payload dropped"); }' +
     '} catch (error) { console.error("[e2rn] bridge delivery failed", error); }' +
     '})();';
   try {
@@ -152,6 +169,32 @@ export function deliverToWebView(id: string, payload: any): boolean {
     return false;
   }
   return true;
+}
+
+const DELIVERY_RETRY_LIMIT = 100;
+const DELIVERY_RETRY_DELAY_MS = 100;
+
+function retryDelivery(id: string, payload: any, attempt: number): void {
+  if (attempt >= DELIVERY_RETRY_LIMIT) {
+    console.warn(
+      `[e2rn] dropped a bridge message for window ${id} after ${attempt} attempts`,
+      payload && payload.type,
+      payload && payload.channel,
+    );
+    return;
+  }
+  const timer = setTimeout(() => {
+    const alive = windowStore
+      .getState()
+      .windows.some(entry => entry.id === id);
+    if (!alive) {
+      return;
+    }
+    if (!deliverOnce(id, payload)) {
+      retryDelivery(id, payload, attempt + 1);
+    }
+  }, DELIVERY_RETRY_DELAY_MS);
+  timer.unref?.();
 }
 
 /** Clears a pending invocation and stops its timeout. */
@@ -177,6 +220,7 @@ export function getPendingInvocationCount(): number {
  *  - `invoke` -> `ipcBus.emitAsync(channel, event, ...args)`, the result is
  *    delivered back to the page.
  *  - `send`   -> `ipcBus.emit(channel, event, ...args)`.
+ *  - `theme`  -> the colour mode of the page, used by the native shell.
  */
 export function handleBridgeMessage(id: string, raw: string): void {
   const message = parseBridgeMessage(raw);
@@ -188,6 +232,11 @@ export function handleBridgeMessage(id: string, raw: string): void {
   switch (message.type) {
     case 'hello':
     case 'ready':
+      return;
+    case 'theme':
+      // The shell (safe area, status bar, splash) is painted by React Native,
+      // so it has to know which colour mode the page applied.
+      setPageTheme(message.theme);
       return;
     case 'invoke':
       void handleInvoke(windowId, message);
@@ -206,7 +255,12 @@ function handleSend(windowId: string, message: BridgeMessage): void {
     return;
   }
   const event = createIpcEvent(windowId, 'send');
-  ipcBus.emit(channel, event, ...(message.args ?? []));
+  const args = message.args ?? [];
+  // A `send` fired during boot would hit a channel that has no listener yet;
+  // the event is replayed once the main process finished registering.
+  void whenStartupComplete().then(() => {
+    ipcBus.emit(channel, event, ...args);
+  });
 }
 
 async function handleInvoke(windowId: string, message: BridgeMessage): Promise<void> {
@@ -218,19 +272,25 @@ async function handleInvoke(windowId: string, message: BridgeMessage): Promise<v
   const event = createIpcEvent(windowId, 'invoke');
 
   const pending: PendingInvocation = {windowId, id, timer: null};
-  pending.timer = setTimeout(() => {
-    pendingInvocations.delete(id);
-    deliverToWebView(windowId, {
-      type: 'reply',
-      id,
-      channel,
-      ok: false,
-      error: 'timeout',
-    });
-  }, IPC_INVOKE_TIMEOUT_MS);
   pendingInvocations.set(id, pending);
 
   try {
+    // Hold the call back while the main process is still booting: otherwise
+    // `emitAsync` finds no handler and answers `undefined`, which the page
+    // reports as a broken IPC channel. The response timeout only starts once
+    // the call was actually handed to the bus.
+    await whenStartupComplete();
+    pending.timer = setTimeout(() => {
+      pendingInvocations.delete(id);
+      deliverToWebView(windowId, {
+        type: 'reply',
+        id,
+        channel,
+        ok: false,
+        error: 'timeout',
+      });
+    }, IPC_INVOKE_TIMEOUT_MS);
+
     const value = await ipcBus.emitAsync(channel, event, ...(message.args ?? []));
     settlePending(id);
     deliverToWebView(windowId, {

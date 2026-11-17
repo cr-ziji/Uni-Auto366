@@ -1,9 +1,19 @@
 const moduleLog = require('../logging').create('进程监控');
 const { spawnPowerShell, execTextSync: execSync, readLines } = require('./process-text');
 const { shell } = require('electron');
+const { isMobile } = require('./platform');
 // Preserve the existing IPC namespace; source ownership follows the business directory.
 const ipcMain = require('../register').forModule('system');
 const fs = require('fs-extra');
+
+/**
+ * 移动端没有 `up366.exe`，也没有 PowerShell / WMI。
+ *
+ * 旧实现在这里会 spawn `powershell.exe`，手机上必然失败并在日志里留下
+ * “启动失败: ... spawn powershell.exe ENOENT”，而渲染层的自动启动逻辑每次
+ * 初始化都会再触发一次。这里直接短路：不 spawn、不发任何事件、不写错误日志。
+ */
+const MONITOR_UNSUPPORTED = '进程监控仅支持桌面端（需要 PowerShell + WMI 监听 up366.exe）';
 
 class ProcessMonitor {
   constructor() {
@@ -53,6 +63,10 @@ while ($true) {
   }
 
   start(mainWindow) {
+    if (isMobile) {
+      // 静默跳过：调用方（renderer 的自动启动、代理面板）都不需要看到失败。
+      return { success: true, skipped: true, message: MONITOR_UNSUPPORTED };
+    }
     if (this.isMonitoring) return { success: false, message: '进程监控已在运行中' };
     if (!mainWindow || mainWindow.isDestroyed()) return { success: false, message: '主窗口不可用' };
 
@@ -146,6 +160,9 @@ while ($true) {
   }
 
   stop() {
+    if (isMobile) {
+      return { success: true, skipped: true, message: MONITOR_UNSUPPORTED };
+    }
     if (!this.isMonitoring) return { success: true, message: '进程监控未在运行' };
 
     if (this.psProcess && !this.psProcess.killed) {
@@ -193,6 +210,10 @@ while ($true) {
   }
 
   _queryProcessCount() {
+    if (isMobile) {
+      // 不要在手机上 spawn PowerShell：必失败，还会等命令超时。
+      return Promise.resolve({ count: 0, pids: [] });
+    }
     return new Promise((resolve) => {
       const queryScript = `
 $all = Get-CimInstance Win32_Process -Filter "Name='up366.exe'" -ErrorAction SilentlyContinue
@@ -260,6 +281,9 @@ if ($count -gt 0) {
   }
 
   getUp366Path() {
+    if (isMobile) {
+      return null;
+    }
     try {
       const regPath = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\up366-2016';
       const result = execSync(`reg query "${regPath}" /v DisplayIcon`, { encoding: 'utf8' });
@@ -279,6 +303,9 @@ if ($count -gt 0) {
   }
 
   async openUp366() {
+    if (isMobile) {
+      return { success: false, skipped: true, error: MONITOR_UNSUPPORTED };
+    }
     const up366Path = this.getUp366Path();
     if (up366Path) {
       try {
@@ -292,6 +319,9 @@ if ($count -gt 0) {
   }
 
   async killUp366() {
+    if (isMobile) {
+      return { success: false, skipped: true, error: MONITOR_UNSUPPORTED };
+    }
     try {
       const result = execSync('taskkill /f /im up366.exe /t 2>&1', { encoding: 'utf8' });
       return { success: true, output: result.trim() };

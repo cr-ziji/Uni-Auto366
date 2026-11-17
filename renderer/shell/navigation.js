@@ -45,6 +45,9 @@ initSwitchToSimple() {
         await window.electronAPI.switchUiMode('simple');
         document.documentElement.setAttribute('data-ui', 'simple');
         document.documentElement.setAttribute('data-simple-page', 'menu');
+        // 简易模式没有底部导航，日志是内容下方的常驻面板：把「整屏日志」
+        // 面板状态收起来，否则左侧视图会被移动端样式藏掉。
+        this.setMobilePanel?.('');
         if (window.electronAPI.captureEvent) {
           window.electronAPI.captureEvent('ui_mode_switched', { mode: 'simple' });
         }

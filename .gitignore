@@ -50,6 +50,9 @@ coverage/
 .nyc_output/
 /tests/
 
+# 本地工具数据（含调试截图等临时产物）
+.workbuddy/
+
 # Electron 输出
 **/out/
 **/release/

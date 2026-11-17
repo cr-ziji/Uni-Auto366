@@ -1,6 +1,10 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Android 9 and below need it to write into the public Downloads folder. -->
+    <uses-permission
+      android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+      android:maxSdkVersion="28" />
 
     <application
       android:name=".MainApplication"
@@ -10,6 +14,7 @@
       android:allowBackup="false"
       android:theme="@style/AppTheme"
       android:usesCleartextTraffic="true"
+      android:requestLegacyExternalStorage="true"
       android:supportsRtl="true">
       <activity
         android:name=".MainActivity"
@@ -23,5 +28,20 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+
+      <!--
+        Hands private files to other apps (opening a downloaded rule set or a
+        log file). Since Android 7 a `file://` URI in an intent throws
+        FileUriExposedException, so everything goes through this provider.
+      -->
+      <provider
+        android:name="androidx.core.content.FileProvider"
+        android:authorities="${applicationId}.fileprovider"
+        android:exported="false"
+        android:grantUriPermissions="true">
+        <meta-data
+          android:name="android.support.FILE_PROVIDER_PATHS"
+          android:resource="@xml/file_paths" />
+      </provider>
     </application>
 </manifest>

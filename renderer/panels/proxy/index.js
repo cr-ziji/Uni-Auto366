@@ -102,6 +102,9 @@ class ProxyUI {
 
   // 代理启动后自动启动 TUN
   _autoStartTun() {
+    // 移动端没有 TUN 增强模式（按钮和设置区块都已按平台裁剪），自动启动
+    // 只会发出一次必然失败的 IPC，并把警告写进日志面板。
+    if (window.app?.isMobilePlatform) return;
     const autostart = settingsStorage.getItem('tun-autostart');
     if (autostart !== null && autostart !== 'true') return;
     // 延迟一会确保代理完全就绪

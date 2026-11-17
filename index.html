@@ -31,16 +31,17 @@
             <span class="titlebar-title">Auto366</span>
             <span class="titlebar-version" id="titlebar-version"></span>
         </div>
-        <button type="button" id="toggle-always-on-top-btn" class="titlebar-btn titlebar-pin-btn" title="窗口置顶">
+        <!-- 桌面专属：移动端由 renderer 按平台删除（data-desktop-only） -->
+        <button type="button" id="toggle-always-on-top-btn" class="titlebar-btn titlebar-pin-btn" title="窗口置顶" data-desktop-only>
             <i class="bi bi-pin-angle"></i>
         </button>
-        <button type="button" id="titlebar-minimize-btn" class="titlebar-btn" title="最小化">
+        <button type="button" id="titlebar-minimize-btn" class="titlebar-btn" title="最小化" data-desktop-only>
             <i class="bi bi-dash-lg"></i>
         </button>
-        <button type="button" id="titlebar-maximize-btn" class="titlebar-btn" title="最大化">
+        <button type="button" id="titlebar-maximize-btn" class="titlebar-btn" title="最大化" data-desktop-only>
             <i class="bi bi-square"></i>
         </button>
-        <button type="button" id="titlebar-close-btn" class="titlebar-btn titlebar-close" title="关闭">
+        <button type="button" id="titlebar-close-btn" class="titlebar-btn titlebar-close" title="关闭" data-desktop-only>
             <i class="bi bi-x-lg"></i>
         </button>
     </header>
@@ -138,13 +139,18 @@
                 <i class="bi bi-cloud-download"></i>
                 <span>扩展规则集</span>
             </div>
-            <div class="sidebar__item" data-view="speed">
+            <div class="sidebar__item" data-view="speed" data-desktop-only>
                 <i class="bi bi-speedometer2"></i>
                 <span>进程加速</span>
             </div>
             <div class="sidebar__item" data-view="settings">
                 <i class="bi bi-gear"></i>
                 <span>设置</span>
+            </div>
+            <!-- 移动端专属：监听日志是右侧常驻面板，由 renderer/shell/mobile.js 切换 -->
+            <div class="sidebar__item sidebar__item--mobile-logs" data-mobile-view="logs">
+                <i class="bi bi-terminal"></i>
+                <span>监听日志</span>
             </div>
         </div>
 
@@ -189,7 +195,7 @@
                         <i class="bi bi-collection"></i>
                         <span>规则集</span>
                     </button>
-                    <button type="button" id="simple-open-speed" class="btn--ghost" aria-label="进程加速">
+                    <button type="button" id="simple-open-speed" class="btn--ghost" aria-label="进程加速" data-desktop-only>
                         <i class="bi bi-speedometer2"></i>
                         <span>进程加速</span>
                     </button>
@@ -201,7 +207,7 @@
             </div>
             <div class="control-panel__group control-panel__cluster control-panel__cluster--actions">
                 <div class="control-panel__actions">
-                    <button type="button" id="toggleTunBtn" class="btn--tun-toggle" aria-label="TUN 增强模式" title="TUN 增强模式（关闭）">
+                    <button type="button" id="toggleTunBtn" class="btn--tun-toggle" aria-label="TUN 增强模式" title="TUN 增强模式（关闭）" data-desktop-only>
                         <i class="bi bi-lightning-charge"></i>
                         <span>增强模式</span>
                     </button>
@@ -434,7 +440,7 @@
                                     <span>启动时自动开启代理</span>
                                 </label>
                             </div>
-                            <div class="setting-item">
+                            <div class="setting-item" data-desktop-only>
                                 <div class="setting-item__content">
                                     <button type="button" id="resetCertificateBtn" class="btn--danger">
                                         <i class="bi bi-arrow-counterclockwise"></i>
@@ -448,7 +454,7 @@
 
 </div>
 </div>
-<div class="settings-entry">
+<div class="settings-entry" data-desktop-only>
 <h4 class="settings-entry__label">增强模式</h4>
 <div class="settings-entry__body">
 
@@ -487,11 +493,11 @@
 
                             <div class="setting-item">
                                 <input type="text" id="cachePathInput" class="form-input" placeholder="选择缓存路径">
-                                <button id="browseCacheBtn" class="btn--ghost">
+                                <button id="browseCacheBtn" class="btn--ghost" data-desktop-only>
                                     <i class="bi bi-folder"></i>
                                     <span>浏览</span>
                                 </button>
-                                <button id="autoFindCacheBtn" class="btn--ghost">
+                                <button id="autoFindCacheBtn" class="btn--ghost" data-desktop-only>
                                     <i class="bi bi-search"></i>
                                     <span>自动寻找</span>
                                 </button>
@@ -765,8 +771,8 @@
 </div>
                 </div>
 
-                <!-- 进程加速 -->
-                <div class="view-panel view-panel--speed" id="speed-view">
+                <!-- 进程加速（桌面专属） -->
+                <div class="view-panel view-panel--speed" id="speed-view" data-desktop-only>
                     <div class="view-panel__header">
                         <h3>进程加速</h3>
                     </div>

@@ -354,6 +354,31 @@ class FileManager {
       }
     });
 
+    // 把一段文本写到用户选择的位置。
+    //
+    // 渲染层原来用 `a[download]` + `URL.createObjectURL` 导出 JSON：浏览器会
+    // 弹出"另存为"，但 WebView 里没有下载管理器，点击只会静默消失（日志却
+    // 显示"已导出"）。保存对话框 + 写盘在桌面和移动端都能真正落盘。
+    ipcMain.handle('save-text-file', async (event, options = {}) => {
+      try {
+        const settings = options && typeof options === 'object' ? options : {};
+        const defaultName = typeof settings.defaultName === 'string' && settings.defaultName
+          ? settings.defaultName
+          : 'export.txt';
+        const content = settings.content == null ? '' : String(settings.content);
+        const filters = Array.isArray(settings.filters) && settings.filters.length > 0
+          ? settings.filters
+          : [{ name: 'All Files', extensions: ['*'] }];
+        const filePath = await this.saveFileDialog({ defaultPath: defaultName, filters });
+        if (!filePath) return { success: false, error: '用户取消保存' };
+        if (!this.writeFile(filePath, content)) return { success: false, error: '写入文件失败' };
+        return { success: true, filePath };
+      } catch (error) {
+        moduleLog.error('保存文件失败:', error);
+        return { success: false, error: error.message };
+      }
+    });
+
     ipcMain.handle('replace-audio', async () => {
       try {
         return await this.replaceAudioFiles(mainWindow);

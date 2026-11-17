@@ -1,6 +1,7 @@
 const moduleLog = require('../logging').create('窗口');
 const { app, BrowserWindow, screen } = require('electron');
 const ipcMain = require('../register').forModule('window');
+const platformInfo = require('../app/platform');
 const path = require('path');
 const fs = require('fs-extra');
 
@@ -143,10 +144,28 @@ class WindowManager {
     ipcMain.handle('get-app-version', () => {
       return app.getVersion();
     });
+
+    // 渲染层据此裁剪桌面专属界面（窗口按钮、进程加速、增强模式入口）。
+    ipcMain.handle('get-platform', () => {
+      return { platform: platformInfo.platform, isMobile: platformInfo.isMobile };
+    });
   }
 
   // 将 HTML 内容导出为 PDF 缓冲区
   async exportHtmlToPdf(htmlContent) {
+    // 移动端没有 Chromium 的 `printToPDF`（Android WebView 不能把页面栅格化
+    // 成 PDF），但导出本身还是可以做：把同一份 HTML 交给用户，浏览器打开后
+    // 可以直接"打印为 PDF"，也能直接分享。返回 `format: 'html'` 让调用方
+    // 换掉扩展名和过滤器。
+    if (platformInfo.isMobile) {
+      return {
+        success: true,
+        format: 'html',
+        htmlBuffer: Buffer.from(String(htmlContent ?? ''), 'utf8'),
+        note: '移动端无法直接生成 PDF，已导出为 HTML（可用浏览器打印成 PDF）',
+      };
+    }
+
     let hiddenWindow = null;
     try {
       hiddenWindow = new BrowserWindow({

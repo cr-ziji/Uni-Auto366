@@ -1,0 +1,10 @@
+<resources>
+
+    <!--
+      Same value as the dark page background (see the color bg page token in
+      styles/global/theme.css), so the launch window never flashes black
+      before the dark UI appears.
+    -->
+    <color name="app_window_background">#16181C</color>
+
+</resources>

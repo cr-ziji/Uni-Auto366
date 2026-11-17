@@ -444,12 +444,37 @@ class AnswersUI {
       };
 
       const dataStr = JSON.stringify(exportData, null, 2);
+      const fileName = `answers_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+
+      // Ask the main process first: it opens the system "save as" dialog and
+      // writes the file itself. `a[download]` relies on a download manager,
+      // which the Android WebView does not have - the click just disappears
+      // while the log claims the file was exported.
+      if (window.electronAPI && window.electronAPI.call) {
+        try {
+          const saved = await window.electronAPI.call('file', 'save-text-file', {
+            defaultName: fileName,
+            content: dataStr,
+            filters: [{ name: 'JSON Files', extensions: ['json'] }]
+          });
+          if (saved && saved.success) {
+            this.logManager.addSuccessLog(`JSON 答案文件已导出: ${saved.filePath}`, "答案");
+            return;
+          }
+          if (saved && saved.error === '用户取消保存') {
+            return;
+          }
+        } catch (error) {
+          moduleLog.warn('保存 JSON 文件失败，回退到浏览器下载:', error);
+        }
+      }
+
       const dataBlob = new Blob([dataStr], { type: 'application/json' });
       const url = URL.createObjectURL(dataBlob);
 
       const link = document.createElement('a');
       link.href = url;
-      link.download = `answers_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+      link.download = fileName;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -491,7 +516,9 @@ class AnswersUI {
       if (window.electronAPI && window.electronAPI.exportAnswersPdf) {
         const result = await window.electronAPI.exportAnswersPdf(htmlContent);
         if (result && result.success) {
-          this.logManager.addSuccessLog(`PDF 答案文件已导出: ${result.filePath}`, "答案");
+          const label = result.format === 'html' ? '答案文件（HTML）' : 'PDF 答案文件';
+          this.logManager.addSuccessLog(`${label}已导出: ${result.filePath}`, "答案");
+          if (result.note) this.logManager.addInfoLog(result.note, "答案");
         } else {
           this.logManager.addErrorLog(`导出 PDF 失败: ${result?.error || '未知错误'}`, "答案");
         }

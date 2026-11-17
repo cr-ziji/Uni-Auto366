@@ -1,0 +1,1317 @@
+/* ============================================================
+   移动端（React Native WebView）响应式布局
+   ============================================================
+
+   所有规则都限定在 html[data-e2rn-mobile="1"] 下。这个属性由资源服务器
+   （reactnative/src/runtime/web/assetServer.ts）在提供 index.html 时注入，
+   桌面 Electron 直接 loadFile('index.html')，永远不会带上它，所以这里的
+   覆盖不会影响桌面端。
+
+   设计目标：
+   - 不再把 1400px 的桌面页缩放塞进手机，而是真正的单列 / 底部导航布局；
+   - 字号、按钮、输入框都提升到触摸友好的尺寸（最小点击区域约 40px）；
+   - 「监听日志」从右侧常驻面板变成底部导航里的整屏面板；
+   - 模态框 / 协议 / 教程在小屏上变成底部 sheet 或全宽卡片。
+
+   结构：
+     1. 设计变量
+     2. 基础与标题栏
+     3. 底部导航（.sidebar）
+     4. 控制面板
+     5. 主内容 / 日志面板
+     6. 各功能页
+     7. 触摸控件（按钮 / 表单 / 开关）
+     8. 模态框与浮层
+     9. 简易模式
+    10. 控件一致性与触屏细节
+    11. 横屏
+   ============================================================ */
+
+/* ---------- 1. 设计变量 ---------- */
+html[data-e2rn-mobile="1"] {
+    --titlebar-height: 0px;
+    --panel-header-height: auto;
+    --sidebar-item-height: 58px;
+    --text-xs: 12px;
+    --text-sm: 13px;
+    --text-base: 15px;
+    --text-lg: 16px;
+    --text-xl: 18px;
+    --text-2xl: 20px;
+    --text-3xl: 22px;
+    --text-4xl: 24px;
+    --e2rn-bottom-nav-height: 58px;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"] {
+    /* 简易模式没有底部导航，日志详情浮层要贴到屏幕底部 */
+    --e2rn-bottom-nav-height: 0px;
+}
+
+/* ---------- 2. 基础与标题栏 ---------- */
+html[data-e2rn-mobile="1"] body {
+    padding-top: 0;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
+    font-size: var(--text-base);
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+/* 手机没有窗口按钮，标题栏整体让位给内容 */
+html[data-e2rn-mobile="1"] .app-custom-titlebar {
+    display: none !important;
+}
+
+html[data-e2rn-mobile="1"] .app-shell {
+    flex-direction: column;
+    min-height: 0;
+}
+
+/* 滚动容器不要触发下拉刷新 / 橡皮筋 */
+html[data-e2rn-mobile="1"] .answers-view__container,
+html[data-e2rn-mobile="1"] .rules-content,
+html[data-e2rn-mobile="1"] .extensions-view,
+html[data-e2rn-mobile="1"] .settings-content,
+html[data-e2rn-mobile="1"] .traffic-monitor__log,
+html[data-e2rn-mobile="1"] .log-detail__content,
+html[data-e2rn-mobile="1"] .modal__body,
+html[data-e2rn-mobile="1"] .agreement-overlay__body {
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* ---------- 3. 底部导航（.sidebar） ---------- */
+html[data-e2rn-mobile="1"] .sidebar,
+html[data-e2rn-mobile="1"] .sidebar:hover {
+    order: 2;
+    width: 100% !important;
+    height: auto;
+    flex: 0 0 auto;
+    flex-direction: row;
+    align-items: stretch;
+    border-right: 0;
+    border-top: 1px solid var(--color-border);
+    background: var(--color-bg-muted);
+    /* 低于模态框（400），高于视图头（100） */
+    z-index: 150;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+html[data-e2rn-mobile="1"] .sidebar__menu {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: row;
+    padding: 0;
+}
+
+html[data-e2rn-mobile="1"] .sidebar__item,
+html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
+    flex: 1 1 0;
+    min-width: 0;
+    height: auto;
+    min-height: var(--e2rn-bottom-nav-height);
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 2px;
+    white-space: nowrap;
+    text-align: center;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+}
+
+html[data-e2rn-mobile="1"] .sidebar__item i {
+    font-size: 20px;
+    min-width: 0;
+    line-height: 1;
+}
+
+html[data-e2rn-mobile="1"] .sidebar__item span,
+html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item span {
+    opacity: 1;
+    max-width: none;
+    overflow: visible;
+    margin-left: 0;
+    font-size: 11px;
+    line-height: 1.15;
+}
+
+/* 选中态从左侧竖条改成顶部横条 */
+html[data-e2rn-mobile="1"] .sidebar__item.is-active::before {
+    left: 0;
+    right: 0;
+    top: 0;
+    bottom: auto;
+    width: auto;
+    height: 2px;
+    background: var(--color-primary);
+}
+
+/* 桌面端的选中态是「整块主题色填充」的胶囊（layout.css），搬到 58px 高的
+   底部标签上会变成一块硬边蓝色方块，既压住了上面的 2px 指示条，又让导航
+   比内容区更抢眼。底部导航统一用「指示条 + 主题色图标文字」表示选中。 */
+html[data-e2rn-mobile="1"] .sidebar__item,
+html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
+    background: transparent;
+    color: var(--color-text-muted);
+}
+
+html[data-e2rn-mobile="1"] .sidebar__item.is-active,
+html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item.is-active {
+    background: transparent;
+    color: var(--color-primary);
+}
+
+/* 触摸屏没有真正的 hover，但点击后 :hover 会一直挂着，这里清掉；
+   换成 :active 做按下反馈，短按也有回应。 */
+html[data-e2rn-mobile="1"] .sidebar__item:hover {
+    background: transparent;
+}
+
+html[data-e2rn-mobile="1"] .sidebar__item:active {
+    background: var(--color-border);
+}
+
+/* 主题切换收进「设置 → 外观」，底部导航只保留 5 个入口 */
+html[data-e2rn-mobile="1"] .sidebar__item--theme {
+    display: none !important;
+}
+
+/* 只在移动端出现的「监听日志」入口 */
+html[data-e2rn-mobile="1"] .sidebar__item--mobile-logs {
+    display: flex !important;
+}
+
+/* 网络请求（监听日志）是手机上最常看的页面，排到第一位；其余保持原有
+   顺序。桌面端没有这个导航项，order 不会影响桌面布局。 */
+html[data-e2rn-mobile="1"] .sidebar__item[data-mobile-view="logs"] {
+    order: -1;
+}
+
+/* ---------- 4. 控制面板 ---------- */
+html[data-e2rn-mobile="1"] .main {
+    order: 1;
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+}
+
+html[data-e2rn-mobile="1"] .control-panel {
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 12px;
+    min-height: 0;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__group {
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__cluster--status {
+    flex: 1 1 100%;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__cluster--actions {
+    flex: 1 1 100%;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions {
+    width: 100%;
+    gap: 8px;
+    flex-wrap: nowrap;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > button {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0 8px;
+    font-size: 13px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__status {
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+/* 手机上省掉「代理状态:」这类说明文字，只保留状态徽标 */
+html[data-e2rn-mobile="1"] .control-panel__status-label {
+    display: none;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__status-item {
+    font-size: 14px;
+    gap: 4px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel .btn--port-change {
+    width: 36px;
+    height: 36px;
+}
+
+/* ---------- 5. 主内容 / 日志面板 ---------- */
+html[data-e2rn-mobile="1"] .main__content {
+    position: relative;
+    flex-direction: column;
+    min-height: 0;
+}
+
+html[data-e2rn-mobile="1"] .main__left {
+    flex: 1 1 auto;
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
+}
+
+html[data-e2rn-mobile="1"] .main__resizer {
+    display: none;
+}
+
+/* 右侧日志默认隐藏，由「监听日志」导航项切换成整屏面板 */
+html[data-e2rn-mobile="1"] .main__right {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    min-width: 0;
+    z-index: 40;
+    display: none;
+    background: var(--color-bg-page);
+}
+
+html[data-e2rn-mobile="1"][data-e2rn-panel="logs"] .main__right {
+    display: flex;
+}
+
+html[data-e2rn-mobile="1"][data-e2rn-panel="logs"] .main__left {
+    display: none;
+}
+
+/* 日志详情改成整屏浮层（JS 用内联 display:flex 打开，这里不碰 display） */
+html[data-e2rn-mobile="1"] #requestDetails {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: var(--e2rn-bottom-nav-height);
+    z-index: 950;
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    min-width: 0;
+    border-left: 0;
+    border-radius: 0;
+    font-size: 13px;
+    background: var(--color-bg-panel);
+}
+
+html[data-e2rn-mobile="1"] .logs-container__details-resizer {
+    display: none !important;
+}
+
+html[data-e2rn-mobile="1"] .log-detail__header {
+    height: 48px;
+    padding: 0 12px;
+}
+
+html[data-e2rn-mobile="1"] .log-detail__header h4 {
+    font-size: 16px;
+}
+
+html[data-e2rn-mobile="1"] .log-detail__content {
+    height: auto;
+    flex: 1;
+    padding: 12px;
+    font-size: 12.5px;
+}
+
+html[data-e2rn-mobile="1"] .logs-container {
+    padding: 0 12px;
+}
+
+html[data-e2rn-mobile="1"] .logs-container__main {
+    flex-direction: column;
+}
+
+html[data-e2rn-mobile="1"] .traffic-monitor {
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .traffic-monitor__log {
+    padding: 10px 8px;
+    font-size: 12.5px;
+}
+
+html[data-e2rn-mobile="1"] .log-item {
+    align-items: flex-start;
+    padding: 8px 0;
+    gap: 6px;
+}
+
+/* 触摸屏没有 hover，避免日志行在点击后左右跳动 */
+html[data-e2rn-mobile="1"] .log-item:hover {
+    margin: 0;
+    padding-left: 0;
+    padding-right: 0;
+    background: transparent;
+}
+
+html[data-e2rn-mobile="1"] .logs-container__stats {
+    min-height: 40px;
+    font-size: 12px;
+}
+
+html[data-e2rn-mobile="1"] .logs-container__search {
+    padding: 8px 12px;
+}
+
+html[data-e2rn-mobile="1"] .logs-container__filters {
+    gap: 6px;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    padding-bottom: 2px;
+}
+
+html[data-e2rn-mobile="1"] .btn--filter {
+    flex: 0 0 auto;
+}
+
+html[data-e2rn-mobile="1"] .search-input-group {
+    width: 100%;
+}
+
+html[data-e2rn-mobile="1"] .logs-container__search-input {
+    font-size: 16px;
+}
+
+/* ---------- 6. 各功能页 ---------- */
+/* 通用视图头 */
+html[data-e2rn-mobile="1"] .view-panel__header {
+    min-height: 48px;
+    padding: 6px 12px;
+    gap: 6px;
+}
+
+html[data-e2rn-mobile="1"] .view-panel__header h3 {
+    font-size: 17px;
+}
+
+html[data-e2rn-mobile="1"] .view-panel__controls {
+    gap: 6px;
+}
+
+/* 答案获取 */
+html[data-e2rn-mobile="1"] .answers-view__container {
+    padding: 12px;
+}
+
+html[data-e2rn-mobile="1"] .answer-group {
+    margin-bottom: 14px;
+}
+
+html[data-e2rn-mobile="1"] .answer-group__header {
+    padding: 10px 12px;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+html[data-e2rn-mobile="1"] .answer-group__header h4 {
+    font-size: 15px;
+}
+
+html[data-e2rn-mobile="1"] .answer-item {
+    padding: 10px 12px;
+}
+
+html[data-e2rn-mobile="1"] .answer-item__content {
+    font-size: 14.5px;
+}
+
+html[data-e2rn-mobile="1"] .answers-view__toolbar {
+    padding: 8px 12px;
+    gap: 8px;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: center;
+}
+
+html[data-e2rn-mobile="1"] .answers-view__toolbar > * {
+    width: 100%;
+    min-width: 0;
+    justify-content: center;
+}
+
+/* 隐藏的 file input 不参与网格布局 */
+html[data-e2rn-mobile="1"] .answers-view__toolbar > .file-input--hidden {
+    display: none;
+}
+
+html[data-e2rn-mobile="1"] .export-menu {
+    width: 100%;
+}
+
+html[data-e2rn-mobile="1"] .export-menu .btn--export {
+    width: 100%;
+}
+
+html[data-e2rn-mobile="1"] .export-menu__dropdown {
+    left: auto;
+    right: 0;
+    transform: none;
+    min-width: 130px;
+}
+
+/* 规则管理 */
+html[data-e2rn-mobile="1"] .rules-content {
+    padding: 12px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__header,
+html[data-e2rn-mobile="1"] .rule-group__header {
+    padding: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__name,
+html[data-e2rn-mobile="1"] .rule-group__name {
+    flex-wrap: wrap;
+    gap: 6px;
+    word-break: break-word;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__actions,
+html[data-e2rn-mobile="1"] .rule-group__actions {
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config {
+    padding: 12px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config-items {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config-item {
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config-label {
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config-value {
+    word-break: break-all;
+}
+
+/* 触摸屏取消 hover 位移，避免列表抖动 */
+html[data-e2rn-mobile="1"] .rule-item:hover,
+html[data-e2rn-mobile="1"] .rule-group:hover,
+html[data-e2rn-mobile="1"] .ruleset-item:hover {
+    transform: none;
+}
+
+/* 扩展规则集 */
+html[data-e2rn-mobile="1"] .extensions-view {
+    padding: 12px;
+}
+
+html[data-e2rn-mobile="1"] .extensions-view__filters {
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"] .extensions-view__filters .form-input {
+    width: auto;
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__header {
+    padding: 12px;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__name {
+    word-break: break-word;
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__actions {
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+html[data-e2rn-mobile="1"] .extensions-view__pagination {
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+/* 设置（settings.css 已有容器查询，这里只放大触摸尺寸） */
+html[data-e2rn-mobile="1"] .settings-content {
+    padding: 0 14px 20px;
+}
+
+html[data-e2rn-mobile="1"] .settings-entry {
+    padding: 16px 0;
+    gap: 10px;
+}
+
+html[data-e2rn-mobile="1"] .setting-item {
+    gap: 8px 10px;
+}
+
+html[data-e2rn-mobile="1"] .setting-item > label:first-child {
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"] .setting-item label {
+    font-size: 14px;
+}
+
+html[data-e2rn-mobile="1"] .setting-item__description {
+    font-size: 13px;
+}
+
+html[data-e2rn-mobile="1"] .settings-entry .form-input {
+    min-height: 42px;
+    font-size: 16px;
+}
+
+/* ---------- 7. 触摸控件 ---------- */
+html[data-e2rn-mobile="1"] button,
+html[data-e2rn-mobile="1"] [role="button"],
+html[data-e2rn-mobile="1"] .sidebar__item {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+html[data-e2rn-mobile="1"] .btn--primary,
+html[data-e2rn-mobile="1"] .btn--ghost,
+html[data-e2rn-mobile="1"] .btn--danger,
+html[data-e2rn-mobile="1"] .btn--action,
+html[data-e2rn-mobile="1"] .btn--cancel,
+html[data-e2rn-mobile="1"] .btn--danger-solid,
+html[data-e2rn-mobile="1"] .btn--retry,
+html[data-e2rn-mobile="1"] .btn--install,
+html[data-e2rn-mobile="1"] .btn--view-details,
+html[data-e2rn-mobile="1"] .btn--download,
+html[data-e2rn-mobile="1"] .btn--copy,
+html[data-e2rn-mobile="1"] .btn--import,
+html[data-e2rn-mobile="1"] .btn--share,
+html[data-e2rn-mobile="1"] .btn--export,
+html[data-e2rn-mobile="1"] .btn--replace-audio,
+html[data-e2rn-mobile="1"] .btn--add-rule,
+html[data-e2rn-mobile="1"] .btn--rule,
+html[data-e2rn-mobile="1"] .btn--settings,
+html[data-e2rn-mobile="1"] .btn--update,
+html[data-e2rn-mobile="1"] .btn--filter {
+    height: 40px;
+    font-size: 14px;
+    padding: 0 14px;
+}
+
+/* 纯图标按钮保持正方形 */
+html[data-e2rn-mobile="1"] .btn--close,
+html[data-e2rn-mobile="1"] .btn--search,
+html[data-e2rn-mobile="1"] .btn--clear,
+html[data-e2rn-mobile="1"] .btn--icon {
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+    padding: 0;
+}
+
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls .btn--search,
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls .btn--clear {
+    width: 40px;
+    height: 40px;
+    line-height: 40px;
+    font-size: 20px;
+}
+
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls .btn--search::before,
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls .btn--clear::before {
+    font-size: 20px;
+    line-height: 40px;
+}
+
+html[data-e2rn-mobile="1"] .btn--sm {
+    height: 34px;
+}
+
+html[data-e2rn-mobile="1"] .form-input {
+    min-height: 44px;
+    padding: 10px 12px;
+    font-size: 16px;
+}
+
+html[data-e2rn-mobile="1"] textarea.form-input {
+    min-height: 96px;
+}
+
+html[data-e2rn-mobile="1"] .form-group {
+    margin-bottom: 16px;
+}
+
+html[data-e2rn-mobile="1"] .form-group label {
+    font-size: 15px;
+}
+
+html[data-e2rn-mobile="1"] .rule-form__fields {
+    padding: 12px;
+}
+
+html[data-e2rn-mobile="1"] .form-group__help {
+    font-size: 12.5px;
+}
+
+html[data-e2rn-mobile="1"] .toggle {
+    width: 48px;
+    height: 28px;
+}
+
+html[data-e2rn-mobile="1"] .toggle__slider:before {
+    height: 22px;
+    width: 22px;
+}
+
+html[data-e2rn-mobile="1"] .toggle input:checked + .toggle__slider:before {
+    transform: translateX(20px);
+}
+
+/* ---------- 8. 模态框与浮层 ---------- */
+html[data-e2rn-mobile="1"] .modal {
+    align-items: flex-end;
+}
+
+html[data-e2rn-mobile="1"] .modal__content,
+html[data-e2rn-mobile="1"] .modal--donation .modal__content,
+html[data-e2rn-mobile="1"] .modal--update .modal__content,
+html[data-e2rn-mobile="1"] .modal--share .modal__content {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100% - 12px);
+    border-radius: 16px 16px 0 0;
+    animation: none;
+}
+
+html[data-e2rn-mobile="1"] .modal__header {
+    padding: 14px 16px;
+}
+
+html[data-e2rn-mobile="1"] .modal__header h3,
+html[data-e2rn-mobile="1"] .modal__header h4 {
+    font-size: 18px;
+}
+
+html[data-e2rn-mobile="1"] .modal__body {
+    padding: 16px;
+}
+
+html[data-e2rn-mobile="1"] .modal__footer {
+    padding: 12px 16px 16px;
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"] .modal__footer .btn--primary,
+html[data-e2rn-mobile="1"] .modal__footer .btn--ghost,
+html[data-e2rn-mobile="1"] .modal__footer .btn--cancel {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+/* 只有一个按钮时不要拉满整行，靠右即可 */
+html[data-e2rn-mobile="1"] .modal__footer > .btn--primary:only-child,
+html[data-e2rn-mobile="1"] .modal__footer > .btn--ghost:only-child,
+html[data-e2rn-mobile="1"] .modal__footer > .btn--cancel:only-child {
+    flex: 0 0 auto;
+    min-width: 120px;
+    margin-left: auto;
+}
+
+html[data-e2rn-mobile="1"] .modal__detail-stats {
+    flex-wrap: wrap;
+    gap: 12px;
+}
+
+html[data-e2rn-mobile="1"] .modal__detail-header,
+html[data-e2rn-mobile="1"] .modal__detail-files {
+    padding: 14px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__header {
+    border-radius: 16px 16px 0 0;
+}
+
+/* 赞赏弹窗只有「稍后再说」一个按钮，通用规则把它当成对话框的次要操作推到
+   右下角（margin-left:auto + 120px），在整宽的底部面板里看起来像跑偏了。
+   这里让它铺满一行，和上面的内容对齐。 */
+html[data-e2rn-mobile="1"] .modal--donation .modal__footer {
+    justify-content: center;
+    padding: 12px 16px 18px;
+    border-top: 0;
+    background: transparent;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__footer > .btn--ghost:only-child {
+    flex: 1 1 100%;
+    min-width: 0;
+    margin-left: 0;
+    height: 44px;
+    border-radius: 12px;
+    font-size: 15px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__body {
+    padding: 20px 20px 12px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation {
+    gap: 12px;
+    margin: 0 0 18px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon {
+    padding: 10px 18px;
+    gap: 6px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon--heart {
+    width: 18px;
+    height: 18px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__text {
+    font-size: 15px;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__messages {
+    margin: 0;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__message {
+    font-size: 13.5px;
+    line-height: 1.65;
+    color: var(--color-text-heading);
+    /* 窄屏下两句文案会折成「…加入QQ群交 / 流哦~」这种孤行尾字，
+       均衡换行让两行长度接近，避免最后一行只剩两个字 */
+    text-wrap: balance;
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .modal__messages .modal__message + .modal__message {
+    margin-top: 6px;
+}
+
+/* 协议浮层：全宽底部 sheet */
+html[data-e2rn-mobile="1"] .agreement-overlay {
+    align-items: flex-end;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__card {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100% - 12px);
+    border-radius: 16px 16px 0 0;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__header {
+    padding: 14px 16px;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__body {
+    padding: 16px;
+    min-width: 0;
+    overflow-x: hidden;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__panel {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__body img,
+html[data-e2rn-mobile="1"] .agreement-overlay__body table,
+html[data-e2rn-mobile="1"] .agreement-overlay__body pre {
+    max-width: 100%;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__body table,
+html[data-e2rn-mobile="1"] .agreement-overlay__body pre {
+    display: block;
+    overflow-x: auto;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__footer {
+    padding: 12px 16px;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__tab {
+    padding: 12px 8px;
+    font-size: 14px;
+}
+
+/* 教程卡片（tutorial.css 已有小屏规则，这里补触摸尺寸） */
+html[data-e2rn-mobile="1"] .tutorial-tour__card {
+    padding: 18px;
+    width: min(420px, calc(100vw - 20px));
+    max-height: calc(100vh - 32px);
+}
+
+html[data-e2rn-mobile="1"] .tutorial-tour__card p {
+    font-size: 15px;
+}
+
+html[data-e2rn-mobile="1"] .tutorial-tour__actions button {
+    min-height: 40px;
+}
+
+/* 赞赏浮窗：桌面是 min-width:480px 的 hover 卡片。手机上既没有 hover，
+   它又即使隐藏也照样参与布局——在设置页会把内容撑出 141px 的横向滚动，
+   能左右拖动页面。统一改成贴底面板，窄屏再允许二维码换行。 */
+html[data-e2rn-mobile="1"] .appreciation__popup {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    bottom: 84px;
+    top: auto;
+    min-width: 0;
+    width: auto;
+    max-width: none;
+    transform: none;
+    max-height: 70vh;
+    overflow: auto;
+}
+
+html[data-e2rn-mobile="1"] .appreciation__qr-group {
+    flex-wrap: wrap;
+}
+
+/* ---------- 9. 简易模式 ---------- */
+html[data-e2rn-mobile="1"] .simple-home {
+    padding: 16px 12px;
+    min-height: 0;
+}
+
+html[data-e2rn-mobile="1"] .simple-home__container {
+    gap: 16px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home h1 {
+    font-size: 28px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home h2 {
+    font-size: 16px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home__grid {
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: 12px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home__card {
+    padding: 14px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home__footer {
+    margin-top: 20px;
+    padding-top: 14px;
+    font-size: 13px;
+}
+
+/* 「发现新版本」在桌面端是文档流里的横幅，手机上会被 flex 压成 18px 高，
+   正好压在右上角的圆形主题切换按钮下面，两个控件看起来叠成一块。
+   改成浮在左上角的胶囊：右上角留给主题按钮，避开居中的 logo。 */
+html[data-e2rn-mobile="1"] .simple-home .btn--update-notify {
+    position: absolute;
+    top: 16px;
+    left: 12px;
+    right: auto;
+    height: 38px;
+    min-height: 38px;
+    padding: 0 12px;
+    border-radius: 19px;
+    z-index: 5;
+    font-size: 12.5px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home .btn--update-notify__text {
+    font-size: 12.5px;
+    white-space: nowrap;
+}
+
+/* 简易模式没有底部导航：日志留在内容下方，而不是变成整屏面板 */
+html[data-e2rn-mobile="1"][data-ui="simple"] .main__content {
+    flex-direction: column;
+}
+
+/* 启动时先按专业模式打开了日志面板，随后 data-ui 才切成 simple；
+   简易模式不能沿用「整屏日志」，否则左侧内容会被 display:none 藏掉。 */
+html[data-e2rn-mobile="1"][data-ui="simple"][data-e2rn-panel="logs"] .main__left {
+    display: block;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"] .main__left {
+    flex: 1 1 55%;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"] .main__right {
+    position: static;
+    inset: auto;
+    display: flex;
+    flex: 1 1 45%;
+    min-height: 0;
+    border-top: 1px solid var(--color-border);
+}
+
+/* 简易模式的控制栏在桌面端靠「鼠标悬停展开」省空间：按钮默认只有
+   2.75rem 宽，hover 才展开文字。手机上既没有悬停，又受 flex 压缩，
+   四个入口被挤成 14px 宽、图标都放不下，还压在右侧的代理按钮上。
+   触屏一律常显图标+文字，分成两行：
+     第一行  代理状态 + 启动代理 / 打开天学网 / 清理缓存
+     第二行  主页 / 答案获取 / 规则集 / 设置（等分）
+   这里的选择器必须比 simple-mode.css 的
+   `html[data-ui="simple"][data-simple-page="app"] ...` 更具体，
+   否则 flex 值仍会被桌面规则覆盖。 */
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel {
+    flex-wrap: wrap;
+    overflow: visible;
+    justify-content: flex-start;
+    align-items: center;
+    gap: 8px;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--status {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--actions {
+    flex: 0 0 auto;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--simple-nav {
+    flex: 1 1 100%;
+    order: 3;
+    min-width: 0;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--simple-nav .control-panel__actions {
+    width: 100%;
+    flex-wrap: nowrap;
+    gap: 6px;
+}
+
+/* 取消桌面端的悬停折叠，按钮常显文字 */
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__group button {
+    max-width: none;
+    flex: 0 0 auto;
+    height: 36px;
+    padding: 0 10px;
+    gap: 0;
+    overflow: visible;
+    font-size: 13px;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__group button > i {
+    width: 16px;
+    min-width: 16px;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__group button > span {
+    display: block;
+    max-width: none;
+    opacity: 1;
+    overflow: visible;
+    padding-left: 6px;
+}
+
+/* 第二行四个入口按等分铺满，点击区域足够 */
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--simple-nav .control-panel__actions > button {
+    flex: 1 1 0;
+    min-width: 0;
+    padding: 0 6px;
+}
+
+/* ---------- 10. 控件一致性与触屏细节 ---------- */
+
+/* 手机上没有真正的滚动条，桌面的滚动条样式（约 10px 宽）会一直压在内容
+   右侧，日志页 / 设置页都能看到一条挡住文字的竖条。触屏滚动本身不依赖它。 */
+html[data-e2rn-mobile="1"] {
+    scrollbar-width: none;
+}
+
+html[data-e2rn-mobile="1"] * {
+    scrollbar-width: none;
+}
+
+html[data-e2rn-mobile="1"] ::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+}
+
+/* 「清空答案」在 answers.css 里被 ID 选择器 + !important 钉成 32px（桌面为
+   了紧凑），移动端要跟同排 40px 的图标按钮一致，否则开关旁边会突然缩水，
+   点击区域也不足。 */
+html[data-e2rn-mobile="1"] #leftContent .view-panel__controls .btn--clear {
+    width: 40px !important;
+    height: 40px !important;
+    min-width: 40px !important;
+    border-radius: var(--radius-md) !important;
+    line-height: 40px;
+}
+
+html[data-e2rn-mobile="1"] #leftContent .view-panel__controls .btn--clear::before {
+    line-height: 40px !important;
+}
+
+/* 导出走的是 .export-menu 包裹，answers.css 里单独把圆角写成了 --radius-sm
+   (4px)，和同一行的导入 / 分享 / 替换音频（8px）不一致。 */
+html[data-e2rn-mobile="1"] .export-menu .btn--export {
+    border-radius: var(--radius-md);
+}
+
+/* 端口按钮在桌面是 hover 才露出的幽灵按钮，手机上既没有 hover 又看不出可点，
+   补一个和头部图标按钮一致的细边框。 */
+html[data-e2rn-mobile="1"] .control-panel .btn--port-change {
+    width: 36px;
+    height: 36px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-bg-panel);
+}
+
+/* 规则 / 规则集卡片：头部是 align-items:center，说明文字一高，右侧那组
+   图标按钮就被垂直居中，落在说明文字中间，看起来像浮在正文上。改成顶部
+   对齐，图标始终跟标题同高。 */
+html[data-e2rn-mobile="1"] .rule-item__header,
+html[data-e2rn-mobile="1"] .rule-group__header,
+html[data-e2rn-mobile="1"] .ruleset-item__header {
+    align-items: flex-start;
+}
+
+/* 信息区独占一行，操作按钮落到右下角。
+   挤在同一行时，标题只剩 140px 左右：320 宽下「内置-自动百舸争流」会把
+   前面的图标挤成单独一行，再折成两行；360 宽下的规则集卡片更严重，标题
+   四个字就断一次。让标题吃满卡片宽度，按钮统一在右下角。 */
+html[data-e2rn-mobile="1"] .rule-item__info,
+html[data-e2rn-mobile="1"] .rule-group__info,
+html[data-e2rn-mobile="1"] .ruleset-item__info {
+    flex: 1 1 100%;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__actions,
+html[data-e2rn-mobile="1"] .rule-group__actions,
+html[data-e2rn-mobile="1"] .ruleset-item__actions {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+    margin-top: 2px;
+}
+
+/* 规则卡的三个图标按钮：桌面靠 border/background 区分主次，到手机上
+   +（有边框）和编辑 / 删除（无边框）混在一起，看着像两个体系；
+   同时 padding 还是 0 14px，图标按钮被撑成 32x40 的怪比例。 */
+html[data-e2rn-mobile="1"] .rule-item__actions .btn--rule,
+html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
+    width: 36px;
+    min-width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-md);
+    background: transparent;
+}
+
+/* 窄屏（≤340px，如 320 宽的小屏机）：三个操作按钮按等分挤到 93px，
+   「打开天学网」的图标+文字刚好顶到边框。这里收一档字号和内边距。 */
+@media (max-width: 340px) {
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions {
+        gap: 6px;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > button {
+        font-size: 12.5px;
+        padding: 0 6px;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar__item,
+    html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
+        gap: 3px;
+        padding: 6px 0;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar__item span,
+    html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item span {
+        font-size: 10.5px;
+    }
+}
+
+/* ---------- 11. 横屏 ---------- */
+/* 横屏时高度比宽度更稀缺：底部导航改成图标+文字并排，控制面板回到单行。 */
+@media (orientation: landscape) {
+    html[data-e2rn-mobile="1"] {
+        --e2rn-bottom-nav-height: 46px;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar__item,
+    html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
+        flex-direction: row;
+        gap: 6px;
+        min-height: var(--e2rn-bottom-nav-height);
+        padding: 4px 6px;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar__item span,
+    html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item span {
+        font-size: 12px;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar__item.is-active::before {
+        left: 0;
+        right: auto;
+        top: 0;
+        bottom: 0;
+        width: 3px;
+        height: auto;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel {
+        flex-wrap: nowrap;
+        overflow-x: auto;
+        justify-content: flex-start;
+        scrollbar-width: none;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel::-webkit-scrollbar {
+        display: none;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel__cluster--status,
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions {
+        flex: 0 0 auto;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions {
+        width: auto;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > button {
+        flex: 0 0 auto;
+    }
+
+    html[data-e2rn-mobile="1"] .answers-view__toolbar {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    /* 横屏高度只有 360 上下，控制栏 / 页头 / 功能栏 / 底部导航各占 50 多
+       像素的话，正文只剩一百出头。这里统一压到 36px 控件 + 4px 内边距。 */
+    html[data-e2rn-mobile="1"] .control-panel {
+        padding: 4px 12px;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > button {
+        height: 36px;
+        font-size: 12.5px;
+    }
+
+    html[data-e2rn-mobile="1"] .control-panel .btn--port-change {
+        width: 32px;
+        height: 32px;
+    }
+
+    html[data-e2rn-mobile="1"] .view-panel__header {
+        min-height: 44px;
+        padding: 2px 12px;
+    }
+
+    html[data-e2rn-mobile="1"] .view-panel__header h3 {
+        font-size: 15px;
+    }
+
+    html[data-e2rn-mobile="1"] .answers-view__toolbar {
+        padding: 4px 12px;
+    }
+
+    html[data-e2rn-mobile="1"] .answers-view__toolbar > * {
+        height: 36px;
+        font-size: 13px;
+    }
+
+    html[data-e2rn-mobile="1"] .answers-view__toolbar .btn {
+        height: 36px;
+        font-size: 13px;
+        padding: 0 10px;
+    }
+
+    /* 简易模式横屏：内容与请求日志左右分栏，否则日志只剩一条标题栏 */
+    html[data-e2rn-mobile="1"][data-ui="simple"] .main__content {
+        flex-direction: row;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"] .main__left {
+        flex: 1 1 56%;
+        min-width: 0;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"] .main__right {
+        flex: 1 1 44%;
+        min-width: 0;
+        min-height: 0;
+        border-top: 0;
+        border-left: 1px solid var(--color-border);
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel {
+        padding: 4px 12px;
+        gap: 6px;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel > .control-panel__group button {
+        height: 32px;
+        padding: 0 8px;
+        font-size: 12.5px;
+    }
+
+    /* 横屏用底部面板不合适：整宽铺开、内容挤在中间一小块。改成居中卡片。 */
+    html[data-e2rn-mobile="1"] .modal--donation {
+        align-items: center;
+        padding: 12px;
+    }
+
+    html[data-e2rn-mobile="1"] .modal--donation .modal__content {
+        width: auto;
+        min-width: 440px;
+        max-width: min(560px, 92vw);
+        max-height: calc(100% - 24px);
+        border-radius: 16px;
+    }
+
+    html[data-e2rn-mobile="1"] .modal--donation .modal__header {
+        border-radius: 16px 16px 0 0;
+    }
+
+    html[data-e2rn-mobile="1"] .modal--donation .modal__body {
+        padding: 12px 20px 8px;
+    }
+
+    html[data-e2rn-mobile="1"] .modal--donation .appreciation {
+        margin-bottom: 10px;
+    }
+
+    html[data-e2rn-mobile="1"] .modal--donation .modal__footer {
+        padding-bottom: 14px;
+    }
+}

@@ -2,6 +2,7 @@ const moduleLog = require('../logging').create('注入');
 const fs = require('fs-extra');
 const path = require('path');
 const crypto = require('crypto');
+const {isMobile} = require('../app/platform');
 
 class InjectionManager {
   constructor(options) {
@@ -65,13 +66,28 @@ class InjectionManager {
   }
   async pruneCache() {
     for (const [key, value] of this.dynamicInjectTemp) {
-      if (Date.now() - value.timestamp <= 300000 && await fs.pathExists(value.zipPath)) continue;
+      // 移动端的条目没有落盘文件，只有内存里的包，不能按 zipPath 是否存在判断。
+      const alive = Date.now() - value.timestamp <= 300000
+        && (Boolean(value.zipBuffer) || await fs.pathExists(value.zipPath));
+      if (alive) continue;
       this.dynamicInjectTemp.delete(key);
       if (require('../config').get('keep-cache-files') !== 'true') await this.removeWorkDirectory(value.directory);
     }
   }
+  /** 移动端缓存的是整包字节，别让学生连着开几个大课件就把内存吃光。 */
+  trimZipBuffers(limit = 128 * 1024 * 1024) {
+    const buffered = [...this.dynamicInjectTemp.entries()].filter(([, value]) => value.zipBuffer);
+    let total = buffered.reduce((sum, [, value]) => sum + value.zipBuffer.length, 0);
+    if (total <= limit) return;
+    // Map 保持插入顺序，从最旧的开始丢，保留最近用过的包。
+    for (const [key, value] of buffered) {
+      if (total <= limit) break;
+      this.dynamicInjectTemp.delete(key);
+      total -= value.zipBuffer.length;
+    }
+  }
 }
-Object.assign(InjectionManager.prototype, require('./archive'), require('./window'), {
+Object.assign(InjectionManager.prototype, require('./archive'), require('./window'), require('./zip'), {
 _replaceFileInfoFields(bodyStr, md5, fileSize) {
     bodyStr = bodyStr.replace(/"filemd5"\s*:\s*"[^"]*"/g, `"filemd5":"${md5}"`);
     bodyStr = bodyStr.replace(/"objectMD5"\s*:\s*"[^"]*"/g, `"objectMD5":"${md5}"`);
@@ -192,6 +208,11 @@ async applyDynamicInjectRules(url, responseBody) {
 
 async handleDynamicInjectFileInfo(url, responseBody, rule) {
     let injectDir, cached = false;
+    // 出错时把阶段带进日志：下载/解压/注入/打包 失败的原因完全不同，
+    // 只报 "动态注入失败" 时无法判断该查哪一步。
+    let stage = '解析响应';
+    const startedAt = Date.now();
+    let downloadMs = 0;
     try {
       let bodyStr = responseBody.toString();
       let jsonData;
@@ -231,66 +252,66 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
       await fs.ensureDir(injectDir);
 
       const originalZipPath = path.join(injectDir, 'original.zip');
+      const injectedZipPath = path.join(injectDir, 'injected.zip');
       const urls = [downloadUrl];
-      await this.downloadWithTimeout(downloadUrl, originalZipPath, timeout, 0, Date.now() + timeout, this.abortController.signal, redirected => urls.push(redirected));
+      stage = '下载原始ZIP';
+      await this.downloadWithRetry(downloadUrl, originalZipPath, timeout, this.abortController.signal, redirected => urls.push(redirected));
+      downloadMs = Date.now() - startedAt;
 
-      this.sendProgress('extracting', '正在解压ZIP...', 30);
-      const extractDir = path.join(injectDir, 'extracted');
-      await fs.ensureDir(extractDir);
-
-      await this.extractZip(originalZipPath, extractDir);
-
-      this.sendProgress('injecting', '正在注入脚本...', 50);
-      const injectScriptPaths = await this.resolveInjectScripts(rule);
-      if (!injectScriptPaths || injectScriptPaths.length === 0) {
+      // 先读脚本：原地注入和回退路径都要用，放在解压之前可以少做无用功。
+      this.sendProgress('injecting', '正在注入脚本...', 30);
+      stage = '读取注入脚本';
+      const scripts = await this.loadInjectScripts(rule);
+      if (scripts.length === 0) {
         this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入: 未找到有效注入脚本` }));
         this.closeProgressWindow();
         return responseBody;
       }
 
-      const htmlFiles = await this.findAllHtmlFiles(extractDir);
-      if (htmlFiles.length === 0) {
+      stage = '注入脚本';
+      let injected;
+      let zipBuffer = null;
+      try {
+        // 不做整包解压/重压缩：只改 .html，其余条目连同压缩字节原样拷贝。
+        injected = await this.rewriteZipFile(originalZipPath, scripts);
+        if (isMobile) {
+          // 移动端每次 writeFile 都要把整包 base64 过一次桥，直接留内存更划算；
+          // 内存占用和写盘后的 fileMirror 一样，没有额外代价。
+          zipBuffer = injected.buffer;
+        } else {
+          await fs.writeFile(injectedZipPath, injected.buffer);
+        }
+      } catch (error) {
+        if (!error || error.code !== 'E_ZIP_UNSUPPORTED') throw error;
+        moduleLog.warn('ZIP 结构不支持原地注入，回退到解压/重打包：', error.message);
+        this.sendProgress('extracting', '正在解压ZIP...', 50);
+        injected = await this.injectZipByExtract(originalZipPath, injectDir, scripts);
+        zipBuffer = null;
+      }
+
+      if (!injected || injected.htmlCount === 0) {
         this.safeIpcSend('rule-log', moduleLog.event({ type: 'warning', message: '动态注入: 未找到HTML文件' }));
         this.closeProgressWindow();
         return responseBody;
       }
-
-      // 注入的脚本跑在页面里，拿不到主进程的配置。bucket 端口是可以改的
-      // （见 setBucketPort），脚本里写死端口一旦用户改过就全链路失联，
-      // 所以在脚本头部塞一段运行时配置，让它自己读。
-      const runtimePrelude =
-        '/* Auto366 注入运行时配置（由代理层在注入时写入） */\n' +
-        'window.__A366__ = ' + JSON.stringify({
-          bucket: 'http://127.0.0.1:' + this.getPort(),
-          bucketPort: this.getPort(),
-        }) + ';\n';
-
-      const scripts = [];
-      for (const scriptPath of injectScriptPaths) {
-        scripts.push({ name: path.basename(scriptPath), content: runtimePrelude + await fs.readFile(scriptPath, 'utf8') });
-      }
-      for (const htmlFile of htmlFiles) {
-        if (this.stopped) return responseBody;
-        for (const script of scripts) {
-          await this.injectScriptIntoHtml(htmlFile, script.name);
-          await fs.writeFile(path.join(path.dirname(htmlFile), script.name), script.content, 'utf8');
-        }
-      }
-
-      this.sendProgress('packing', '正在重新打包...', 70);
-      const injectedZipPath = path.join(injectDir, 'injected.zip');
-      await this.repackZip(extractDir, injectedZipPath);
-
-      this.sendProgress('modifying', '正在修改响应...', 90);
-      const { md5: injectedMd5, size: injectedSize } = await this.describeZip(injectedZipPath);
       if (this.stopped) return responseBody;
+
+      const injectedMd5 = injected.md5;
+      const injectedSize = injected.size;
+      this.sendProgress('modifying', '正在修改响应...', 90);
       const previous = this.dynamicInjectTemp.get(requestKey);
       this.dynamicInjectTemp.set(requestKey, {
-        zipPath: injectedZipPath, directory: injectDir, md5: injectedMd5,
+        zipPath: injectedZipPath, zipBuffer, directory: injectDir, md5: injectedMd5,
         size: injectedSize, timestamp: Date.now(), downloadUrl, objectName, ruleId: rule.id, urls,
       });
       cached = true;
       if (previous && require('../config').get('keep-cache-files') !== 'true') await this.removeWorkDirectory(previous.directory);
+      if (zipBuffer) {
+        // 注入包已在内存里，原包没必要继续占着镜像内存。
+        await this.removeWorkDirectory(injectDir);
+        injectDir = null;
+        this.trimZipBuffers();
+      }
 
       bodyStr = this._replaceFileInfoFields(bodyStr, injectedMd5, injectedSize);
 
@@ -301,7 +322,8 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
 
       this.safeIpcSend('rule-log', moduleLog.event({
         type: 'success',
-        message: `动态注入完成: ${objectName} → ${htmlFiles.length}个HTML已注入`,
+        // 带耗时：手机上"慢"通常卡在下载或注入其中一段，分开报才看得清。
+        message: `动态注入完成: ${objectName} → ${injected.htmlCount}个HTML已注入（下载 ${downloadMs}ms / 注入 ${Date.now() - startedAt - downloadMs}ms）`,
         ruleId: rule.id,
         ruleName: rule.name
       }));
@@ -312,7 +334,7 @@ async handleDynamicInjectFileInfo(url, responseBody, rule) {
       return Buffer.from(bodyStr);
     } catch (error) {
       moduleLog.error('处理动态注入fileinfo失败:', error);
-      this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入失败: ${error.message}` }));
+      this.safeIpcSend('rule-log', moduleLog.event({ type: 'error', message: `动态注入失败（${stage}）: ${error.message}` }));
       this.sendProgress('error', '失败: ' + error.message);
       this.scheduleClose(3000);
       return responseBody;
@@ -332,7 +354,8 @@ async handleDynamicInjectZipDownload(url, rule) {
         ruleId: rule.id,
         ruleName: rule.name
       }));
-      return await fs.readFile(entry.zipPath);
+      // 移动端注入结果只留在内存里，省掉一次整包 base64 桥写。
+      return entry.zipBuffer ?? await fs.readFile(entry.zipPath);
     }
 
     this.safeIpcSend('rule-log', moduleLog.event({
@@ -352,6 +375,55 @@ async resolveInjectScripts(rule) {
       else if (await fs.pathExists(script)) paths.push(script);
     }
     return paths;
+  },
+
+/** 读出注入脚本内容（已带上运行时配置前缀），注入流程两条路径共用。 */
+async loadInjectScripts(rule) {
+    const scriptPaths = await this.resolveInjectScripts(rule);
+    if (!scriptPaths || scriptPaths.length === 0) return [];
+    // 注入的脚本跑在页面里，拿不到主进程的配置。bucket 端口是可以改的
+    // （见 setBucketPort），脚本里写死端口一旦用户改过就全链路失联，
+    // 所以在脚本头部塞一段运行时配置，让它自己读。
+    const runtimePrelude =
+      '/* Auto366 注入运行时配置（由代理层在注入时写入） */\n' +
+      'window.__A366__ = ' + JSON.stringify({
+        bucket: 'http://127.0.0.1:' + this.getPort(),
+        bucketPort: this.getPort(),
+      }) + ';\n';
+    const scripts = [];
+    for (const scriptPath of scriptPaths) {
+      scripts.push({
+        name: path.basename(scriptPath),
+        content: runtimePrelude + await fs.readFile(scriptPath, 'utf8'),
+      });
+    }
+    return scripts;
+  },
+
+/**
+ * 回退路径：ZIP 结构原地改不了时（ZIP64/加密/未知压缩方式）才解压重打包。
+ * 移动端这条路很慢，正常情况下不会走到。
+ */
+async injectZipByExtract(originalZipPath, injectDir, scripts) {
+    const extractDir = path.join(injectDir, 'extracted');
+    await fs.ensureDir(extractDir);
+    await this.extractZip(originalZipPath, extractDir);
+
+    const htmlFiles = await this.findAllHtmlFiles(extractDir);
+    if (htmlFiles.length === 0) return {htmlCount: 0, md5: '', size: 0};
+
+    for (const htmlFile of htmlFiles) {
+      if (this.stopped) return {htmlCount: 0, md5: '', size: 0};
+      for (const script of scripts) {
+        await this.injectScriptIntoHtml(htmlFile, script.name);
+        await fs.writeFile(path.join(path.dirname(htmlFile), script.name), script.content, 'utf8');
+      }
+    }
+
+    const injectedZipPath = path.join(injectDir, 'injected.zip');
+    await this.repackZip(extractDir, injectedZipPath);
+    const {md5, size} = await this.describeZip(injectedZipPath);
+    return {md5, size, htmlCount: htmlFiles.length};
   },
 });
 module.exports = InjectionManager;

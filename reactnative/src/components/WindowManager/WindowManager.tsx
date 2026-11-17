@@ -14,6 +14,7 @@ import {PanResponder, StyleSheet, Text, View, type LayoutChangeEvent} from 'reac
 
 import type {WindowState} from '../../runtime/windowState';
 import {useWindowStore} from '../../runtime/windowStore';
+import {useAppTheme} from '../../theme/useAppTheme';
 import {Window} from './Window';
 
 const CARD_PADDING = 8;
@@ -28,6 +29,9 @@ export function WindowManager({forceDesktopMode}: WindowManagerProps) {
   const state = useWindowStore(current => current);
   const [size, setSize] = useState({width: 0, height: 0});
   const containerRef = useRef<React.ComponentRef<typeof View>>(null);
+  // Visible between the window cards and behind a window that is still
+  // loading - follows the page colour like the rest of the shell.
+  const theme = useAppTheme();
 
   const handleLayout = useCallback((event: LayoutChangeEvent) => {
     const {width, height} = event.nativeEvent.layout;
@@ -65,9 +69,9 @@ export function WindowManager({forceDesktopMode}: WindowManagerProps) {
 
   if (!mountedWindows.length) {
     return (
-      <View style={styles.root} onLayout={handleLayout} ref={containerRef}>
+      <View style={[styles.root, {backgroundColor: theme.background}]} onLayout={handleLayout} ref={containerRef}>
         <View style={styles.empty}>
-          <Text style={styles.emptyText}>没有可显示的窗口</Text>
+          <Text style={[styles.emptyText, {color: theme.textMuted}]}>没有可显示的窗口</Text>
         </View>
       </View>
     );
@@ -76,10 +80,10 @@ export function WindowManager({forceDesktopMode}: WindowManagerProps) {
   if (!forceDesktopMode && (single || fullscreenWindow)) {
     const target = fullscreenWindow ?? focusedWindow;
     if (!target) {
-      return <View style={styles.root} onLayout={handleLayout} ref={containerRef} />;
+      return <View style={[styles.root, {backgroundColor: theme.background}]} onLayout={handleLayout} ref={containerRef} />;
     }
     return (
-      <View style={styles.root} onLayout={handleLayout} ref={containerRef}>
+      <View style={[styles.root, {backgroundColor: theme.background}]} onLayout={handleLayout} ref={containerRef}>
         <Window
           key={target.id}
           window={target}
@@ -105,7 +109,7 @@ export function WindowManager({forceDesktopMode}: WindowManagerProps) {
   const cardHeight = Math.max((size.height - CARD_PADDING * 2) / Math.max(visibleWindows.length, 1), 0);
 
   return (
-    <View style={styles.root} onLayout={handleLayout} ref={containerRef}>
+    <View style={[styles.root, {backgroundColor: theme.background}]} onLayout={handleLayout} ref={containerRef}>
       {visibleWindows.map((entry, index) => (
         <WindowCard
           key={entry.id}
@@ -180,7 +184,8 @@ function WindowCard({window, width, height, offset}: WindowCardProps) {
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: '#101014',
+    // Overridden at render time with the colour of the current page theme.
+    backgroundColor: '#16181c',
   },
   empty: {
     flex: 1,

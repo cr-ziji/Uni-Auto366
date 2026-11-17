@@ -11,6 +11,7 @@ const http = require('http');
 
 const fs = require('fs-extra');
 const path = require('path');
+const { isMobile } = require('../app/platform');
 
 const AnswerExtractor = require('../answers/index');
 const TrafficCache = require('./traffic');
@@ -197,6 +198,11 @@ class ProxyServer {
 
   // 查找占用端口的进程
   async findProcessByPort(port) {
+    if (isMobile) {
+      // 手机上既没有 netstat 也没有 lsof，`exec` 只会拿到一个 ENOTSUP。
+      // 端口冲突时直接报告“找不到占用进程”，由用户自己处理。
+      return null;
+    }
     return new Promise((resolve) => {
       const { execText: exec } = require('../app/process-text');
       if (process.platform === 'win32') {
@@ -241,6 +247,10 @@ class ProxyServer {
 
   // 结束指定进程
   async killProcess(pid) {
+    if (isMobile) {
+      // `taskkill` / `kill` 在手机上不存在，也没有权限结束其它 App 的进程。
+      return false;
+    }
     return new Promise((resolve) => {
       const { execText: exec } = require('../app/process-text');
       if (!pid) {
@@ -385,30 +395,38 @@ class ProxyServer {
     await this.startProxyPromise();
 
     // 自动导入证书
-    try {
-      this.safeIpcSend('certificate-status', {
-        status: 'importing',
-        message: '正在检查并导入证书到受信任的根证书颁发机构...'
-      });
+    if (isMobile) {
+      // 移动端没有可写入的系统根证书库：Android 需要用户在系统设置里手动
+      // 安装 CA，iOS 需要装描述文件。这里既不发 'importing' / 'error' 状态，
+      // 也不调用 PowerShell/certutil，避免每次启动代理都刷一条必然失败的
+      // “证书导入失败”。
+      moduleLog.log('移动端跳过系统根证书导入（HTTPS 中间人使用 App 内置 CA，如需抓包请在系统设置中信任）');
+    } else {
+      try {
+        this.safeIpcSend('certificate-status', {
+          status: 'importing',
+          message: '正在检查并导入证书到受信任的根证书颁发机构...'
+        });
 
-      // 先尝试正常导入
-      let certResult = await this.certManager.importCertificate();
+        // 先尝试正常导入
+        let certResult = await this.certManager.importCertificate();
 
-      // 发送证书导入结果状态
-      this.safeIpcSend('certificate-status', {
-        status: certResult.status || (certResult.success ? 'success' : 'error'),
-        message: certResult.message || certResult.error || '证书处理完成'
-      });
+        // 发送证书导入结果状态
+        this.safeIpcSend('certificate-status', {
+          status: certResult.status || (certResult.success ? 'success' : 'error'),
+          message: certResult.message || certResult.error || '证书处理完成'
+        });
 
-      if (!certResult.success) {
-        moduleLog.warn('证书导入失败，但代理将继续启动:', certResult.error);
+        if (!certResult.success) {
+          moduleLog.warn('证书导入失败，但代理将继续启动:', certResult.error);
+        }
+      } catch (error) {
+        this.safeIpcSend('certificate-status', {
+          status: 'error',
+          message: '证书导入过程中发生错误: ' + error.message
+        });
+        moduleLog.warn('证书导入过程中发生错误，但代理将继续启动:', error);
       }
-    } catch (error) {
-      this.safeIpcSend('certificate-status', {
-        status: 'error',
-        message: '证书导入过程中发生错误: ' + error.message
-      });
-      moduleLog.warn('证书导入过程中发生错误，但代理将继续启动:', error);
     }
 
     // 启动本地词库HTTP服务器

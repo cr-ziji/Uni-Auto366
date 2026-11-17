@@ -33,6 +33,7 @@ import {hydrateFileSystem} from '../polyfills/node/fs';
 import {installNodeGlobals} from '../polyfills/node/globals';
 import {installProcessGlobals} from '../polyfills/node/process';
 import {startAssetServer} from '../runtime/web/assetServer';
+import {markStartupComplete, beginStartup} from '../runtime/startupGate';
 import {markAppReady} from '../shims/electron/app';
 
 export interface BootstrapResult {
@@ -63,29 +64,59 @@ export async function bootstrapE2RN(): Promise<BootstrapResult> {
     return pending;
   }
   started = true;
+  beginStartup();
 
   pending = (async (): Promise<BootstrapResult> => {
     try {
+      // Start-up is the only place where a slow step blocks every IPC call
+      // (the WebView page is already running and calling `invoke`), so each
+      // stage is timed - "the app takes 40 s to start" is otherwise very hard
+      // to attribute.
+      const startedAt = Date.now();
+      let mark = startedAt;
+      const stage = (label: string) => {
+        const now = Date.now();
+        console.log(`[e2rn] startup: ${label} ${now - mark} ms`);
+        mark = now;
+      };
+
       // 1. the `process` global and the other Node globals (`Buffer`, ...)
       installProcessGlobals();
       installNodeGlobals();
+      stage('node globals');
 
-      // 2. the writable sandbox (the desktop code reads files synchronously)
-      await hydrateFileSystem();
-
-      // 3. the local web-asset server
-      await startAssetServer();
+      // 2 + 3. the writable sandbox and the local web-asset server.
+      //
+      // They are independent: hydrating only touches the device file system,
+      // the server only needs the bundled manifest. Running them in parallel
+      // removes one whole stage from the critical path.
+      const parallelStart = Date.now();
+      const finish = (label: string) => () =>
+        console.log(
+          `[e2rn] startup: ${label} +${Date.now() - parallelStart} ms (parallel)`,
+        );
+      await Promise.all([
+        hydrateFileSystem().then(finish('file system mirror')),
+        startAssetServer().then(finish('asset server')),
+      ]);
+      stage('file system mirror + asset server');
 
       // 4. mark Electron app ready before loading the original main process
       markAppReady();
+      stage('app ready');
 
       // 5. the original, unmodified main process
       requireDesktopMain();
-      console.log('[e2rn] the Auto366 main process has been started');
+      stage('desktop main process');
+      console.log(`[e2rn] the Auto366 main process has been started (${Date.now() - startedAt} ms)`);
       return {ok: true};
     } catch (error) {
       console.error('[e2rn] the Auto366 main process could not be started', error);
       return {ok: false, error};
+    } finally {
+      // Releases the IPC bridge: calls the page made while the main process was
+      // still booting are held back until the handlers exist.
+      markStartupComplete();
     }
   })();
 
