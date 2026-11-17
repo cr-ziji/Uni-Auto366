@@ -1980,6 +1980,143 @@ var UI = {
     autoPkPanel: null,
     logPanel: null,
 
+    // 面板拖动：鼠标 + 移动端触摸。把手的位移超过阈值才算拖动，轻点仍能触发按钮/输入框。
+    // options.ignore   在该选择器命中的元素上不启动拖动（默认忽略按钮与输入控件）
+    // options.bodyDrag 整块面板都可拖动（桌面端保持原有手感，触摸端仍只认把手，避免和滚动冲突）
+    enableDrag: function(panel, handle, options) {
+        if (!panel || !handle) return;
+        var opts = options || {};
+        var ignoreSelector = opts.ignore || 'button, input, select, textarea, a';
+        var TOUCH_THRESHOLD = 6;
+
+        // 触摸端：不要把手势当成页面滚动/缩放
+        handle.style.touchAction = 'none';
+        handle.style.msTouchAction = 'none';
+        handle.style.webkitUserSelect = 'none';
+        handle.style.cursor = 'move';
+
+        var mouseDown = false;
+        var touchDown = false;
+        var touchMoved = false;
+        var lastTouchAt = 0;
+        var startX = 0;
+        var startY = 0;
+        var grabX = 0;
+        var grabY = 0;
+
+        function on(el, type, fn, extra) {
+            try {
+                el.addEventListener(type, fn, extra);
+            } catch (err) {
+                el.addEventListener(type, fn, false);
+            }
+        }
+
+        function isIgnored(target) {
+            if (!target || target === panel) return false;
+            if (target.closest) return !!target.closest(ignoreSelector);
+            var el = target;
+            while (el && el !== panel) {
+                if (el.matches && el.matches(ignoreSelector)) return true;
+                el = el.parentNode;
+            }
+            return false;
+        }
+
+        function begin(clientX, clientY) {
+            var rect = panel.getBoundingClientRect();
+            grabX = clientX - rect.left;
+            grabY = clientY - rect.top;
+            startX = clientX;
+            startY = clientY;
+            touchMoved = false;
+        }
+
+        function apply(clientX, clientY) {
+            var maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+            var maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+            var left = Math.min(Math.max(0, clientX - grabX), maxLeft);
+            var top = Math.min(Math.max(0, clientY - grabY), maxTop);
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        }
+
+        function clampInside() {
+            if (!panel.style.left && !panel.style.top) return;
+            var maxLeft = Math.max(0, window.innerWidth - panel.offsetWidth);
+            var maxTop = Math.max(0, window.innerHeight - panel.offsetHeight);
+            var left = parseFloat(panel.style.left);
+            var top = parseFloat(panel.style.top);
+            if (!isNaN(left)) panel.style.left = Math.min(Math.max(0, left), maxLeft) + 'px';
+            if (!isNaN(top)) panel.style.top = Math.min(Math.max(0, top), maxTop) + 'px';
+        }
+
+        if (opts.bodyDrag) {
+            on(panel, 'mousedown', function(e) {
+                if (e.button !== undefined && e.button !== 0) return;
+                if (Date.now() - lastTouchAt < 700) return;
+                if (isIgnored(e.target)) return;
+                mouseDown = true;
+                begin(e.clientX, e.clientY);
+            });
+        }
+
+        on(handle, 'mousedown', function(e) {
+            if (e.button !== undefined && e.button !== 0) return;
+            if (Date.now() - lastTouchAt < 700) return;
+            if (isIgnored(e.target)) return;
+            mouseDown = true;
+            begin(e.clientX, e.clientY);
+            e.preventDefault();
+        });
+
+        on(document, 'mousemove', function(e) {
+            if (!mouseDown) return;
+            apply(e.clientX, e.clientY);
+        });
+
+        on(document, 'mouseup', function() {
+            mouseDown = false;
+        });
+
+        on(handle, 'touchstart', function(e) {
+            if (isIgnored(e.target)) return;
+            var t = e.touches && e.touches[0];
+            if (!t) return;
+            touchDown = true;
+            begin(t.clientX, t.clientY);
+        }, { passive: true });
+
+        on(handle, 'touchmove', function(e) {
+            if (!touchDown) return;
+            var t = e.touches && e.touches[0];
+            if (!t) return;
+            if (!touchMoved) {
+                if (Math.abs(t.clientX - startX) < TOUCH_THRESHOLD &&
+                    Math.abs(t.clientY - startY) < TOUCH_THRESHOLD) return;
+                touchMoved = true;
+            }
+            if (e.cancelable) e.preventDefault();
+            apply(t.clientX, t.clientY);
+        }, { passive: false });
+
+        function endTouch() {
+            touchDown = false;
+            touchMoved = false;
+            lastTouchAt = Date.now();
+        }
+        on(handle, 'touchend', endTouch);
+        on(handle, 'touchcancel', endTouch);
+
+        // 横竖屏切换 / 窗口尺寸变化后，别把面板留在屏幕外
+        on(window, 'resize', clampInside);
+        on(window, 'orientationchange', function() {
+            setTimeout(clampInside, 200);
+        });
+    },
+
     addLogMessage: function(message, type) {
         if (type === void 0) type = 'info';
         var timestamp = new Date().toLocaleTimeString();
@@ -2120,29 +2257,8 @@ var UI = {
 
         document.body.appendChild(UI.logPanel);
 
-        var isDragging = false;
-        var offsetX = 0;
-        var offsetY = 0;
-
-        header.addEventListener('mousedown', function(e) {
-            if (e.target === closeBtn) return;
-            isDragging = true;
-            offsetX = e.clientX - UI.logPanel.offsetLeft;
-            offsetY = e.clientY - UI.logPanel.offsetTop;
-            e.preventDefault();
-        });
-
-        document.addEventListener('mousemove', function(e) {
-            if (!isDragging) return;
-            UI.logPanel.style.left = (e.clientX - offsetX) + 'px';
-            UI.logPanel.style.top = (e.clientY - offsetY) + 'px';
-            UI.logPanel.style.right = 'auto';
-            UI.logPanel.style.bottom = 'auto';
-        });
-
-        document.addEventListener('mouseup', function() {
-            isDragging = false;
-        });
+        // 标题栏拖动：桌面鼠标 + 移动端手指（按钮上不会触发拖动）
+        UI.enableDrag(UI.logPanel, header, { ignore: 'button' });
     },
 
     updateLogPanel: function() {
@@ -2963,23 +3079,10 @@ var UI = {
 
         document.body.appendChild(UI.autoPkPanel);
 
-        var isDragging = false;
-        var offsetX = 0;
-        var offsetY = 0;
-        UI.autoPkPanel.addEventListener('mousedown', function(e) {
-            isDragging = true;
-            offsetX = e.clientX - UI.autoPkPanel.offsetLeft;
-            offsetY = e.clientY - UI.autoPkPanel.offsetTop;
-        });
-        document.addEventListener('mousemove', function(e) {
-            if (!isDragging) return;
-            UI.autoPkPanel.style.left = (e.clientX - offsetX) + 'px';
-            UI.autoPkPanel.style.top = (e.clientY - offsetY) + 'px';
-            UI.autoPkPanel.style.right = 'auto';
-            UI.autoPkPanel.style.bottom = 'auto';
-        });
-        document.addEventListener('mouseup', function() {
-            isDragging = false;
+        // 桌面端保留整块面板可拖动；移动端只认标题栏，避免和面板内滚动打架
+        UI.enableDrag(UI.autoPkPanel, header, {
+            bodyDrag: true,
+            ignore: 'button, input, select, textarea, a'
         });
 
         UI.updateStatus();
