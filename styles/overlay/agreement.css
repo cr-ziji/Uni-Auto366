@@ -4,7 +4,11 @@
 
 .agreement-overlay {
   position: fixed;
-  inset: 0;
+  /* 显式四边：`inset` 需要 Chrome 87+，旧 WebView 会丢掉整条声明 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   z-index: 100000;
   display: flex;
   align-items: center;

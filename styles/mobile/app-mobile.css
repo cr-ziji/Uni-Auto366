@@ -25,6 +25,7 @@
      9. 简易模式
     10. 控件一致性与触屏细节
     11. 横屏
+    12. 旧内核兼容：flex gap → margin
    ============================================================ */
 
 /* ---------- 1. 设计变量 ---------- */
@@ -51,8 +52,9 @@ html[data-e2rn-mobile="1"][data-ui="simple"] {
 /* ---------- 2. 基础与标题栏 ---------- */
 html[data-e2rn-mobile="1"] body {
     padding-top: 0;
+    /* 只写 100vh：100dvh 需要 Chrome 108，旧内核会直接把这条声明丢掉，
+       而 WebView 里没有地址栏，100vh 就是整块可视区域 */
     height: 100vh;
-    height: 100dvh;
     overflow: hidden;
     font-size: var(--text-base);
     -webkit-text-size-adjust: 100%;
@@ -117,7 +119,6 @@ html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
     flex-direction: column;
     justify-content: center;
     align-items: center;
-    gap: 4px;
     padding: 6px 2px;
     white-space: nowrap;
     text-align: center;
@@ -206,13 +207,8 @@ html[data-e2rn-mobile="1"] .control-panel {
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
     padding: 8px 12px;
     min-height: 0;
-}
-
-html[data-e2rn-mobile="1"] .control-panel__group {
-    gap: 8px;
 }
 
 html[data-e2rn-mobile="1"] .control-panel__cluster--status {
@@ -227,7 +223,6 @@ html[data-e2rn-mobile="1"] .control-panel__cluster--actions {
 
 html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions {
     width: 100%;
-    gap: 8px;
     flex-wrap: nowrap;
 }
 
@@ -239,7 +234,6 @@ html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__acti
 }
 
 html[data-e2rn-mobile="1"] .control-panel__status {
-    gap: 8px;
     flex-wrap: wrap;
 }
 
@@ -250,7 +244,6 @@ html[data-e2rn-mobile="1"] .control-panel__status-label {
 
 html[data-e2rn-mobile="1"] .control-panel__status-item {
     font-size: 14px;
-    gap: 4px;
 }
 
 html[data-e2rn-mobile="1"] .control-panel .btn--port-change {
@@ -279,7 +272,11 @@ html[data-e2rn-mobile="1"] .main__resizer {
 /* 右侧日志默认隐藏，由「监听日志」导航项切换成整屏面板 */
 html[data-e2rn-mobile="1"] .main__right {
     position: absolute;
-    inset: 0;
+    /* 不用 inset（Chrome 87+），旧内核会丢掉整条声明，面板就跑到屏幕外 */
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
     width: 100%;
     min-width: 0;
     z-index: 40;
@@ -353,7 +350,6 @@ html[data-e2rn-mobile="1"] .traffic-monitor__log {
 html[data-e2rn-mobile="1"] .log-item {
     align-items: flex-start;
     padding: 8px 0;
-    gap: 6px;
 }
 
 /* 触摸屏没有 hover，避免日志行在点击后左右跳动 */
@@ -374,7 +370,6 @@ html[data-e2rn-mobile="1"] .logs-container__search {
 }
 
 html[data-e2rn-mobile="1"] .logs-container__filters {
-    gap: 6px;
     overflow-x: auto;
     flex-wrap: nowrap;
     padding-bottom: 2px;
@@ -397,15 +392,10 @@ html[data-e2rn-mobile="1"] .logs-container__search-input {
 html[data-e2rn-mobile="1"] .view-panel__header {
     min-height: 48px;
     padding: 6px 12px;
-    gap: 6px;
 }
 
 html[data-e2rn-mobile="1"] .view-panel__header h3 {
     font-size: 17px;
-}
-
-html[data-e2rn-mobile="1"] .view-panel__controls {
-    gap: 6px;
 }
 
 /* 答案获取 */
@@ -420,7 +410,6 @@ html[data-e2rn-mobile="1"] .answer-group {
 html[data-e2rn-mobile="1"] .answer-group__header {
     padding: 10px 12px;
     flex-wrap: wrap;
-    gap: 6px;
 }
 
 html[data-e2rn-mobile="1"] .answer-group__header h4 {
@@ -437,10 +426,11 @@ html[data-e2rn-mobile="1"] .answer-item__content {
 
 html[data-e2rn-mobile="1"] .answers-view__toolbar {
     padding: 8px 12px;
-    gap: 8px;
     min-height: 0;
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    /* grid 的 gap 从 Chrome 57 就支持，这里可以放心用 */
+    gap: 8px;
     align-items: center;
 }
 
@@ -479,20 +469,17 @@ html[data-e2rn-mobile="1"] .rule-item__header,
 html[data-e2rn-mobile="1"] .rule-group__header {
     padding: 12px;
     flex-wrap: wrap;
-    gap: 8px;
 }
 
 html[data-e2rn-mobile="1"] .rule-item__name,
 html[data-e2rn-mobile="1"] .rule-group__name {
     flex-wrap: wrap;
-    gap: 6px;
     word-break: break-word;
 }
 
 html[data-e2rn-mobile="1"] .rule-item__actions,
 html[data-e2rn-mobile="1"] .rule-group__actions {
     flex-wrap: wrap;
-    gap: 6px;
 }
 
 html[data-e2rn-mobile="1"] .rule-item__config {
@@ -505,7 +492,6 @@ html[data-e2rn-mobile="1"] .rule-item__config-items {
 
 html[data-e2rn-mobile="1"] .rule-item__config-item {
     flex-wrap: wrap;
-    gap: 4px;
 }
 
 html[data-e2rn-mobile="1"] .rule-item__config-label {
@@ -528,10 +514,6 @@ html[data-e2rn-mobile="1"] .extensions-view {
     padding: 12px;
 }
 
-html[data-e2rn-mobile="1"] .extensions-view__filters {
-    gap: 8px;
-}
-
 html[data-e2rn-mobile="1"] .extensions-view__filters .form-input {
     width: auto;
     flex: 1 1 0;
@@ -541,7 +523,6 @@ html[data-e2rn-mobile="1"] .extensions-view__filters .form-input {
 html[data-e2rn-mobile="1"] .ruleset-item__header {
     padding: 12px;
     flex-wrap: wrap;
-    gap: 8px;
 }
 
 html[data-e2rn-mobile="1"] .ruleset-item__name {
@@ -550,26 +531,31 @@ html[data-e2rn-mobile="1"] .ruleset-item__name {
 
 html[data-e2rn-mobile="1"] .ruleset-item__actions {
     flex-wrap: wrap;
-    gap: 6px;
 }
 
 html[data-e2rn-mobile="1"] .extensions-view__pagination {
     flex-wrap: wrap;
-    gap: 8px;
 }
 
-/* 设置（settings.css 已有容器查询，这里只放大触摸尺寸） */
+/* 设置（settings.css 的 @container 查询需要 Chrome 105+，旧内核会落回
+   桌面端的 `128px minmax(0,1fr)`，在手机上把内容挤成一列细条，所以这里
+   直接给移动端一套网格；宽屏（平板 / 横屏）再恢复两列标签布局） */
 html[data-e2rn-mobile="1"] .settings-content {
     padding: 0 14px 20px;
 }
 
 html[data-e2rn-mobile="1"] .settings-entry {
-    padding: 16px 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 10px;
+    padding: 16px 0;
 }
 
-html[data-e2rn-mobile="1"] .setting-item {
-    gap: 8px 10px;
+@media (min-width: 700px) {
+    html[data-e2rn-mobile="1"] .settings-entry {
+        grid-template-columns: 128px minmax(0, 1fr);
+        gap: 20px;
+    }
 }
 
 html[data-e2rn-mobile="1"] .setting-item > label:first-child {
@@ -722,7 +708,6 @@ html[data-e2rn-mobile="1"] .modal__body {
 
 html[data-e2rn-mobile="1"] .modal__footer {
     padding: 12px 16px 16px;
-    gap: 8px;
 }
 
 html[data-e2rn-mobile="1"] .modal__footer .btn--primary,
@@ -743,7 +728,6 @@ html[data-e2rn-mobile="1"] .modal__footer > .btn--cancel:only-child {
 
 html[data-e2rn-mobile="1"] .modal__detail-stats {
     flex-wrap: wrap;
-    gap: 12px;
 }
 
 html[data-e2rn-mobile="1"] .modal__detail-header,
@@ -779,13 +763,11 @@ html[data-e2rn-mobile="1"] .modal--donation .modal__body {
 }
 
 html[data-e2rn-mobile="1"] .modal--donation .appreciation {
-    gap: 12px;
     margin: 0 0 18px;
 }
 
 html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon {
     padding: 10px 18px;
-    gap: 6px;
 }
 
 html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon--heart {
@@ -904,10 +886,6 @@ html[data-e2rn-mobile="1"] .simple-home {
     min-height: 0;
 }
 
-html[data-e2rn-mobile="1"] .simple-home__container {
-    gap: 16px;
-}
-
 html[data-e2rn-mobile="1"] .simple-home h1 {
     font-size: 28px;
 }
@@ -969,7 +947,10 @@ html[data-e2rn-mobile="1"][data-ui="simple"] .main__left {
 
 html[data-e2rn-mobile="1"][data-ui="simple"] .main__right {
     position: static;
-    inset: auto;
+    top: auto;
+    right: auto;
+    bottom: auto;
+    left: auto;
     display: flex;
     flex: 1 1 45%;
     min-height: 0;
@@ -990,7 +971,6 @@ html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-pa
     overflow: visible;
     justify-content: flex-start;
     align-items: center;
-    gap: 8px;
 }
 
 html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--status {
@@ -1012,7 +992,6 @@ html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-pa
 html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--simple-nav .control-panel__actions {
     width: 100%;
     flex-wrap: nowrap;
-    gap: 6px;
 }
 
 /* 取消桌面端的悬停折叠，按钮常显文字 */
@@ -1021,7 +1000,6 @@ html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-pa
     flex: 0 0 auto;
     height: 36px;
     padding: 0 10px;
-    gap: 0;
     overflow: visible;
     font-size: 13px;
 }
@@ -1138,10 +1116,6 @@ html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
 /* 窄屏（≤340px，如 320 宽的小屏机）：三个操作按钮按等分挤到 93px，
    「打开天学网」的图标+文字刚好顶到边框。这里收一档字号和内边距。 */
 @media (max-width: 340px) {
-    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions {
-        gap: 6px;
-    }
-
     html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > button {
         font-size: 12.5px;
         padding: 0 6px;
@@ -1149,7 +1123,6 @@ html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
 
     html[data-e2rn-mobile="1"] .sidebar__item,
     html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
-        gap: 3px;
         padding: 6px 0;
     }
 
@@ -1169,7 +1142,6 @@ html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
     html[data-e2rn-mobile="1"] .sidebar__item,
     html[data-e2rn-mobile="1"] .sidebar:hover .sidebar__item {
         flex-direction: row;
-        gap: 6px;
         min-height: var(--e2rn-bottom-nav-height);
         padding: 4px 6px;
     }
@@ -1276,7 +1248,6 @@ html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
 
     html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel {
         padding: 4px 12px;
-        gap: 6px;
     }
 
     html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel > .control-panel__group button {
@@ -1313,5 +1284,451 @@ html[data-e2rn-mobile="1"] .rule-group__actions .btn--rule {
 
     html[data-e2rn-mobile="1"] .modal--donation .modal__footer {
         padding-bottom: 14px;
+    }
+}
+
+/* ---------- 12. 旧内核兼容：flex gap → margin ----------
+   flex 布局里的 gap 需要 Chrome 84+。renderer 用了 `<script type="module">`
+   和可选链，JS 的下限是 Chrome 80，也就是说应用可能跑在 Chrome 80~83 的
+   WebView 上：这些内核认 `gap` 属性（grid 用），但 flex 容器上的 gap 会被
+   整条忽略，按钮、列表项、卡片全贴在一起。
+
+   @supports 无法区分这两种情况（`@supports (gap: 1px)` 在 Chrome 66~83 也
+   为真），所以只能把移动端用到的 flex 容器的 gap 归零，再用相邻兄弟的
+   margin 补回同样的间距。新内核读到的也是这套 margin，前后表现一致。
+   grid 容器的 gap 不受影响（Chrome 57+），保留在第 6 节里。 */
+
+/* -- 12.1 按钮：图标与文字 -- */
+html[data-e2rn-mobile="1"] .btn,
+html[data-e2rn-mobile="1"] [class*="btn--"] {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .btn > * + *,
+html[data-e2rn-mobile="1"] [class*="btn--"] > * + * {
+    margin-left: var(--space-xs);
+}
+
+/* 简易模式的控制栏按钮已经用 span 的 padding-left 留出 6px */
+html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel > .control-panel__group button > i + span {
+    margin-left: 0;
+}
+
+/* -- 12.2 底部导航：图标与文字 -- */
+html[data-e2rn-mobile="1"] .sidebar .sidebar__item > i + span {
+    margin-top: 4px;
+}
+
+/* -- 12.3 控制面板 -- */
+html[data-e2rn-mobile="1"] .control-panel,
+html[data-e2rn-mobile="1"] .control-panel__group,
+html[data-e2rn-mobile="1"] .control-panel__cluster,
+html[data-e2rn-mobile="1"] .control-panel__actions,
+html[data-e2rn-mobile="1"] .control-panel__status,
+html[data-e2rn-mobile="1"] .control-panel__status-item,
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel,
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__actions,
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__status-item {
+    gap: 0;
+}
+
+/* 面板在竖屏会换行（状态一行、操作按钮一行），横轴和纵轴要分开补 */
+html[data-e2rn-mobile="1"] .control-panel > .control-panel__cluster {
+    margin-left: 8px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel > .control-panel__cluster:first-child {
+    margin-left: 0;
+}
+
+html[data-e2rn-mobile="1"] .control-panel > .control-panel__cluster--actions {
+    margin-left: 0;
+    margin-top: 8px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__group > * + *,
+html[data-e2rn-mobile="1"] .control-panel__cluster > * + *,
+html[data-e2rn-mobile="1"] .control-panel__actions > * + *,
+html[data-e2rn-mobile="1"] .control-panel__status > * + * {
+    margin-left: 8px;
+}
+
+html[data-e2rn-mobile="1"] .control-panel__status-item > * + * {
+    margin-left: var(--space-xs);
+}
+
+/* 简易模式：状态和三个常用操作在同一行，导航那一组换到第二行 */
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__cluster--actions {
+    margin-left: 8px;
+    margin-top: 0;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__cluster--simple-nav {
+    margin-left: 0;
+    margin-top: 8px;
+}
+
+html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel .control-panel__cluster--simple-nav .control-panel__actions > * + * {
+    margin-left: 6px;
+}
+
+@media (max-width: 340px) {
+    html[data-e2rn-mobile="1"] .control-panel__cluster--actions .control-panel__actions > * + * {
+        margin-left: 6px;
+    }
+}
+
+/* -- 12.4 视图头 / 日志 -- */
+html[data-e2rn-mobile="1"] .view-panel__header,
+html[data-e2rn-mobile="1"] .view-panel__controls,
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls,
+html[data-e2rn-mobile="1"] .log-item,
+html[data-e2rn-mobile="1"] .log-request__line,
+html[data-e2rn-mobile="1"] .logs-container__search,
+html[data-e2rn-mobile="1"] .search-input-group,
+html[data-e2rn-mobile="1"] .logs-container__filters,
+html[data-e2rn-mobile="1"] .logs-container__stats,
+html[data-e2rn-mobile="1"] .logs-container__stats-item,
+html[data-e2rn-mobile="1"] .log-item__actions {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .view-panel__header > * + *,
+html[data-e2rn-mobile="1"] .view-panel__controls > * + * {
+    margin-left: 6px;
+}
+
+html[data-e2rn-mobile="1"] #rightLogs .view-panel__controls > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .log-item > * + *,
+html[data-e2rn-mobile="1"] .logs-container__filters > * + * {
+    margin-left: 6px;
+}
+
+html[data-e2rn-mobile="1"] .log-request__line > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .logs-container__search > * + * {
+    margin-top: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .search-input-group > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .logs-container__stats > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .logs-container__stats-item > * + *,
+html[data-e2rn-mobile="1"] .log-item__actions > * + * {
+    margin-left: var(--space-xs);
+}
+
+/* -- 12.5 答案 / 规则 / 规则集 -- */
+html[data-e2rn-mobile="1"] .answer-group__header,
+html[data-e2rn-mobile="1"] .answer-group__header h4,
+html[data-e2rn-mobile="1"] .answer-file-section__header h4,
+html[data-e2rn-mobile="1"] .answer-pattern-section__header h4,
+html[data-e2rn-mobile="1"] .answers-view__empty,
+html[data-e2rn-mobile="1"] .export-menu__dropdown,
+html[data-e2rn-mobile="1"] .export-menu__item,
+html[data-e2rn-mobile="1"] .rule-item__header,
+html[data-e2rn-mobile="1"] .rule-group__header,
+html[data-e2rn-mobile="1"] .rule-item__name,
+html[data-e2rn-mobile="1"] .rule-group__name,
+html[data-e2rn-mobile="1"] .rule-item__actions,
+html[data-e2rn-mobile="1"] .rule-group__actions,
+html[data-e2rn-mobile="1"] .rule-item__config-item,
+html[data-e2rn-mobile="1"] .rules-list__empty,
+html[data-e2rn-mobile="1"] .rules-list__group-empty,
+html[data-e2rn-mobile="1"] .rule-detail-item,
+html[data-e2rn-mobile="1"] .extensions-view__filters,
+html[data-e2rn-mobile="1"] .extensions-view__search-box,
+html[data-e2rn-mobile="1"] .extensions-view__loading,
+html[data-e2rn-mobile="1"] .extensions-view__empty,
+html[data-e2rn-mobile="1"] .extensions-view__error,
+html[data-e2rn-mobile="1"] .extensions-view__pagination,
+html[data-e2rn-mobile="1"] .ruleset-item__header,
+html[data-e2rn-mobile="1"] .ruleset-item__meta,
+html[data-e2rn-mobile="1"] .ruleset-item__downloads,
+html[data-e2rn-mobile="1"] .ruleset-item__actions,
+html[data-e2rn-mobile="1"] .ruleset-item__tags,
+html[data-e2rn-mobile="1"] .ruleset-item__content,
+html[data-e2rn-mobile="1"] .badge--installed {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .answer-group__header > * + * {
+    margin-left: 6px;
+}
+
+html[data-e2rn-mobile="1"] .answer-group__header h4 > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .answer-file-section__header h4 > * + *,
+html[data-e2rn-mobile="1"] .answer-pattern-section__header h4 > * + * {
+    margin-left: var(--space-xs);
+}
+
+html[data-e2rn-mobile="1"] .answers-view__empty > * + *,
+html[data-e2rn-mobile="1"] .rules-list__empty > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__loading > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__empty > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__error > * + * {
+    margin-top: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .export-menu__dropdown > * + * {
+    margin-top: var(--space-2xs);
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__content > * + * {
+    margin-top: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .export-menu__item > * + *,
+html[data-e2rn-mobile="1"] .ruleset-item__header > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__search-box > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__filters > * + *,
+html[data-e2rn-mobile="1"] .extensions-view__pagination > * + *,
+html[data-e2rn-mobile="1"] .rules-list__group-empty > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__meta > * + * {
+    margin-left: var(--space-lg);
+}
+
+html[data-e2rn-mobile="1"] .ruleset-item__downloads > * + *,
+html[data-e2rn-mobile="1"] .ruleset-item__tags > * + *,
+html[data-e2rn-mobile="1"] .badge--installed > * + * {
+    margin-left: var(--space-xs);
+}
+
+html[data-e2rn-mobile="1"] .rule-item__header > * + *,
+html[data-e2rn-mobile="1"] .rule-group__header > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .rule-item__name > * + *,
+html[data-e2rn-mobile="1"] .rule-group__name > * + *,
+html[data-e2rn-mobile="1"] .rule-item__actions > * + *,
+html[data-e2rn-mobile="1"] .rule-group__actions > * + *,
+html[data-e2rn-mobile="1"] .ruleset-item__actions > * + * {
+    margin-left: 6px;
+}
+
+html[data-e2rn-mobile="1"] .rule-item__config-item > * + * {
+    margin-left: var(--space-xs);
+}
+
+html[data-e2rn-mobile="1"] .rule-detail-item > * + * {
+    margin-left: var(--space-md);
+}
+
+/* -- 12.6 设置 / 表单 / 模态框 -- */
+html[data-e2rn-mobile="1"] .setting-item,
+html[data-e2rn-mobile="1"] .setting-item label,
+html[data-e2rn-mobile="1"] .a366-dl,
+html[data-e2rn-mobile="1"] .toggle-group,
+html[data-e2rn-mobile="1"] .form-input-group,
+html[data-e2rn-mobile="1"] .modal__footer,
+html[data-e2rn-mobile="1"] .modal__detail-stats,
+html[data-e2rn-mobile="1"] .modal__detail-stat,
+html[data-e2rn-mobile="1"] .modal__file-info,
+html[data-e2rn-mobile="1"] .modal--share .modal__url-input-group {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .setting-item > * + *,
+html[data-e2rn-mobile="1"] .setting-item label > * + * {
+    margin-left: 10px;
+}
+
+html[data-e2rn-mobile="1"] .form-input-group > * + *,
+html[data-e2rn-mobile="1"] .modal--share .modal__url-input-group > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .a366-dl > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .toggle-group > * + *,
+html[data-e2rn-mobile="1"] .modal__file-info > * + *,
+html[data-e2rn-mobile="1"] .modal__footer > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .modal__detail-stats > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .modal__detail-stat > * + * {
+    margin-left: var(--space-xs);
+}
+
+/* -- 12.7 浮层 / 赞赏 / 教程 / 简易模式 -- */
+html[data-e2rn-mobile="1"] .agreement-overlay__notice,
+html[data-e2rn-mobile="1"] .agreement-overlay__checkbox-wrap,
+html[data-e2rn-mobile="1"] .agreement-overlay__actions,
+html[data-e2rn-mobile="1"] .appreciation,
+html[data-e2rn-mobile="1"] .appreciation__icon,
+html[data-e2rn-mobile="1"] .appreciation__qr-group,
+html[data-e2rn-mobile="1"] .modal--donation .appreciation,
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon,
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__qr-group,
+html[data-e2rn-mobile="1"] .tutorial-tour__top,
+html[data-e2rn-mobile="1"] .tutorial-tour__actions,
+html[data-e2rn-mobile="1"] .tutorial-tour__ack,
+html[data-e2rn-mobile="1"] #tutorialQuiz label,
+html[data-e2rn-mobile="1"] .simple-home__container,
+html[data-e2rn-mobile="1"] .simple-home__card,
+html[data-e2rn-mobile="1"] .simple-home__card h3,
+html[data-e2rn-mobile="1"] .answer-learning__toggle,
+html[data-e2rn-mobile="1"] .answer-learning__row,
+html[data-e2rn-mobile="1"] .answer-learning__actions {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__notice > * + *,
+html[data-e2rn-mobile="1"] .agreement-overlay__checkbox-wrap > * + *,
+html[data-e2rn-mobile="1"] .appreciation__icon > * + *,
+html[data-e2rn-mobile="1"] .tutorial-tour__top > * + *,
+html[data-e2rn-mobile="1"] .tutorial-tour__actions > * + *,
+html[data-e2rn-mobile="1"] #tutorialQuiz label > * + *,
+html[data-e2rn-mobile="1"] .simple-home__card h3 > * + *,
+html[data-e2rn-mobile="1"] .answer-learning__row > * + *,
+html[data-e2rn-mobile="1"] .answer-learning__actions > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .agreement-overlay__actions > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .appreciation > * + *,
+html[data-e2rn-mobile="1"] .appreciation__qr-group > * + *,
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__qr-group > * + * {
+    margin-left: var(--space-xl);
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .modal--donation .appreciation__icon > * + * {
+    margin-left: 6px;
+}
+
+html[data-e2rn-mobile="1"] .tutorial-tour__ack > * + * {
+    margin-left: 9px;
+}
+
+html[data-e2rn-mobile="1"] .answer-learning__toggle > * + * {
+    margin-left: 10px;
+}
+
+html[data-e2rn-mobile="1"] .simple-home__container > * + *,
+html[data-e2rn-mobile="1"] .simple-home__card > * + * {
+    margin-top: var(--space-lg);
+}
+
+html[data-e2rn-mobile="1"] .simple-home__card > * + * {
+    margin-top: var(--space-sm);
+}
+
+/* 教程里的主按钮靠 auto 右对齐，不能被相邻 margin 覆盖掉 */
+html[data-e2rn-mobile="1"] .tutorial-tour__actions .btn--primary {
+    margin-left: auto;
+}
+
+/* -- 12.8 设置面板内的 TTS / TUN / 测速 -- */
+html[data-e2rn-mobile="1"] .tts-approval__body,
+html[data-e2rn-mobile="1"] .tts-approval__meta,
+html[data-e2rn-mobile="1"] .tts-approval__footer,
+html[data-e2rn-mobile="1"] .tts-approval__footer-actions,
+html[data-e2rn-mobile="1"] .tun-processes,
+html[data-e2rn-mobile="1"] .tun-processes__header,
+html[data-e2rn-mobile="1"] .tun-processes__list,
+html[data-e2rn-mobile="1"] .tun-process-item,
+html[data-e2rn-mobile="1"] .tun-process-item__label,
+html[data-e2rn-mobile="1"] .speed-page__content,
+html[data-e2rn-mobile="1"] .speed-page__display {
+    gap: 0;
+}
+
+html[data-e2rn-mobile="1"] .tts-approval__body > * + * {
+    margin-top: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .speed-page__content > * + * {
+    margin-top: 24px;
+}
+
+html[data-e2rn-mobile="1"] .tts-approval__meta > * + * {
+    margin-left: var(--space-lg);
+}
+
+html[data-e2rn-mobile="1"] .tts-approval__footer > * + *,
+html[data-e2rn-mobile="1"] .tun-processes__header > * + * {
+    margin-left: var(--space-md);
+}
+
+html[data-e2rn-mobile="1"] .tun-process-item > * + *,
+html[data-e2rn-mobile="1"] .tun-process-item__label > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .tts-approval__footer-actions > * + * {
+    margin-left: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .tun-processes > * + * {
+    margin-top: var(--space-sm);
+}
+
+html[data-e2rn-mobile="1"] .tun-processes__list > * + * {
+    margin-top: var(--space-xs);
+}
+
+html[data-e2rn-mobile="1"] .speed-page__display > * + * {
+    margin-left: 6px;
+}
+
+@media (max-width: 340px) {
+    html[data-e2rn-mobile="1"] .sidebar .sidebar__item > i + span {
+        margin-top: 3px;
+    }
+}
+
+/* -- 12.9 横屏：控制面板回到单行，间距回到横轴 -- */
+@media (orientation: landscape) {
+    html[data-e2rn-mobile="1"] .control-panel > .control-panel__cluster--actions {
+        margin-left: 8px;
+        margin-top: 0;
+    }
+
+    html[data-e2rn-mobile="1"] .sidebar .sidebar__item > i + span {
+        margin-top: 0;
+        margin-left: 6px;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"] .control-panel {
+        gap: 0;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__cluster--actions {
+        margin-left: 6px;
+        margin-top: 0;
+    }
+
+    html[data-e2rn-mobile="1"][data-ui="simple"][data-simple-page="app"] .control-panel > .control-panel__cluster--simple-nav {
+        margin-top: 6px;
     }
 }

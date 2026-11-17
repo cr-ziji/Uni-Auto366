@@ -1,5 +1,5 @@
 .tutorial-tour[hidden], .tutorial-tour [hidden] { display: none !important; }
-.tutorial-tour { position: fixed; inset: 0; pointer-events: none; z-index: 10050; }
+.tutorial-tour { position: fixed; top: 0; right: 0; bottom: 0; left: 0; pointer-events: none; z-index: 10050; }
 .tutorial-tour__shade { position: fixed; background: var(--shadow-color-overlay); pointer-events: auto; }
 .tutorial-tour__spotlight { position: fixed; box-sizing: border-box; border: 2px solid var(--color-primary); border-radius: 7px; box-shadow: 0 0 0 4px var(--color-focus-ring-strong), 0 3px 18px var(--shadow-color-primary-15); pointer-events: none; }
 .tutorial-tour__card { position: absolute; z-index: 1; right: 12px; bottom: 12px; width: min(390px, calc(100vw - 24px)); max-height: calc(100vh - 60px); overflow: auto; pointer-events: auto; padding: 22px; border: 1px solid var(--color-border); border-radius: 12px; background: var(--color-bg-panel); color: var(--color-text); box-shadow: 0 12px 40px var(--shadow-color-black-15); }
@@ -13,7 +13,7 @@
 .tutorial-tour__ack input { margin: 4px 0 0; flex-shrink: 0; accent-color: var(--color-primary); }
 .tutorial-target { scroll-margin-block: 32px; }
 #tutorialQuiz fieldset { padding: 14px; margin: 14px 0; border: 1px solid var(--color-border); border-radius: 8px; }
-#tutorialQuiz legend { font-weight: 600; font-size: 13px; padding-inline: 4px; }
+#tutorialQuiz legend { font-weight: 600; font-size: 13px; padding-left: 4px; padding-right: 4px; }
 #tutorialQuiz label { display: flex; align-items: baseline; gap: 8px; line-height: 1.65; padding: 7px 0; cursor: pointer; font-size: 13px; }
 #tutorialQuiz input { accent-color: var(--color-primary); }
 #tutorialQuiz fieldset p, #tutorialFeedback { font-size: 12px; color: var(--color-text-muted); }
