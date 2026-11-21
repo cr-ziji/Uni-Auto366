@@ -1157,8 +1157,21 @@ function removeFromMirror(target: string): void {
   }
 }
 
-export async function rmdir(target: string, _options?: {recursive?: boolean}): Promise<void> {
+/**
+ * 让 `fs` 忘掉某个路径的缓存，下次读取直接回落到设备。
+ *
+ * 原生模块（`react-native-nitro-unzip` 解压 / 打包）是在 `fs` 之外直接写盘的。
+ * 写完不清理镜像缓存的话，缓存里残留的旧内容会继续遮住真实文件 —— 最典型的
+ * 是 `createWriteStream` 结束时 flush 进去的空 buffer，会让刚打好的 ZIP 看起来
+ * 只有 0 字节。
+ */
+export function forgetFile(target: string): void {
   const resolved = resolveTarget(target);
+  fileMirror.delete(resolved);
+  deviceOnlyFiles.delete(resolved);
+}
+
+export async function rmdir(target: string, _options?: {recursive?: boolean}): Promise<void> {  const resolved = resolveTarget(target);
   removeFromMirror(resolved);
   await queueWrite(resolved, async () => {
     try {
@@ -1838,7 +1851,11 @@ export function createWriteStream(target: string, options?: any): Writable {
     },
     final(callback: (error?: Error | null) => void) {
       try {
-        flush();
+        // 一个字节都没写过就不落盘：原生模块（zip 打包/解压）会直接往同一个路径
+        // 写文件，这里再刷一个空 buffer 会把刚打好的包覆盖成 0 字节。
+        if (chunks.length > 0 || appendMode) {
+          flush();
+        }
         callback();
       } catch (error) {
         callback(error as Error);
@@ -1846,9 +1863,13 @@ export function createWriteStream(target: string, options?: any): Writable {
     },
     destroy(error: Error | null, callback: (error?: Error | null) => void) {
       // 中途失败（下载被截断）时也保留已写入的部分，否则调用方看到的文件是空的，
-      // 连"收到多少字节"都查不出来。
+      // 连"收到多少字节"都查不出来。一个字节都没写过时同样什么都不写 ——
+      // Writable 在 finish 之后会自动 destroy，这里再刷一个空 buffer 会把原生
+      // 模块刚写好的文件覆盖成 0 字节。
       try {
-        flush();
+        if (chunks.length > 0 || appendMode) {
+          flush();
+        }
       } catch {
         /* the destroy callback still reports the original error */
       }
@@ -1861,6 +1882,10 @@ export function createWriteStream(target: string, options?: any): Writable {
       stream.destroy(createError('EEXIST', 'open', resolved, 'file already exists'));
     }, 0);
   }
+
+  // 和 Node 的 WriteStream 一样暴露目标路径：原生模块（zip 打包/解压）要按路径
+  // 直接落盘，调用方 `archive.pipe(fs.createWriteStream(out))` 时靠它取输出位置。
+  stream.path = resolved;
 
   let closed = false;
   stream.on('finish', () => {
@@ -2161,6 +2186,7 @@ const fs = {
   fdatasyncSync,
   hydrateFileSystem,
   flushPendingWrites,
+  forgetFile,
   loadIntoMirror,
   lstat,
   lstatSync,

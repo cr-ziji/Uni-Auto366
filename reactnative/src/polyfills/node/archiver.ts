@@ -1,23 +1,26 @@
 /**
- * `archiver` polyfill for React Native.
+ * `archiver` polyfill for React Native, backed by `react-native-nitro-unzip`.
  *
- * Only the ZIP format is supported, which is the one the desktop sources
- * use (`archiver('zip', {zlib: {level: 9}})`). The archive is assembled in
- * memory and handed over to the destination stream when `finalize()` is
- * called, which mirrors the behaviour of the original package closely enough
- * for the ported modules:
+ * 桌面源码只用到 ZIP，且只有一个形状（`modules/injection/archive.js`）：
  *
- *   - `archive.pipe(output)` selects the destination,
- *   - `archive.directory(dir, dest)` adds a directory tree,
- *   - `archive.append(buffer, {name})` adds a single file,
- *   - `await archive.finalize()` writes the archive and resolves,
- *   - `archive.abort()` cancels the archive.
+ *     const output = fs.createWriteStream(zipPath);
+ *     const archive = archiver('zip', {zlib: {level: 9}});
+ *     archive.pipe(output);
+ *     archive.directory(sourceDir, false);
+ *     await archive.finalize();
+ *
+ * 以前这条路径是把整个目录读进内存、用 fflate 在 JS 里 deflate，几十 MB 的
+ * 注入包要好几秒。现在直接把目录交给原生打包（Android 用 `java.util.zip`），
+ * 打包结果由原生直接写进目标文件，JS 侧一个字节都不碰。
+ *
+ * 因此要求 `pipe()` 的目标带 `path`（`fs.createWriteStream` 的实现已经暴露）。
+ * 其它组合（`append()`、带前缀的 `directory()`）没有调用方，直接报错而不是
+ * 悄悄走一条又慢又占内存的老路。
  */
 import {EventEmitter} from 'events';
 import {Buffer} from 'buffer';
-import {zipSync} from 'fflate';
-import {readdir, readFile} from './fs';
-import {join} from './path';
+import {getUnzip} from 'react-native-nitro-unzip';
+import {forgetFile} from './fs';
 
 export interface ArchiverOptions {
   zlib?: {level?: number};
@@ -28,24 +31,19 @@ export interface AppendOptions {
   name?: string;
 }
 
-function toBytes(source: any): Uint8Array {
-  if (typeof source === 'string') {
-    return Buffer.from(source, 'utf8') as any;
+let factory: ReturnType<typeof getUnzip> | null = null;
+
+function unzip(): ReturnType<typeof getUnzip> {
+  if (!factory) {
+    factory = getUnzip();
   }
-  if (source instanceof Uint8Array) {
-    return source;
-  }
-  if (source && typeof source === 'object' && source.data) {
-    return toBytes(source.data);
-  }
-  throw new Error('archiver: unsupported source');
+  return factory;
 }
 
-/** A ZIP archive that is written to a destination stream. */
+/** A ZIP archive that is written straight to a destination file. */
 export class Archiver extends EventEmitter {
   readonly format: string;
   readonly options: ArchiverOptions;
-  private readonly files = new Map<string, Uint8Array>();
   private readonly directories: {path: string; destination?: string | false}[] = [];
   private destination: any = null;
   private finalized = false;
@@ -57,7 +55,7 @@ export class Archiver extends EventEmitter {
     this.options = options ?? {};
   }
 
-  /** The stream the archive is written to. */
+  /** The stream the archive is written to. Its `path` is the output file. */
   pipe(destination: any): any {
     this.destination = destination;
     return destination;
@@ -69,14 +67,9 @@ export class Archiver extends EventEmitter {
     return this;
   }
 
-  /** Adds a single file to the archive. */
-  append(source: any, options?: AppendOptions): this {
-    const name = options?.name;
-    if (!name) {
-      throw new Error('archiver: append() requires a "name" option');
-    }
-    this.files.set(name, toBytes(source));
-    return this;
+  /** 移动端按目录整体打包，不支持按名字塞单个 buffer。 */
+  append(_source: any, _options?: AppendOptions): this {
+    throw new Error('archiver: 移动端只支持 directory(dir, false)，append() 无原生实现');
   }
 
   /** Writes the archive to the destination and resolves when it is done. */
@@ -87,76 +80,61 @@ export class Archiver extends EventEmitter {
     if (this.aborted) {
       throw new Error('archiver: the archive was aborted');
     }
-    for (const entry of this.directories) {
-      await this.collectDirectory(entry.path, entry.destination);
+    if (this.directories.length !== 1 || this.directories[0].destination !== false) {
+      throw new Error('archiver: 移动端只支持单个 directory(dir, false)');
     }
-    const level = this.options?.zlib?.level;
-    // `fflate` only understands plain objects - handed a `Map` it silently
-    // packs zero entries, which produced 22 byte "empty" archives and made
-    // every repacked injection package useless.
-    const entries: Record<string, Uint8Array> = {};
-    for (const [name, content] of this.files) {
-      entries[name] = content;
+    const destinationPath = this.destination?.path;
+    if (!destinationPath) {
+      throw new Error('archiver: pipe() 的目标必须带 path（用 fs.createWriteStream）');
     }
-    const data = zipSync(entries, level === undefined ? undefined : ({level} as any));
+
     this.finalized = true;
-    const destination = this.destination;
-    if (!destination) {
-      this.emit('end');
-      return;
+    const sourcePath = this.directories[0].path;
+
+    // 目标路径可能还留着旧的镜像缓存，清掉，让后面的 stat/read 落到真实文件上。
+    forgetFile(destinationPath);
+
+    // 原生直接把 zip 写到目标路径。
+    const task = unzip().zip(sourcePath, destinationPath);
+    const result = await task.await();
+    if (!result || !result.success) {
+      throw new Error('archiver: 打包失败');
     }
-    await new Promise<void>((resolve, reject) => {
-      const onError = (error: any) => {
-        destination.removeListener?.('error', onError);
-        reject(error);
-      };
-      destination.once?.('error', onError);
-      try {
-        destination.write(Buffer.from(data as any));
-        destination.end(() => {
-          destination.removeListener?.('error', onError);
-          resolve();
-        });
-      } catch (error) {
-        destination.removeListener?.('error', onError);
-        reject(error);
-      }
-    });
+    // 原生是绕开 `fs` 写的盘，再清一次缓存让调用方立刻能读到。
+    forgetFile(destinationPath);
+
+    // 文件已经就位，这时才结束目标流：它一个字节都没收到，`fs` 不会写出空文件
+    // 把打包结果盖掉。顺序反过来会让 close 先于产物出现，监听 close 的调用方
+    // 会拿到一个还不存在的包。
+    await this.closeDestination();
+
     this.emit('end');
   }
 
   /** Cancels the archive. */
   abort(): this {
     this.aborted = true;
-    this.files.clear();
     this.directories.length = 0;
     this.emit('aborted');
     return this;
   }
 
-  private async collectDirectory(directoryPath: string, destination?: string | false): Promise<void> {
-    // A directory that cannot be listed has to fail the archive: silently
-    // shipping an empty ZIP hides the problem until the page that consumes the
-    // package breaks.
-    const entries = (await readdir(directoryPath, {withFileTypes: true})) as any;
-    for (const entry of entries) {
-      const name: string = entry.name;
-      const fullPath = join(directoryPath, name);
-      const relative = destination ? `${destination.replace(/\/$/, '')}/${name}` : name;
-      if (entry.isDirectory?.()) {
-        await this.collectDirectory(fullPath, relative);
-        continue;
-      }
-      if (entry.isSymbolicLink?.()) {
-        continue;
-      }
-      try {
-        const content = await readFile(fullPath);
-        this.files.set(relative, Buffer.from(content as any) as any);
-      } catch (error) {
-        this.emit('error', error);
-      }
+  private closeDestination(): Promise<void> {
+    const destination = this.destination;
+    if (!destination || typeof destination.end !== 'function') {
+      return Promise.resolve();
     }
+    return new Promise<void>(resolve => {
+      const finish = () => resolve();
+      destination.once?.('close', finish);
+      destination.once?.('finish', finish);
+      destination.once?.('error', finish);
+      try {
+        destination.end(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
   }
 }
 

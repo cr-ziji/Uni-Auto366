@@ -32,7 +32,7 @@
 | Jest | 29.7.0（`@react-native/jest-preset` 0.88.0） |
 | ESLint / Prettier | 8.57.1 / 3.9.10 |
 | 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1；网络层为自研原生模块 `Auto366Net` |
-| Android | Gradle 9.4.1、AGP（`com.android.tools.build:gradle`）、Kotlin 2.2.0、compileSdk 37、targetSdk 36、minSdk 24、NDK 27.1.12297006 |
+| Android | Gradle 9.4.1、AGP（`com.android.tools.build:gradle`）、Kotlin 2.2.0、compileSdk 37、targetSdk 36、minSdk 26、NDK 27.1.12297006 |
 | iOS | Swift `AppDelegate` + `SceneDelegate`（`RCTDefaultReactNativeFactoryDelegate`）、`RCTNewArchEnabled=true` |
 
 升级带来的改动：

@@ -5,7 +5,7 @@
 ## 0. 技术栈基线
 
 React Native **0.88.0**（New Architecture only，Hermes）· React 19.3.1 · Metro 0.87.1 ·
-CLI 20.2.0 · Android Gradle 9.4.1 / Kotlin 2.2.0 / compileSdk 37 / minSdk 24 /
+CLI 20.2.0 · Android Gradle 9.4.1 / Kotlin 2.2.0 / compileSdk 37 / minSdk 26
 NDK 27.1.12297006 · iOS Swift AppDelegate + SceneDelegate（`RCTNewArchEnabled=true`）。
 
 ## 1. 已安装的 npm 原生模块
