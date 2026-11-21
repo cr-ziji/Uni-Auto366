@@ -32,6 +32,8 @@ module.exports = {
     // 打包/解压则换成会明确报错的替身，由需要的用例自行 jest.mock。
     '^react-native-nitro-zlib$': '<rootDir>/__mocks__/nitro-zlib.ts',
     '^react-native-nitro-unzip$': '<rootDir>/__mocks__/nitro-unzip.ts',
+    '^react-native-quick-crypto$': '<rootDir>/__mocks__/quick-crypto.ts',
+    '^react-native-quick-base64$': '<rootDir>/__mocks__/quick-base64.ts',
     // The original Electron sources live outside `rootDir`; Babel injects
     // `@babel/runtime` helpers there and Jest cannot resolve them from that
     // folder (Metro maps them explicitly, see metro.config.js).

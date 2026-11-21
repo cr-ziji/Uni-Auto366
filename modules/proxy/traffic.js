@@ -1,6 +1,10 @@
 // Bound completed captures, independently of requests currently being processed.
+//
+// 上限按手机来定：桌面端留 200 条 / 64 MB 无所谓，手机上这块常驻内存会跟
+// WebView、Hermes 抢同一份预算，低端机很容易被系统回收（表现为切回来要重启）。
+// 24 MB / 120 条仍然够翻最近的记录，也够完整下载一条中等大小的响应。
 class TrafficCache extends Map {
-  constructor({ maxEntries = 200, maxBytes = 64 * 1024 * 1024 } = {}) {
+  constructor({ maxEntries = 120, maxBytes = 24 * 1024 * 1024 } = {}) {
     super();
     this.maxEntries = maxEntries;
     this.maxBytes = maxBytes;

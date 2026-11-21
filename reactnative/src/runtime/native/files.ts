@@ -9,6 +9,7 @@
  */
 import {NativeModules} from 'react-native';
 import {Buffer} from 'buffer';
+import {decodeBase64, encodeBase64} from './base64';
 
 interface PickedFile {
   path: string;
@@ -91,7 +92,7 @@ export async function flushPendingSave(localPath: string, bytes: Buffer): Promis
     return false;
   }
   try {
-    await native.writeToUri(uri, bytes.toString('base64'));
+    await native.writeToUri(uri, encodeBase64(bytes));
     pendingSaves.delete(localPath);
     return true;
   } catch (error) {
@@ -163,7 +164,7 @@ export function readFileSyncBlocking(path: string): Buffer | null {
     if (typeof base64 !== 'string' || base64.length === 0) {
       return null;
     }
-    return Buffer.from(base64, 'base64');
+    return decodeBase64(base64);
   } catch {
     return null;
   }

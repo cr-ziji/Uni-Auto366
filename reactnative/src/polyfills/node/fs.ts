@@ -31,6 +31,7 @@ import RNFS from 'react-native-fs';
 import {Buffer} from 'buffer';
 import {Readable, Writable} from 'stream';
 import {flushPendingSave, isSyncReadAvailable, readFileSyncBlocking} from '../../runtime/native/files';
+import {decodeBase64, encodeBase64} from '../../runtime/native/base64';
 import {
   appDataDirectory,
   temporaryDirectory,
@@ -303,6 +304,16 @@ const MIRROR_TOTAL_LIMIT = SYNC_READ_AVAILABLE ? 8 * 1024 * 1024 : 64 * 1024 * 1
  */
 const SYNC_READ_LIMIT = 32 * 1024 * 1024;
 
+/**
+ * 按需读取后回填镜像的总预算。
+ *
+ * 启动时不再预读正文（见 `hydrateFileSystem`），缓存全部由同步读顺手攒起来。
+ * 4 MB 足够覆盖"反复读同一批小文件"的场景（规则集、config、答案索引），又不会
+ * 让常驻内存随会话无限增长；超预算的文件照旧每次都走 JSI 同步读，一样快。
+ */
+const LAZY_MIRROR_LIMIT = 4 * 1024 * 1024;
+let lazyMirrorBytes = 0;
+
 /** In-memory copy of every known directory of the writable sandbox. */
 const directoryMirror = new Set<string>();
 
@@ -395,7 +406,7 @@ async function ensureDeviceDirectory(directory: string): Promise<void> {
 
 async function persistFile(target: string, buffer: Buffer): Promise<void> {
   await ensureDeviceDirectory(dirnameOf(target));
-  await RNFS.writeFile(target, buffer.toString('base64'), 'base64');
+  await RNFS.writeFile(target, encodeBase64(buffer), 'base64');
   // A path returned by `dialog.showSaveDialog()` stands for a document the
   // user picked through the system dialog; the sandbox copy is only the
   // intermediate step, the bytes have to reach that document as well.
@@ -415,7 +426,7 @@ async function persistFile(target: string, buffer: Buffer): Promise<void> {
  */
 async function appendDeviceFile(target: string, addition: Buffer): Promise<void> {
   await ensureDeviceDirectory(dirnameOf(target));
-  const payload = addition.toString('base64');
+  const payload = encodeBase64(addition);
   const nativeAppend = (RNFS as any).appendFile;
   if (typeof nativeAppend !== 'function') {
     const current = (await readDeviceFile(target)) ?? Buffer.alloc(0);
@@ -439,7 +450,7 @@ async function readDeviceFile(target: string): Promise<Buffer | null> {
   }
   try {
     const base64 = await RNFS.readFile(target, 'base64');
-    return Buffer.from(base64, 'base64');
+    return decodeBase64(base64);
   } catch {
     return null;
   }
@@ -600,7 +611,7 @@ function readAsset(target: string, encoding?: string | null): Buffer | string | 
     return null;
   }
   const value = assetReadFileSync(key, 'base64');
-  const buffer = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'base64');
+  const buffer = Buffer.isBuffer(value) ? value : decodeBase64(String(value));
   return decodeBuffer(buffer, encoding);
 }
 
@@ -627,7 +638,10 @@ function readFileBytesSync(target: string): Buffer {
       if (bytes) {
         // Keep it for the next read: the answer parser walks the same files
         // repeatedly, and a second blocking bridge call is pure waste.
-        if (bytes.length <= MIRROR_CONTENT_LIMIT) {
+        // 但缓存要封顶：启动时不再预读正文后，缓存全靠这条路径按需攒，没有上限
+        // 的话读得越多常驻内存越大（单个文件最多 256 KB，攒起来就没边了）。
+        if (bytes.length <= MIRROR_CONTENT_LIMIT && lazyMirrorBytes < LAZY_MIRROR_LIMIT) {
+          lazyMirrorBytes += bytes.length;
           fileMirror.set(resolved, bytes);
           deviceOnlyFiles.delete(resolved);
         }
@@ -793,7 +807,7 @@ function formatBytes(bytes: number): string {
 async function readDeviceFileDirect(target: string): Promise<Buffer | null> {
   try {
     const base64 = await RNFS.readFile(target, 'base64');
-    return Buffer.from(base64, 'base64');
+    return decodeBase64(base64);
   } catch {
     return null;
   }
@@ -878,10 +892,22 @@ export async function hydrateFileSystem(): Promise<void> {
   const candidates: HydrationCandidate[] = [];
   await collectHydrationCandidates(appDataDirectory, candidates, stats, run);
 
-  // Smallest first: `config.json`, the rule sets and the small metadata files
-  // the main process reads synchronously are served from memory, while the
-  // budget is spent on the files that are actually needed.
+  // Smallest first: when the content really has to be preloaded, the budget is
+  // spent on `config.json`, the rule sets and the small metadata files first.
   candidates.sort((left, right) => left.size - right.size);
+
+  /**
+   * 正文要不要提前读进内存？
+   *
+   * 只有拿不到 JSI 同步读时才需要：那种情况下 `readFileSync` 只能命中镜像，
+   * 否则会 EBUSY。有同步读时（当前 Android 构建就是）一律按需读 ——
+   * `readFileBytesSync` 会对 deviceOnly 文件走 `readFileBase64Sync`，
+   * 一次 JSI 同步调用几乎没有延迟，读完还会自动进镜像缓存。
+   *
+   * 之前无论有没有同步读,都把 70 个文件全读一遍：启动白等约 1 秒,还常驻
+   * 1.9 MB 镜像内存,纯属浪费。
+   */
+  const eagerContent = !SYNC_READ_AVAILABLE;
 
   /** Bytes per top-level directory, for the "where did the disk go" log. */
   const deferredByDirectory = new Map<string, number>();
@@ -897,7 +923,7 @@ export async function hydrateFileSystem(): Promise<void> {
         );
         const exceedsFileLimit = candidate.size > MIRROR_CONTENT_LIMIT;
         const exceedsBudget = reservedBytes + candidate.size > MIRROR_TOTAL_LIMIT;
-        if (isDeferredDirectory || exceedsFileLimit || exceedsBudget) {
+        if (!eagerContent || isDeferredDirectory || exceedsFileLimit || exceedsBudget) {
           deviceOnlyFiles.set(candidate.path, candidate.size);
           stats.deferred += 1;
           stats.deferredBytes += candidate.size;

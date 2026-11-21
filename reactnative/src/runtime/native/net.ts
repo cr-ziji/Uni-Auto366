@@ -19,6 +19,7 @@
 import {Buffer} from 'buffer';
 import {EventEmitter} from 'events';
 import {NativeEventEmitter, NativeModules} from 'react-native';
+import {decodeBase64 as decodeBase64Native} from './base64';
 
 /** 原生模块名，Android `Auto366NetModule` / iOS `Auto366Net`。 */
 const MODULE_NAME = 'Auto366Net';
@@ -124,7 +125,7 @@ const MAX_NATIVE_WRITE = 64 * 1024;
 const MAX_NATIVE_IN_FLIGHT = 4;
 
 function decodeBase64(text: string | null | undefined): Buffer {
-  return text ? Buffer.from(text, 'base64') : Buffer.alloc(0);
+  return text ? decodeBase64Native(text) : Buffer.alloc(0);
 }
 
 /**

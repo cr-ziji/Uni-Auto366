@@ -124,8 +124,13 @@ describe('the start-up file mirror', () => {
     await hydrateFileSystem();
   });
 
-  it('mirrors the small files the boot reads synchronously', () => {
-    // No blocking read needed: the bytes are already in memory.
+  it('reads a small file on demand and caches it afterwards', () => {
+    // 启动时只建索引、不搬正文：第一次同步读走原生阻塞调用。
+    expect(readFileSync(SMALL, 'utf8')).toBe('{"theme":"dark"}');
+    expect(mockReadFileSyncBlocking).toHaveBeenCalledWith(SMALL);
+
+    // 读完进了镜像缓存，第二次不该再打一次 JSI 调用。
+    mockReadFileSyncBlocking.mockClear();
     expect(readFileSync(SMALL, 'utf8')).toBe('{"theme":"dark"}');
     expect(mockReadFileSyncBlocking).not.toHaveBeenCalledWith(SMALL);
   });
