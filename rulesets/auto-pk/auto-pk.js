@@ -1,3860 +1,1141 @@
-(function() {
-'use strict';
+/*
+ * 单词 PK 自动作答脚本（选择题模式）
+ * ------------------------------------------------------------
+ * 页面 DOM：
+ *   题目：.u3-pk-core__cn
+ *   选项：.u3-pk-core__word > .u3-pk-core__text
+ *
+ * 页面是 Vue 2，PKCore 组件的根节点 .u3-pk-core 上挂着 __vue__。
+ * 组件里的 vm.word 就是当前题目的完整数据，直接包含正确答案：
+ *
+ *   vm.en2cn === false : 题目中文，选项英文，正确答案 = vm.word.en
+ *   vm.en2cn === true  : 题目英文，选项中文，正确答案 = vm.word.cn
+ *
+ * 因此不再自己维护词库、不再做相似度评分，也不复制页面里的 D() 函数。
+ * 直接从组件读取答案，再找到文字完全一致的选项点击。
+ *
+ * 控制台：
+ *   页面右下角浮动面板，可鼠标拖拽，也可触控拖拽（Pointer/Touch 都支持）。
+ *   面板可以：
+ *     - 显示作答日志（作答结果、正误、异常）
+ *     - 控制正确率（0~100%，未命中时随机点一个错误选项）
+ *     - 控制间隔（题目出现后等待多久再作答）
+ *     - 跳过动画（默认关闭）：缩短页面作答动画，并提前收掉 +1 飘字/错误提示，
+ *       让下一题更快出现；不影响正常答题逻辑，关闭后立即恢复页面原有动画。
+ *     - 提交时间（默认关闭）：把“提交用时”推给本地服务，由代理层在提交时改写
+ *       submitJson.duration 与 wordInfos[].answerTime，改包逻辑见
+ *       modules/proxy/time-modifier.js（applyPkTimeMod）。
+ *     - 开始/停止、折叠、隐藏（隐藏后右下角保留一个小圆钮）
+ *
+ * 控制台 API：
+ *   AutoPk.stop() / AutoPk.start()     停止 / 开始
+ *   AutoPk.setAccuracy(80)             设置正确率百分比
+ *   AutoPk.setIntervalMs(200)          设置作答间隔（毫秒）
+ *   AutoPk.setSkipAnim(true)           开启 / 关闭“跳过动画”
+ *   AutoPk.setSubmitTime(true, 180)    开启提交时间修改，并设成 180 秒
+ *   AutoPk.setSubmitTime(false)        关闭提交时间修改
+ *   AutoPk.show() / AutoPk.hide()      显示 / 隐藏控制台
+ *   AutoPk.status()                    查看当前状态
+ *   AutoPk.debug = false               关闭控制台日志输出（页面上的日志仍在）
+ */
+(function () {
+    'use strict';
 
-// bucket 端口用户可以改；代理层在注入脚本时把真实地址写进 window.__A366__。
-// 注意不能读 localStorage —— 注入脚本跑在 up366 页面的 origin 下，
-// 跟主程序窗口不是同一个存储区，主程序写进去的值这里根本看不到。
-function a366BucketOrigin() {
-    if (window.__A366__ && window.__A366__.bucket) return window.__A366__.bucket;
-    return 'http://127.0.0.1:5290';
-}
+    var VERSION = '4.2.0';
+    var TICK_MS = 100;
+    var TICK_FAST_MS = 40;
+    var LOG_LIMIT = 300;
+    var INT32_MAX = 2147483647;
+    var TIME_ENABLED_KEY = 'a366_pk_time_enabled';
+    var TIME_SECONDS_KEY = 'a366_pk_time_seconds';
+    // 兼容旧版控制台的存储键，老用户升级后不用重新设置
+    var LEGACY_TIME_ENABLED_KEY = 'pkTimeModEnabled';
+    var LEGACY_TIME_SECONDS_KEY = 'pkTimeModSeconds';
 
-const POS_LIST = ['interj', 'prep', 'pron', 'abbr', 'conj', 'adj', 'adv', 'num', 'art', 'vt', 'vi', 'n', 'v'];
-const POS_ALT = POS_LIST.join('|');
-const POS_ABBREV_PATTERN = new RegExp('^(?:(?:' + POS_ALT + ')(?=\\.|\\s|[\\u4e00-\\u9fff]|$)\\.?\\s*(?:&\\s*(?:' + POS_ALT + ')\\.?\\s*)*)\\s*');
-
-const STOP_WORDS = new Set([
-    'a', 'an', 'the', 'in', 'on', 'at', 'of', 'to', 'for', 'with', 'by', 'from',
-    'about', 'as', 'into', 'through', 'during', 'before', 'after', 'above',
-    'below', 'between', 'under', 'over', 'up', 'down', 'off', 'out', 'upon',
-    'within', 'without', 'and', 'but', 'or', 'nor', 'so', 'yet', 'both',
-    'either', 'neither', 'be', 'am', 'is', 'are', 'was', 'were', 'been',
-    'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing',
-    'will', 'would', 'shall', 'should', 'can', 'could', 'may', 'might',
-    'must', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her',
-    'us', 'them', 'my', 'your', 'his', 'its', 'our', 'their', 'this', 'that',
-    'these', 'those', 'not', 'no', 'if', 'then', 'also', 'just', 'very',
-    'every', 'some', 'any', 'each', 'all', 'few', 'more', 'most',
-    'other', 'such', 'only', 'own', 'same', 'so', 'than', 'too'
-]);
-
-const BUCKET_MAX_RETRIES = 10;
-const LOG_ROW_HEIGHT = 22;
-// 内置模型实测: doubao~1.1s / qwen~1.2s / chatnut~2.1s, 故内置链路给更宽的超时。
-const AI_TIMEOUT = 3000;
-const AI_TIMEOUT_BUILTIN = 8000;
-const AI_API_URL = 'https://api.deepseek.com/chat/completions';
-const AI_MODEL = 'deepseek-v4-flash';
-
-var Utils = {
-    parseParaphrase: function(paraphrase) {
-        if (!paraphrase) return { pos: [], meanings: [], meaning_text: '' };
-        var allPos = [];
-        var allMeanings = [];
-        var lines = paraphrase.split(/\n/).filter(function(l) { return l.trim(); });
-        var meaningText = '';
-        for (var i = 0; i < lines.length; i++) {
-            var line = lines[i].trim();
-            if (!line) continue;
-            var posMatch = line.match(POS_ABBREV_PATTERN);
-            var posStr = '';
-            var meaningPart = line;
-            if (posMatch) {
-                posStr = posMatch[0].trim();
-                meaningPart = line.substring(posMatch[0].length);
-            }
-            if (posStr) {
-                var tags = posStr.split(/\s*&\s*/).map(function(p) { return p.trim(); }).filter(function(p) { return p; });
-                allPos.push.apply(allPos, tags);
-            }
-            var parts = meaningPart.split(/[；;]/).map(function(m) { return m.trim(); }).filter(function(m) { return m; });
-            allMeanings.push.apply(allMeanings, parts);
-            if (i === 0) {
-                if (posStr && parts.length > 0) {
-                    meaningText = posStr + ' ' + parts[0];
-                } else if (parts.length > 0) {
-                    meaningText = parts[0];
-                } else if (posStr) {
-                    meaningText = posStr;
-                }
-            }
-        }
-        return { pos: allPos, meanings: allMeanings, meaning_text: meaningText };
-    },
-
-    normalizePunctuation: function(text) {
-        if (!text) return '';
-        return text
-            .replace(/\.{2,}/g, '…')
-            .replace(/。{2,}/g, '…')
-            .replace(/…{2,}/g, '…');
-    },
-
-    normalizeText: function(text) {
-        if (!text) return '';
-        return Utils.normalizePunctuation(
-            text.trim().toLowerCase()
-        ).replace(/[………]/g, '');
-    },
-
-    normalizeEntryKey: function(text) {
-        if (!text) return '';
-        return Utils.normalizePunctuation(
-            text.trim().toLowerCase()
-        ).replace(/[\s………\-]/g, '');
-    },
-
-    calculateSimilarity: function(str1, str2) {
-        var s1 = Utils.normalizeText(str1);
-        var s2 = Utils.normalizeText(str2);
-
-        if (s1 === s2) return 100;
-
-        if (s1.includes(s2) || s2.includes(s1)) {
-            var minLen = Math.min(s1.length, s2.length);
-            var maxLen = Math.max(s1.length, s2.length);
-            return (minLen / maxLen) * 90;
-        }
-
-        var words1 = s1.split(/[\s，；,;、]/).filter(function(w) { return w.length > 0; });
-        var words2 = s2.split(/[\s，；,;、]/).filter(function(w) { return w.length > 0; });
-
-        if (words1.length === 0 || words2.length === 0) {
-            var commonChars = 0;
-            var charSet2 = new Set(s2);
-            var _arr2 = s1;
-            for (var _i2 = 0; _i2 < _arr2.length; _i2++) {
-                var ch = _arr2[_i2];
-                if (charSet2.has(ch)) commonChars++;
-            }
-            return (commonChars / Math.max(s1.length, s2.length)) * 70;
-        }
-
-        var matchedWords = 0;
-        for (var _i3 = 0; _i3 < words1.length; _i3++) {
-            var w1 = words1[_i3];
-            for (var _j = 0; _j < words2.length; _j++) {
-                var w2 = words2[_j];
-                if (w1 === w2) {
-                    matchedWords++;
-                    break;
-                } else if (w1.includes(w2) || w2.includes(w1)) {
-                    matchedWords += 0.7;
-                    break;
-                }
-            }
-        }
-
-        var wordScore = (matchedWords / Math.max(words1.length, words2.length)) * 80;
-
-        var commonChars2 = 0;
-        var charSet22 = new Set(s2);
-        var _arr3 = s1;
-        for (var _i4 = 0; _i4 < _arr3.length; _i4++) {
-            var ch2 = _arr3[_i4];
-            if (charSet22.has(ch2)) commonChars2++;
-        }
-        var charScore = (commonChars2 / Math.max(s1.length, s2.length)) * 20;
-
-        return wordScore + charScore;
-    },
-
-    decodeHtmlEntities: function(text) {
-        var textarea = document.createElement('textarea');
-        textarea.innerHTML = text;
-        return textarea.value;
-    },
-
-    removePartOfSpeech: function(text) {
-        if (!text) return '';
-        text = Utils.decodeHtmlEntities(text);
-        var result = text.replace(POS_ABBREV_PATTERN, '').trim();
-        if (!result) {
-            var dotIndex = text.indexOf('.');
-            if (dotIndex !== -1 && dotIndex < text.length - 1) {
-                result = text.substring(dotIndex + 1).trim();
-            } else {
-                result = text.trim();
-            }
-        }
-        result = result.replace(/[\(（][^\)）]*[\)）]/g, '').replace(/\s+/g, ' ').trim();
-        return result;
-    },
-
-    extractPosSet: function(text) {
-        if (!text) return new Set(['other']);
-        text = Utils.decodeHtmlEntities(text);
-        var posMatch = text.match(POS_ABBREV_PATTERN);
-        if (!posMatch || !posMatch[0].trim()) return new Set(['other']);
-        var posStr = posMatch[0].trim();
-        var tags = posStr.split(/\s*&\s*/).map(function(p) { return p.replace(/\./g, '').trim().toLowerCase(); }).filter(function(p) { return p; });
-        if (tags.length === 0) return new Set(['other']);
-        var normalized = new Set();
-        for (var _i5 = 0; _i5 < tags.length; _i5++) {
-            var tag = tags[_i5];
-            if (tag === 'vt' || tag === 'vi') normalized.add('v');
-            else normalized.add(tag);
-        }
-        return normalized;
-    },
-
-    isPosCompatible: function(set1, set2) {
-        if (set1.has('other') || set2.has('other')) return true;
-        var _arr4 = Array.from(set1);
-        for (var _i6 = 0; _i6 < _arr4.length; _i6++) {
-            var p = _arr4[_i6];
-            if (set2.has(p)) return true;
-        }
-        return false;
-    },
-
-    chineseCharOverlap: function(s1, s2) {
-        var chars1 = new Set((s1.match(/[\u4e00-\u9fff]/g) || []));
-        var chars2 = new Set((s2.match(/[\u4e00-\u9fff]/g) || []));
-        if (chars1.size === 0 || chars2.size === 0) return 0;
-        var overlap = 0;
-        var _arr5 = Array.from(chars1);
-        for (var _i7 = 0; _i7 < _arr5.length; _i7++) {
-            var ch = _arr5[_i7];
-            if (chars2.has(ch)) overlap++;
-        }
-        return overlap / Math.max(chars1.size, chars2.size);
-    },
-
-    chineseCharCoverage: function(shorter, longer) {
-        var charsShort = new Set((shorter.match(/[\u4e00-\u9fff]/g) || []));
-        var charsLong = new Set((longer.match(/[\u4e00-\u9fff]/g) || []));
-        if (charsShort.size === 0 || charsLong.size === 0) return 0;
-        var matched = 0;
-        var _arr6 = Array.from(charsShort);
-        for (var _i8 = 0; _i8 < _arr6.length; _i8++) {
-            var ch = _arr6[_i8];
-            if (charsLong.has(ch)) matched++;
-        }
-        return matched / charsShort.size;
-    },
-
-    calculatePhraseMeaningMatchScore: function(questionText, phraseWord, questionIsChinese, phraseInfo) {
-        var qText = Utils.normalizeText(Utils.removePartOfSpeech(questionText));
-        var highScore = 0;
-
-        if (questionIsChinese) {
-            var meaningsToCheck = (phraseInfo.clean_meanings || []).concat(phraseInfo.meanings);
-            for (var _i9 = 0; _i9 < meaningsToCheck.length; _i9++) {
-                var meaning = meaningsToCheck[_i9];
-                var nm = Utils.normalizeText(meaning);
-                if (nm === qText) {
-                    highScore = 100;
-                    break;
-                }
-                if (nm.includes(qText) || qText.includes(nm)) {
-                    var minLen = Math.min(nm.length, qText.length);
-                    var maxLen = Math.max(nm.length, qText.length);
-                    var subScore = (minLen / maxLen) * 90;
-                    if (subScore > highScore) highScore = subScore;
-                }
-                var overlap = Utils.chineseCharOverlap(qText, nm);
-                if (overlap >= 0.5) {
-                    var overlapScore = overlap * 80;
-                    if (overlapScore > highScore) highScore = overlapScore;
-                }
-            }
-        } else {
-            var qClean = Utils.normalizeText(Utils.removePartOfSpeech(questionText));
-            var entryQ = Utils.normalizeEntryKey(qClean);
-            var phraseNorm = Utils.normalizeText(phraseWord);
-            var phraseKey = Utils.normalizeEntryKey(phraseWord);
-
-            if (phraseNorm === qClean || phraseKey === entryQ) {
-                highScore = 100;
-            } else if (phraseNorm.includes(qClean) || qClean.includes(phraseNorm)) {
-                var minLen2 = Math.min(phraseNorm.length, qClean.length);
-                var maxLen2 = Math.max(phraseNorm.length, qClean.length);
-                highScore = Math.max(highScore, (minLen2 / maxLen2) * 90);
-            } else {
-                for (var _i10 = 0; _i10 < phraseInfo.meanings.length; _i10++) {
-                    var meaning2 = phraseInfo.meanings[_i10];
-                    var nm2 = Utils.normalizeText(meaning2);
-                    if (nm2.includes(qClean) || qClean.includes(nm2)) {
-                        var minLen3 = Math.min(nm2.length, qClean.length);
-                        var maxLen3 = Math.max(nm2.length, qClean.length);
-                        highScore = Math.max(highScore, (minLen3 / maxLen3) * 80);
-                    }
-                }
-            }
-        }
-        return Math.min(highScore, 100);
+    if (window.AutoPk && window.AutoPk.version) {
+        return;
     }
-};
 
-var State = {
-    jsonData: null,
-    bucketLoaded: false,
-    bucketError: null,
-    bucketRetryCount: 0,
-    customBucketUrl: localStorage.getItem('customBucketUrl') || '',
-    autoPkDelay: 1000,
-    autoPkIntervalId: null,
-    lastMatchedWord: '',
-    matchCount: 0,
-    missCount: 0,
-    currentBucketType: null,
-    scoreControlEnabled: localStorage.getItem('scoreControlEnabled') === 'true',
-    scoreControlMode: localStorage.getItem('scoreControlMode') || 'rate',
-    targetScoreRate: parseInt(localStorage.getItem('targetScoreRate'), 10) || 100,
-    targetCorrectCount: parseInt(localStorage.getItem('targetCorrectCount'), 10) || 0,
-    totalWordsInBucket: 0,
-    answeredCorrectly: 0,
-    answeredTotal: 0,
-    scoreControlActive: false,
-    lastMatchScores: [],
-    aiApiKey: '',
-    aiBaseUrl: '',
-    aiModel: '',
-    aiBuiltin: false,
-    aiEnabled: localStorage.getItem('aiEnabled') === 'true',
-    aiThreshold: parseInt(localStorage.getItem('aiThreshold'), 10) || 50,
-    aiWaiting: false,
-    // ===== 听音拼词（独立子规则，由按钮控制启停）=====
-    listenSpellEnabled: localStorage.getItem('listenSpellEnabled') === 'true',
-    // ===== 时间修改修改（隶属"通用自动PK"，可关可开的子规则）=====
-    pkTimeModEnabled: localStorage.getItem('pkTimeModEnabled') === 'true',
-    // 秒数：未设置时为 null，面板显示 "-"；int32 全范围
-    pkTimeModSeconds: (function() {
-        var raw = localStorage.getItem('pkTimeModSeconds');
-        if (raw === null || raw === '') return null;
-        var v = parseInt(raw, 10);
-        return Number.isFinite(v) ? v : null;
-    })()
-};
+    // ---------- 小工具 ----------
 
-var INT32_MIN = -2147483648;
-var INT32_MAX = 2147483647;
-
-var MatcherFull = {
-    standardizeEntry: function(rawEntry) {
-        var entry = rawEntry.entry || '';
-        var entryId = rawEntry.entryId || null;
-
-        var allParaphraseTexts = [];
-        if (rawEntry.paraphrase) {
-            allParaphraseTexts.push(rawEntry.paraphrase);
-        }
-
-        if (rawEntry.newPropList && Array.isArray(rawEntry.newPropList)) {
-            for (var _i11 = 0; _i11 < rawEntry.newPropList.length; _i11++) {
-                var prop = rawEntry.newPropList[_i11];
-                if (prop.senseList && Array.isArray(prop.senseList)) {
-                    for (var _j2 = 0; _j2 < prop.senseList.length; _j2++) {
-                        var sense = prop.senseList[_j2];
-                        if (sense.paraphrase && typeof sense.paraphrase === 'string') {
-                            allParaphraseTexts.push(sense.paraphrase);
-                        }
-                    }
-                }
-            }
-        }
-
-        var allPos = [];
-        var allMeanings = [];
-        var meaning_text = '';
-        var matchKeys = new Set();
-
-        for (var _i12 = 0; _i12 < allParaphraseTexts.length; _i12++) {
-            var text = allParaphraseTexts[_i12];
-            var parsed = Utils.parseParaphrase(text);
-            var pos = parsed.pos;
-            var meanings = parsed.meanings;
-            var mt = parsed.meaning_text;
-            allPos.push.apply(allPos, pos);
-            allMeanings.push.apply(allMeanings, meanings);
-            if (!meaning_text && mt) meaning_text = mt;
-        }
-
-        var uniquePos = Array.from(new Set(allPos));
-        var uniqueMeanings = Array.from(new Set(allMeanings));
-
-        matchKeys.add(entry);
-        for (var _i13 = 0; _i13 < uniqueMeanings.length; _i13++) {
-            var meaning = uniqueMeanings[_i13];
-            matchKeys.add(meaning);
-            var fineParts = meaning.split(/[，,、]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-            for (var _j3 = 0; _j3 < fineParts.length; _j3++) {
-                var part = fineParts[_j3];
-                matchKeys.add(part);
-            }
-        }
-        if (meaning_text) {
-            matchKeys.add(meaning_text);
-            var fineParts2 = meaning_text.split(/[，,、]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-            for (var _j4 = 0; _j4 < fineParts2.length; _j4++) {
-                var part2 = fineParts2[_j4];
-                matchKeys.add(part2);
-            }
-        }
-
-        var variants = [];
-        if (entry.includes('/')) {
-            variants = entry.split('/').map(function(v) { return v.trim(); }).filter(function(v) { return v; });
-            for (var _i14 = 0; _i14 < variants.length; _i14++) {
-                var v = variants[_i14];
-                matchKeys.add(v);
-            }
-        }
-
-        var isPhrase = entry.includes(' ');
-        var cleanMeanings = uniqueMeanings.map(function(m) { return m.replace(/[\(（][^\)）]*[\)）]/g, '').trim(); }).filter(function(m) { return m; });
-
-        UI.addLogMessage('[标准化] 词条="' + entry + '" | 释义数=' + allParaphraseTexts.length + ' | 词性=' + JSON.stringify(uniquePos) + ' | 释义=' + JSON.stringify(uniqueMeanings.slice(0, 5)) + ' | matchKeys数=' + matchKeys.size + ' | 变体=' + JSON.stringify(variants) + ' | 短语=' + isPhrase + ' | 纯净释义=' + JSON.stringify(cleanMeanings.slice(0, 3)), 'info');
-
-        return {
-            word: entry,
-            pos: uniquePos,
-            meanings: uniqueMeanings,
-            meaning_text: meaning_text,
-            match_keys: Array.from(matchKeys),
-            variants: variants,
-            entryId: entryId,
-            is_phrase: isPhrase,
-            clean_meanings: cleanMeanings
-        };
-    },
-
-    build: function(entryList) {
-        var words = [];
-        var byQuestion = {};
-        var byWord = {};
-        var seen = new Set();
-        var duplicateCount = 0;
-        for (var _i15 = 0; _i15 < entryList.length; _i15++) {
-            var rawEntry = entryList[_i15];
-            var std = MatcherFull.standardizeEntry(rawEntry);
-            var dedupeKey = std.word + '_' + std.meaning_text;
-            if (seen.has(dedupeKey)) {
-                duplicateCount++;
-                continue;
-            }
-            seen.add(dedupeKey);
-            words.push(std);
-            for (var _i16 = 0; _i16 < std.match_keys.length; _i16++) {
-                var key = std.match_keys[_i16];
-                if (key) {
-                    if (!byQuestion[key]) byQuestion[key] = [];
-                    if (byQuestion[key].length < 3 && byQuestion[key].indexOf(std.word) === -1) byQuestion[key].push(std.word);
-                }
-                var nk = Utils.normalizeText(key);
-                if (nk) {
-                    if (!byQuestion[nk]) byQuestion[nk] = [];
-                    if (byQuestion[nk].length < 3 && byQuestion[nk].indexOf(std.word) === -1) byQuestion[nk].push(std.word);
-                }
-                var ek = Utils.normalizeEntryKey(key);
-                if (ek && ek !== nk) {
-                    if (!byQuestion[ek]) byQuestion[ek] = [];
-                    if (byQuestion[ek].length < 3 && byQuestion[ek].indexOf(std.word) === -1) byQuestion[ek].push(std.word);
-                }
-            }
-            for (var _i17 = 0; _i17 < std.variants.length; _i17++) {
-                var variant = std.variants[_i17];
-                if (variant) {
-                    if (!byQuestion[variant]) byQuestion[variant] = [];
-                    if (byQuestion[variant].length < 3 && byQuestion[variant].indexOf(std.word) === -1) byQuestion[variant].push(std.word);
-                }
-                var nv = Utils.normalizeText(variant);
-                if (nv) {
-                    if (!byQuestion[nv]) byQuestion[nv] = [];
-                    if (byQuestion[nv].length < 3 && byQuestion[nv].indexOf(std.word) === -1) byQuestion[nv].push(std.word);
-                }
-                var ev = Utils.normalizeEntryKey(variant);
-                if (ev) {
-                    if (!byQuestion[ev]) byQuestion[ev] = [];
-                    if (byQuestion[ev].length < 3 && byQuestion[ev].indexOf(std.word) === -1) byQuestion[ev].push(std.word);
-                }
-            }
-            if (!byWord[std.word]) {
-                byWord[std.word] = {
-                    pos: std.pos,
-                    meanings: std.meanings,
-                    clean_meanings: std.clean_meanings,
-                    is_phrase: std.is_phrase
-                };
-            }
-        }
-
-        var phraseIndex = {};
-        for (var _i18 = 0; _i18 < words.length; _i18++) {
-            var _std = words[_i18];
-            if (_std.is_phrase) {
-                var phraseWords = _std.word.toLowerCase().split(/\s+/).filter(function(w) { return !STOP_WORDS.has(w); });
-                for (var _i19 = 0; _i19 < phraseWords.length; _i19++) {
-                    var pw = phraseWords[_i19];
-                    if (!phraseIndex[pw]) phraseIndex[pw] = [];
-                    if (!phraseIndex[pw].includes(_std.word)) {
-                        phraseIndex[pw].push(_std.word);
-                    }
-                }
-            }
-        }
-
-        UI.addLogMessage('词库标准化完成: 原始 ' + entryList.length + ' 条 → 标准化后 ' + words.length + ' 条 (去重 ' + duplicateCount + ' 条)', 'info');
-        UI.addLogMessage('[索引] byQuestion键数=' + Object.keys(byQuestion).length + ' | byWord键数=' + Object.keys(byWord).length + ' | phraseIndex键数=' + Object.keys(phraseIndex).length, 'info');
-        return {
-            version: '3.5',
-            index: {
-                by_question: byQuestion,
-                by_word: byWord,
-                phrase_index: phraseIndex
-            },
-            words: words
-        };
-    },
-
-    match: function(word, candidates) {
-        if (!State.jsonData || !State.jsonData.version || State.jsonData.version !== '3.5') {
-            UI.addLogMessage('[匹配] 词库未就绪，跳过匹配', 'warning');
-            State.lastMatchScores = [];
-            return 0;
-        }
-
-        candidates = candidates.map(function(c) { return Utils.decodeHtmlEntities(c); });
-
-        var byQuestion = State.jsonData.index.by_question;
-        var byWord = State.jsonData.index.by_word;
-        var wordsList = State.jsonData.words;
-
-        var isChineseInput = /[\u4e00-\u9fff]/.test(word);
-        var questionPosSet = Utils.extractPosSet(word);
-        var cleanedWord = Utils.removePartOfSpeech(word);
-        var normalizedWord = Utils.normalizeText(word);
-        var normalizedCleaned = Utils.normalizeText(cleanedWord);
-        var entryKeyWord = Utils.normalizeEntryKey(word);
-        var entryKeyCleaned = Utils.normalizeEntryKey(cleanedWord);
-
-        UI.addLogMessage('[匹配] 原始题目="' + word + '" | 是否中文=' + isChineseInput + ' | 清理后="' + cleanedWord + '" | 归一化="' + normalizedCleaned + '" | entryKey="' + entryKeyCleaned + '"', 'info');
-        UI.addLogMessage('[匹配] 题目词性=' + JSON.stringify(Array.from(questionPosSet)) + ' | 候选数=' + candidates.length, 'info');
-
-        var targetWords = new Set();
-
-        var lookupKeys = [word, normalizedWord, cleanedWord, normalizedCleaned, entryKeyWord, entryKeyCleaned];
-        for (var _i20 = 0; _i20 < lookupKeys.length; _i20++) {
-            var key = lookupKeys[_i20];
-            if (key && byQuestion[key]) {
-                var hits = byQuestion[key];
-                for (var h = 0; h < hits.length; h++) {
-                    targetWords.add(hits[h]);
-                }
-                UI.addLogMessage('[索引命中] key="' + key + '" → word="' + hits.join(',') + '"', 'info');
-            }
-        }
-
-        if (isChineseInput && targetWords.size === 0) {
-            UI.addLogMessage('[索引未命中] 中文输入，遍历词库进行子串匹配...', 'info');
-            for (var _i21 = 0; _i21 < wordsList.length; _i21++) {
-                var w = wordsList[_i21];
-                var checkList = (w.clean_meanings || []).concat(w.meanings).concat(w.match_keys);
-                var matched = false;
-                for (var _j5 = 0; _j5 < checkList.length; _j5++) {
-                    var item = checkList[_j5];
-                    var nm = Utils.normalizeText(item);
-                    if (nm && normalizedCleaned && (nm.includes(normalizedCleaned) || normalizedCleaned.includes(nm))) {
-                        targetWords.add(w.word);
-                        matched = true;
-                        break;
-                    }
-                }
-                if (matched) {
-                    UI.addLogMessage('[子串匹配] 通过 clean_meanings/meanings/match_keys 命中: ' + w.word, 'info');
-                }
-            }
-        }
-
-        if (!isChineseInput && targetWords.size === 0) {
-            UI.addLogMessage('[索引未命中] 英文输入，遍历词库进行单词/变体匹配...', 'info');
-            for (var _i22 = 0; _i22 < wordsList.length; _i22++) {
-                var w2 = wordsList[_i22];
-                if (Utils.normalizeText(w2.word) === normalizedCleaned || Utils.normalizeEntryKey(w2.word) === entryKeyCleaned) {
-                    targetWords.add(w2.word);
-                }
-                for (var _i23 = 0; _i23 < w2.variants.length; _i23++) {
-                    var variant = w2.variants[_i23];
-                    if (Utils.normalizeText(variant) === normalizedCleaned || Utils.normalizeEntryKey(variant) === entryKeyCleaned) {
-                        targetWords.add(w2.word);
-                    }
-                }
-            }
-        }
-
-        var phraseCandidateCount = candidates.filter(function(c) { return c && c.includes(' '); }).length;
-        var isPhraseQuestion = isChineseInput && candidates.length > 0 && phraseCandidateCount / candidates.length >= 0.5;
-
-        if (isPhraseQuestion) {
-            UI.addLogMessage('[短语检测] 空格选项占比=' + Math.round(phraseCandidateCount / candidates.length * 100) + '%，判定为短语题', 'info');
-
-            var directPhraseScores = [];
-            for (var i = 0; i < candidates.length; i++) {
-                var candidate = candidates[i];
-                if (!candidate) continue;
-
-                var cleanCand = Utils.removePartOfSpeech(candidate);
-                var candKey = Utils.normalizeEntryKey(cleanCand);
-                var exactKey = Utils.normalizeText(cleanCand);
-
-                var foundWord = null;
-                var phraseHits = byQuestion[exactKey] || byQuestion[candKey] || byQuestion[cleanCand];
-                if (phraseHits) {
-                    for (var phi = 0; phi < phraseHits.length; phi++) {
-                        var pw = phraseHits[phi];
-                        var pwi = byWord[pw];
-                        if (pwi && pwi.is_phrase) {
-                            foundWord = pw;
-                            break;
-                        }
-                    }
-                    if (!foundWord && phraseHits.length > 0) foundWord = phraseHits[0];
-                }
-
-                var matchedScore = 0;
-                if (foundWord) {
-                    var foundInfo = byWord[foundWord];
-                    if (foundInfo && foundInfo.is_phrase) {
-                        matchedScore = Utils.calculatePhraseMeaningMatchScore(word, foundWord, isChineseInput, foundInfo);
-                        if (matchedScore > 0) {
-                            UI.addLogMessage('[短语直连] 候选[' + i + ']="' + candidate + '" 命中短语 "' + foundWord + '"，得分=' + Math.round(matchedScore) + '%', 'info');
-                        }
-                    }
-                }
-                directPhraseScores.push({ index: i, candidate: candidate, score: matchedScore, phraseWord: foundWord });
-            }
-
-            directPhraseScores.sort(function(a, b) { return b.score - a.score; });
-            var bestDirect = directPhraseScores[0];
-
-            if (bestDirect && bestDirect.score >= 80) {
-                UI.addLogMessage('[结果] 短语直连最优: [' + bestDirect.index + '] ' + bestDirect.candidate + '，得分=' + Math.round(bestDirect.score) + '%', 'success');
-                State.lastMatchScores = directPhraseScores;
-                State.matchCount++;
-                return bestDirect.index;
-            }
-
-            if (bestDirect && bestDirect.score > 0) {
-                UI.addLogMessage('[短语直连] 最高分仅' + Math.round(bestDirect.score) + '%，未达阈值，继续后续评分', 'info');
-            } else {
-                UI.addLogMessage('[短语直连] 未直接命中任何短语，启用原短语索引扩展', 'info');
-            }
-
-            var phraseIndex = State.jsonData.index.phrase_index || {};
-            var expandedTargets = new Set();
-            var _arr7 = Array.from(targetWords);
-            for (var _i24 = 0; _i24 < _arr7.length; _i24++) {
-                var tw = _arr7[_i24];
-                var lowerTw = tw.toLowerCase();
-                if (phraseIndex[lowerTw]) {
-                    for (var _i25 = 0; _i25 < phraseIndex[lowerTw].length; _i25++) {
-                        var phrase = phraseIndex[lowerTw][_i25];
-                        expandedTargets.add(phrase);
-                    }
-                }
-                var wordInfo = byWord[tw];
-                if (wordInfo && wordInfo.is_phrase) {
-                    expandedTargets.add(tw);
-                }
-            }
-            if (expandedTargets.size > 0) {
-                targetWords = expandedTargets;
-                UI.addLogMessage('[短语扩展] 扩展后目标词=' + JSON.stringify(Array.from(targetWords)), 'info');
-            } else {
-                UI.addLogMessage('[短语扩展] 未能扩展出短语目标词，继续使用原目标词', 'info');
-            }
-        }
-
-        UI.addLogMessage('[目标] 命中目标词=' + JSON.stringify(Array.from(targetWords)) + ' (共' + targetWords.size + '个)', targetWords.size > 0 ? 'info' : 'warning');
-
-        var bestIndex = 0;
-        var bestScore = -1;
-        var secondBestScore = -1;
-        var scoreDetails = [];
-
-        for (var i2 = 0; i2 < candidates.length; i2++) {
-            var candidate2 = candidates[i2];
-            if (!candidate2) continue;
-
-            var maxScore = 0;
-            var cleanedCandidate = Utils.removePartOfSpeech(candidate2);
-            var normalizedCandidate = Utils.normalizeText(cleanedCandidate);
-            var candidateKey = Utils.normalizeEntryKey(cleanedCandidate);
-            var candidatePosSet = Utils.extractPosSet(candidate2);
-
-            var _arr8 = Array.from(targetWords);
-            for (var _i26 = 0; _i26 < _arr8.length; _i26++) {
-                var targetWord = _arr8[_i26];
-                var wordInfo2 = byWord[targetWord];
-                if (!wordInfo2) continue;
-
-                var wordEntry = wordsList.find(function(w3) { return w3.word === targetWord; });
-
-                if (isChineseInput) {
-                    var score = 0;
-                    var scoreReason = '';
-
-                    if (normalizedCandidate === Utils.normalizeText(targetWord) || candidateKey === Utils.normalizeEntryKey(targetWord)) {
-                        score = 100;
-                        scoreReason = '完全匹配';
-                    } else if (wordEntry && wordEntry.variants.includes(candidate2.trim())) {
-                        score = 95;
-                        scoreReason = '变体精确匹配';
-                    } else if (wordEntry) {
-                        for (var _i27 = 0; _i27 < wordEntry.variants.length; _i27++) {
-                            var variant2 = wordEntry.variants[_i27];
-                            if (Utils.normalizeText(variant2) === normalizedCandidate || Utils.normalizeEntryKey(variant2) === candidateKey) {
-                                score = 95;
-                                scoreReason = '变体归一化匹配';
-                                break;
-                            }
-                        }
-                    }
-
-                    if (score === 0) {
-                        var sim = Utils.calculateSimilarity(candidate2, targetWord);
-                        if (sim > 50) {
-                            score = sim * 0.7;
-                            scoreReason = '相似度=' + Math.round(sim) + '*0.7';
-                        }
-                    }
-
-                    if (score > 0) {
-                        var posBonus = Utils.isPosCompatible(candidatePosSet, questionPosSet) ? 1.0 : 0.6;
-                        if (posBonus < 1.0) {
-                            scoreReason += ' | 词性不兼容*0.6';
-                        }
-                        score *= posBonus;
-                    }
-
-                    if (score > 0) {
-                        UI.addLogMessage('[评分] 候选[' + i2 + ']="' + candidate2 + '" vs 目标="' + targetWord + '" → ' + Math.round(score) + '% (' + scoreReason + ')', 'info');
-                    }
-                    maxScore = Math.max(maxScore, score);
-                } else {
-                    var score2 = 0;
-                    var scoreReason2 = '';
-
-                    for (var _i28 = 0; _i28 < wordInfo2.meanings.length; _i28++) {
-                        var meaning = wordInfo2.meanings[_i28];
-                        var nm2 = Utils.normalizeText(meaning);
-                        if (normalizedCandidate === nm2) {
-                            score2 = 100;
-                            scoreReason2 = '释义完全匹配="' + meaning + '"';
-                            break;
-                        }
-                        var meaningParts = meaning.split(/[，,、；;]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-                        for (var pi = 0; pi < meaningParts.length; pi++) {
-                            var part = meaningParts[pi];
-                            var np = Utils.normalizeText(part);
-                            if (np === normalizedCandidate) {
-                                var baseScore = (part.length >= 2) ? 90 : 70;
-                                if (baseScore > score2) {
-                                    score2 = baseScore;
-                                    scoreReason2 = '释义分项完全匹配="' + part + '"';
-                                }
-                            } else if (np && normalizedCandidate && (np.includes(normalizedCandidate) || normalizedCandidate.includes(np))) {
-                                var pMinLen = Math.min(normalizedCandidate.length, np.length);
-                                var pMaxLen = Math.max(normalizedCandidate.length, np.length);
-                                var baseScore2 = (part.length >= 2) ? 90 : 70;
-                                var partScore = (pMinLen / pMaxLen) * baseScore2;
-                                if (partScore > score2) {
-                                    score2 = partScore;
-                                    scoreReason2 = '释义分项子串匹配="' + part + '" (' + pMinLen + '/' + pMaxLen + ')';
-                                }
-                            }
-                        }
-                        if (score2 === 100) break;
-                    }
-
-                    if (score2 === 0) {
-                        var bqNorm = byQuestion[normalizedCandidate];
-                        if (bqNorm && bqNorm.indexOf(targetWord) !== -1) {
-                            score2 = 85;
-                            scoreReason2 = 'byQuestion归一化命中';
-                        }
-                    }
-                    if (score2 === 0) {
-                        var bqKey = byQuestion[candidateKey];
-                        if (bqKey && bqKey.indexOf(targetWord) !== -1) {
-                            score2 = 85;
-                            scoreReason2 = 'byQuestion entryKey命中';
-                        }
-                    }
-
-                    if (score2 === 0) {
-                        for (var _i29 = 0; _i29 < wordInfo2.meanings.length; _i29++) {
-                            var meaning2 = wordInfo2.meanings[_i29];
-                            var candChineseLen = (cleanedCandidate.match(/[\u4e00-\u9fff]/g) || []).length;
-                            var meanChineseLen = (meaning2.match(/[\u4e00-\u9fff]/g) || []).length;
-                            var lenWeight = (candChineseLen > 0 && meanChineseLen > 0)
-                                ? Math.sqrt(Math.min(candChineseLen, meanChineseLen) / Math.max(candChineseLen, meanChineseLen))
-                                : 1;
-
-                            var overlap = Utils.chineseCharOverlap(cleanedCandidate, meaning2);
-                            if (overlap >= 0.3) {
-                                var overlapScore = overlap * 80 * lenWeight;
-                                if (overlapScore > score2) {
-                                    score2 = overlapScore;
-                                    scoreReason2 = '汉字重叠=' + Math.round(overlap * 100) + '%*80*权重' + lenWeight.toFixed(2) + ' vs "' + meaning2 + '"';
-                                }
-                            }
-                            var coverage = Utils.chineseCharCoverage(cleanedCandidate, meaning2);
-                            if (coverage >= 0.4) {
-                                var covScore = coverage * 70 * lenWeight;
-                                if (covScore > score2) {
-                                    score2 = covScore;
-                                    scoreReason2 = '汉字覆盖=' + Math.round(coverage * 100) + '%*70*权重' + lenWeight.toFixed(2) + ' vs "' + meaning2 + '"';
-                                }
-                            }
-                        }
-                    }
-
-                    if (score2 === 0) {
-                        var sim2 = Utils.calculateSimilarity(cleanedCandidate, cleanedWord);
-                        if (sim2 > 30) {
-                            score2 = sim2 * 0.3;
-                            scoreReason2 = '整体相似度=' + Math.round(sim2) + '*0.3';
-                        }
-                    }
-
-                    if (score2 > 0) {
-                        var posBonus2 = Utils.isPosCompatible(candidatePosSet, questionPosSet) ? 1.0 : 0.6;
-                        if (posBonus2 < 1.0) {
-                            scoreReason2 += ' | 词性不兼容*0.6';
-                        }
-                        score2 *= posBonus2;
-                    }
-
-                    if (score2 > 0) {
-                        UI.addLogMessage('[评分] 候选[' + i2 + ']="' + candidate2 + '" vs 目标="' + targetWord + '" → ' + Math.round(score2) + '% (' + scoreReason2 + ')', 'info');
-                    }
-                    maxScore = Math.max(maxScore, score2);
-                }
-            }
-
-            if (targetWords.size === 0) {
-                if (isChineseInput) {
-                    for (var _i30 = 0; _i30 < wordsList.length; _i30++) {
-                        var w4 = wordsList[_i30];
-                        var meaningMatch = false;
-                        for (var _i31 = 0; _i31 < w4.meanings.length; _i31++) {
-                            var meaning3 = w4.meanings[_i31];
-                            var nm3 = Utils.normalizeText(meaning3);
-                            if (nm3 && normalizedCleaned && (nm3.includes(normalizedCleaned) || normalizedCleaned.includes(nm3))) {
-                                meaningMatch = true;
-                                break;
-                            }
-                        }
-                        if (meaningMatch) {
-                            if (normalizedCandidate === Utils.normalizeText(w4.word) || candidateKey === Utils.normalizeEntryKey(w4.word)) {
-                                UI.addLogMessage('[兜底匹配] 候选[' + i2 + ']="' + candidate2 + '" → word="' + w4.word + '" (80%)', 'info');
-                                maxScore = Math.max(maxScore, 80);
-                            }
-                        }
-                    }
-                } else {
-                    for (var _i32 = 0; _i32 < wordsList.length; _i32++) {
-                        var w5 = wordsList[_i32];
-                        if (Utils.normalizeText(w5.word) === normalizedCleaned || Utils.normalizeEntryKey(w5.word) === entryKeyCleaned) {
-                            for (var _i33 = 0; _i33 < w5.meanings.length; _i33++) {
-                                var meaning4 = w5.meanings[_i33];
-                                var nm4 = Utils.normalizeText(meaning4);
-                                if (normalizedCandidate === nm4) {
-                                    UI.addLogMessage('[兜底匹配] 候选[' + i2 + ']="' + candidate2 + '" → 释义完全匹配 (100%)', 'info');
-                                    maxScore = Math.max(maxScore, 100);
-                                } else {
-                                    var dbParts = meaning4.split(/[，,、；;]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-                                    for (var dpi = 0; dpi < dbParts.length; dpi++) {
-                                        var dbPart = dbParts[dpi];
-                                        var dbnp = Utils.normalizeText(dbPart);
-                                        if (dbnp === normalizedCandidate) {
-                                            var dbBase = (dbPart.length >= 2) ? 90 : 70;
-                                            UI.addLogMessage('[兜底匹配] 候选[' + i2 + ']="' + candidate2 + '" → 释义分项完全匹配="' + dbPart + '" (' + dbBase + '%)', 'info');
-                                            maxScore = Math.max(maxScore, dbBase);
-                                        } else if (dbnp && normalizedCandidate && (dbnp.includes(normalizedCandidate) || normalizedCandidate.includes(dbnp))) {
-                                            var dpMin = Math.min(normalizedCandidate.length, dbnp.length);
-                                            var dpMax = Math.max(normalizedCandidate.length, dbnp.length);
-                                            var dbBase2 = (dbPart.length >= 2) ? 90 : 70;
-                                            var dpScore = (dpMin / dpMax) * dbBase2;
-                                            if (dpScore > maxScore) {
-                                                UI.addLogMessage('[兜底匹配] 候选[' + i2 + ']="' + candidate2 + '" → 释义分项子串匹配="' + dbPart + '" (' + Math.round(dpScore) + '%)', 'info');
-                                                maxScore = dpScore;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (maxScore < 20 && isChineseInput) {
-                var chineseChars = (cleanedCandidate.match(/[\u4e00-\u9fff]/g) || []);
-                if (chineseChars.length >= 2) {
-                    var appearsInOther = false;
-                    var appearsInSelf = false;
-                    for (var _i34 = 0; _i34 < wordsList.length; _i34++) {
-                        var w6 = wordsList[_i34];
-                        for (var _i35 = 0; _i35 < w6.meanings.length; _i35++) {
-                            var meaning5 = w6.meanings[_i35];
-                            if (meaning5.includes(cleanedCandidate)) {
-                                if (targetWords.has(w6.word)) {
-                                    appearsInSelf = true;
-                                } else {
-                                    appearsInOther = true;
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if (appearsInOther && !appearsInSelf) {
-                        UI.addLogMessage('[惩罚] 候选[' + i2 + ']="' + candidate2 + '" 出现在其他词条释义中，降权*0.2', 'warning');
-                        maxScore *= 0.2;
-                    } else if (!appearsInOther && !appearsInSelf) {
-                        maxScore = Math.max(maxScore, 15);
-                    }
-                }
-            }
-
-            scoreDetails.push({ index: i2, candidate: candidate2, score: maxScore });
-
-            if (maxScore > bestScore) {
-                secondBestScore = bestScore;
-                bestScore = maxScore;
-                bestIndex = i2;
-            } else if (maxScore > secondBestScore) {
-                secondBestScore = maxScore;
-            }
-        }
-
-        var scoreGap = bestScore - secondBestScore;
-
-        UI.addLogMessage('[结果] 所有候选评分: ' + scoreDetails.map(function(s) { return '[' + s.index + ']' + s.candidate + '=' + Math.round(s.score) + '%'; }).join(' | '), 'info');
-        State.lastMatchScores = scoreDetails.slice();
-
-        if (isChineseInput && bestScore === 0 && targetWords.size > 0) {
-            UI.addLogMessage('[反向查库] 中文→英文方向首轮全部0分，启用候选反向查词库', 'info');
-            for (var ri = 0; ri < candidates.length; ri++) {
-                var rCand = candidates[ri];
-                if (!rCand) continue;
-                var rCleaned = Utils.removePartOfSpeech(rCand);
-                var rNorm = Utils.normalizeText(rCleaned);
-                var rKey = Utils.normalizeEntryKey(rCleaned);
-                var rInfo = byWord[rCleaned] || byWord[rNorm] || byWord[rKey];
-                if (!rInfo) continue;
-                var rMaxScore = 0;
-                var rReason = '';
-                for (var rmi = 0; rmi < rInfo.meanings.length; rmi++) {
-                    var rMeaning = rInfo.meanings[rmi];
-                    var rnm = Utils.normalizeText(rMeaning);
-                    if (rnm === normalizedCleaned) {
-                        rMaxScore = 85;
-                        rReason = '反向释义完全匹配="' + rMeaning + '"';
-                        break;
-                    }
-                    var rParts = rMeaning.split(/[，,、；;]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-                    for (var rpi = 0; rpi < rParts.length; rpi++) {
-                        var rPart = rParts[rpi];
-                        var rpNorm = Utils.normalizeText(rPart);
-                        if (rpNorm === normalizedCleaned) {
-                            rMaxScore = 85;
-                            rReason = '反向分项完全匹配="' + rPart + '"';
-                            break;
-                        } else if (rpNorm && normalizedCleaned && (rpNorm.includes(normalizedCleaned) || normalizedCleaned.includes(rpNorm))) {
-                            var rpMin = Math.min(normalizedCleaned.length, rpNorm.length);
-                            var rpMax = Math.max(normalizedCleaned.length, rpNorm.length);
-                            var rpScore = (rpMin / rpMax) * 80;
-                            if (rpScore > rMaxScore) {
-                                rMaxScore = rpScore;
-                                rReason = '反向分项子串匹配="' + rPart + '" (' + rpMin + '/' + rpMax + ')';
-                            }
-                        }
-                    }
-                    if (rMaxScore >= 85) break;
-                }
-                if (rMaxScore > 0) {
-                    var rPosSet = Utils.extractPosSet(rCand);
-                    var rPosBonus = Utils.isPosCompatible(rPosSet, questionPosSet) ? 1.0 : 0.6;
-                    rMaxScore *= rPosBonus;
-                    UI.addLogMessage('[反向查库] 候选[' + ri + ']="' + rCand + '" → ' + Math.round(rMaxScore) + '% (' + rReason + ')', 'info');
-                }
-                if (rMaxScore > bestScore) {
-                    secondBestScore = bestScore;
-                    bestScore = rMaxScore;
-                    bestIndex = ri;
-                } else if (rMaxScore > secondBestScore) {
-                    secondBestScore = rMaxScore;
-                }
-            }
-            scoreGap = bestScore - secondBestScore;
-        }
-
-        if (!isChineseInput && (bestScore < 50 || scoreGap < 15) && targetWords.size > 0) {
-            UI.addLogMessage('[二轮兜底] 首轮不可信 (最佳=' + Math.round(bestScore) + '%, 分差=' + Math.round(scoreGap) + ')，启用纯净释义二轮匹配', 'info');
-
-            var round2BestIndex = bestIndex;
-            var round2BestScore = bestScore;
-
-            for (var i3 = 0; i3 < candidates.length; i3++) {
-                var candidate3 = candidates[i3];
-                if (!candidate3) continue;
-
-                var maxScore2 = 0;
-                var cleanedCandidate2 = Utils.removePartOfSpeech(candidate3);
-                var normalizedCandidate2 = Utils.normalizeText(cleanedCandidate2);
-
-                var _arr9 = Array.from(targetWords);
-                for (var _i36 = 0; _i36 < _arr9.length; _i36++) {
-                    var targetWord2 = _arr9[_i36];
-                    var wordInfo3 = byWord[targetWord2];
-                    if (!wordInfo3 || !wordInfo3.clean_meanings) continue;
-
-                    for (var _i37 = 0; _i37 < wordInfo3.clean_meanings.length; _i37++) {
-                        var cleanMeaning = wordInfo3.clean_meanings[_i37];
-                        var ncm = Utils.normalizeText(cleanMeaning);
-                        if (normalizedCandidate2 === ncm) {
-                            maxScore2 = Math.max(maxScore2, 100);
-                        } else {
-                            var r2Parts = cleanMeaning.split(/[，,、；;]/).map(function(p) { return p.trim(); }).filter(function(p) { return p && p.length >= 1; });
-                            for (var r2pi = 0; r2pi < r2Parts.length; r2pi++) {
-                                var r2Part = r2Parts[r2pi];
-                                var r2np = Utils.normalizeText(r2Part);
-                                if (r2np === normalizedCandidate2) {
-                                    var r2Base = (r2Part.length >= 2) ? 90 : 70;
-                                    maxScore2 = Math.max(maxScore2, r2Base);
-                                } else if (r2np && normalizedCandidate2 && (r2np.includes(normalizedCandidate2) || normalizedCandidate2.includes(r2np))) {
-                                    var r2Min = Math.min(normalizedCandidate2.length, r2np.length);
-                                    var r2Max = Math.max(normalizedCandidate2.length, r2np.length);
-                                    var r2Base2 = (r2Part.length >= 2) ? 90 : 70;
-                                    var r2Score = (r2Min / r2Max) * r2Base2;
-                                    maxScore2 = Math.max(maxScore2, r2Score);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (maxScore2 > round2BestScore) {
-                    round2BestScore = maxScore2;
-                    round2BestIndex = i3;
-                }
-            }
-
-            if (round2BestScore > bestScore) {
-                UI.addLogMessage('[二轮兜底] 二轮结果更优: [' + round2BestIndex + ']' + candidates[round2BestIndex] + ' (' + Math.round(round2BestScore) + '% > ' + Math.round(bestScore) + '%)', 'match');
-                bestIndex = round2BestIndex;
-                bestScore = round2BestScore;
-            } else {
-                UI.addLogMessage('[二轮兜底] 二轮未改善，保留首轮结果', 'info');
-            }
-        }
-
-        if (bestScore >= 90 || scoreGap >= 10) {
-            UI.addLogMessage('选择答案: [' + bestIndex + '] ' + candidates[bestIndex] + ' (匹配度: ' + Math.round(bestScore) + '%, 置信度: ' + Math.round(scoreGap) + ')', 'match');
-            State.matchCount++;
-            return bestIndex >= 0 ? bestIndex : 0;
-        } else if (bestScore >= 15) {
-            var confLevel = (bestScore >= 40 && scoreGap >= 5) ? '中置信' : '低置信';
-            UI.addLogMessage('选择答案(' + confLevel + '): [' + bestIndex + '] ' + candidates[bestIndex] + ' (匹配度: ' + Math.round(bestScore) + '%, 置信度: ' + Math.round(scoreGap) + ')', 'warning');
-            State.matchCount++;
-            return bestIndex >= 0 ? bestIndex : 0;
-        } else {
-            UI.addLogMessage('匹配度不够高，保持默认选择: [' + 0 + '] ' + candidates[0] + ' (最佳匹配度: ' + Math.round(bestScore) + '%, 次佳: ' + Math.round(secondBestScore) + '%)', 'warning');
-            State.missCount++;
-            UI.addLogMessage('[统计] 命中=' + State.matchCount + ' | 未命中=' + State.missCount + ' | 命中率=' + (State.matchCount + State.missCount > 0 ? Math.round(State.matchCount / (State.matchCount + State.missCount) * 100) : 0) + '%', 'info');
-            return 0;
-        }
-    }
-};
-
-var MatcherSimple = {
-    build: function(entryList) {
-        var words = [];
-        var byQuestion = {};
-        var byWord = {};
-        var seen = new Set();
-        var duplicateCount = 0;
-
-        for (var i = 0; i < entryList.length; i++) {
-            var rawEntry = entryList[i];
-            var std = MatcherFull.standardizeEntry(rawEntry);
-            var extraKeys = [];
-            for (var cm = 0; cm < std.clean_meanings.length; cm++) {
-                var cleanM = std.clean_meanings[cm];
-                extraKeys.push(cleanM);
-                var cmParts = cleanM.split(/[，,、]/);
-                for (var cp = 0; cp < cmParts.length; cp++) {
-                    var cmPart = cmParts[cp].trim();
-                    if (cmPart && cmPart.length >= 1) {
-                        extraKeys.push(cmPart);
-                        var noPosPart = cmPart.replace(/^[a-z]+(?:\s+[a-z]+)*\.\s*/, '').trim();
-                        if (noPosPart && noPosPart !== cmPart) extraKeys.push(noPosPart);
-                    }
-                }
-            }
-            for (var pm = 0; pm < std.meanings.length; pm++) {
-                var pmItem = std.meanings[pm];
-                var mvMatch = pmItem.match(/^modal\s+(?:verb|v)\.\s*/i);
-                if (mvMatch) {
-                    if (std.pos.indexOf('modal verb') === -1) std.pos.push('modal verb');
-                    if (std.pos.indexOf('v') === -1) std.pos.push('v');
-                    var afterMV = pmItem.substring(mvMatch[0].length).trim();
-                    afterMV = afterMV.replace(/[\(（][^\)）]*[\)）]/g, '').trim();
-                    if (afterMV) {
-                        extraKeys.push(afterMV);
-                        var afterParts = afterMV.split(/[，,、]/);
-                        for (var ap = 0; ap < afterParts.length; ap++) {
-                            var afterPart = afterParts[ap].trim();
-                            if (afterPart) extraKeys.push(afterPart);
-                        }
-                    }
-                }
-            }
-            for (var eki = 0; eki < extraKeys.length; eki++) {
-                if (extraKeys[eki] && std.match_keys.indexOf(extraKeys[eki]) === -1) {
-                    std.match_keys.push(extraKeys[eki]);
-                }
-            }
-            var dedupeKey = std.word + '_' + std.meaning_text;
-            if (seen.has(dedupeKey)) {
-                duplicateCount++;
-                continue;
-            }
-            seen.add(dedupeKey);
-            words.push(std);
-
-            for (var j = 0; j < std.match_keys.length; j++) {
-                var mk = std.match_keys[j];
-                if (mk) {
-                    if (!byQuestion[mk]) byQuestion[mk] = [];
-                    if (byQuestion[mk].indexOf(std.word) === -1) byQuestion[mk].push(std.word);
-                }
-                var nk = Utils.normalizeText(mk);
-                if (nk) {
-                    if (!byQuestion[nk]) byQuestion[nk] = [];
-                    if (byQuestion[nk].indexOf(std.word) === -1) byQuestion[nk].push(std.word);
-                }
-                var ek = Utils.normalizeEntryKey(mk);
-                if (ek && ek !== nk) {
-                    if (!byQuestion[ek]) byQuestion[ek] = [];
-                    if (byQuestion[ek].indexOf(std.word) === -1) byQuestion[ek].push(std.word);
-                }
-            }
-
-            for (var k = 0; k < std.variants.length; k++) {
-                var v = std.variants[k];
-                if (v) {
-                    if (!byQuestion[v]) byQuestion[v] = [];
-                    if (byQuestion[v].indexOf(std.word) === -1) byQuestion[v].push(std.word);
-                }
-                var nv = Utils.normalizeText(v);
-                if (nv) {
-                    if (!byQuestion[nv]) byQuestion[nv] = [];
-                    if (byQuestion[nv].indexOf(std.word) === -1) byQuestion[nv].push(std.word);
-                }
-                var ev = Utils.normalizeEntryKey(v);
-                if (ev) {
-                    if (!byQuestion[ev]) byQuestion[ev] = [];
-                    if (byQuestion[ev].indexOf(std.word) === -1) byQuestion[ev].push(std.word);
-                }
-            }
-
-            if (!byWord[std.word]) {
-                byWord[std.word] = {
-                    pos: std.pos,
-                    meanings: std.meanings,
-                    clean_meanings: std.clean_meanings,
-                    is_phrase: std.is_phrase
-                };
-            }
-        }
-
-        UI.addLogMessage('[Simple] 词库标准化完成: 原始 ' + entryList.length + ' 条 → 标准化后 ' + words.length + ' 条 (去重 ' + duplicateCount + ' 条)', 'info');
-        UI.addLogMessage('[Simple] [索引] byQuestion键数=' + Object.keys(byQuestion).length + ' | byWord键数=' + Object.keys(byWord).length, 'info');
-
-        return {
-            version: '3.6',
-            index: {
-                by_question: byQuestion,
-                by_word: byWord,
-                phrase_index: {}
-            },
-            words: words
-        };
-    },
-
-    match: function(word, candidates) {
-        if (!State.jsonData || !State.jsonData.version || State.jsonData.version !== '3.6') {
-            UI.addLogMessage('[Simple] 词库未就绪，跳过匹配', 'warning');
-            State.lastMatchScores = [];
-            return 0;
-        }
-
-        candidates = candidates.map(function(c) { return Utils.decodeHtmlEntities(c); });
-
-        var byQuestion = State.jsonData.index.by_question;
-        var byWord = State.jsonData.index.by_word;
-        var wordsList = State.jsonData.words;
-
-        var isChineseInput = /[\u4e00-\u9fff]/.test(word);
-        var questionPosSet = Utils.extractPosSet(word);
-        var cleanedWord = Utils.removePartOfSpeech(word);
-        var normalizedWord = Utils.normalizeText(word);
-        var normalizedCleaned = Utils.normalizeText(cleanedWord);
-        var entryKeyWord = Utils.normalizeEntryKey(word);
-        var entryKeyCleaned = Utils.normalizeEntryKey(cleanedWord);
-
-        var modalVerbDetected = /^modal\s+(?:verb|v)\./i.test(word);
-        if (modalVerbDetected) {
-            questionPosSet.delete('other');
-            questionPosSet.add('v');
-            questionPosSet.add('modal verb');
-        }
-
-        UI.addLogMessage('[Simple] 原始题目="' + word + '" | 是否中文=' + isChineseInput + ' | 清理后="' + cleanedWord + '" | 归一化="' + normalizedCleaned + '" | entryKey="' + entryKeyCleaned + '"' + (modalVerbDetected ? ' | modal verb已识别' : ''), 'info');
-        UI.addLogMessage('[Simple] 题目词性=' + JSON.stringify(Array.from(questionPosSet)) + ' | 候选数=' + candidates.length, 'info');
-
-        var targetWords = new Set();
-
-        var lookupKeys = [word, normalizedWord, cleanedWord, normalizedCleaned, entryKeyWord, entryKeyCleaned];
-        for (var i = 0; i < lookupKeys.length; i++) {
-            var key = lookupKeys[i];
-            if (key && byQuestion[key]) {
-                var matchedWords = byQuestion[key];
-                for (var mw = 0; mw < matchedWords.length; mw++) {
-                    targetWords.add(matchedWords[mw]);
-                    UI.addLogMessage('[Simple] [索引命中] key="' + key + '" → word="' + matchedWords[mw] + '"', 'info');
-                }
-            }
-        }
-
-        if (isChineseInput) {
-            UI.addLogMessage('[Simple] [子串补充] 中文输入，遍历词库进行子串匹配补充... (当前目标数=' + targetWords.size + ')', 'info');
-            for (var j = 0; j < wordsList.length; j++) {
-                var w = wordsList[j];
-                var checkList = (w.clean_meanings || []).concat(w.meanings).concat(w.match_keys);
-                var matched = false;
-                for (var k = 0; k < checkList.length; k++) {
-                    var item = checkList[k];
-                    var nm = Utils.normalizeText(item);
-                    if (nm && normalizedCleaned && (nm.includes(normalizedCleaned) || normalizedCleaned.includes(nm))) {
-                        targetWords.add(w.word);
-                        matched = true;
-                        break;
-                    }
-                }
-                if (matched) {
-                    UI.addLogMessage('[Simple] [子串匹配] 命中: ' + w.word, 'info');
-                }
-            }
-        }
-
-        if (!isChineseInput && targetWords.size === 0) {
-            UI.addLogMessage('[Simple] [索引未命中] 英文输入，遍历词库进行单词/变体匹配...', 'info');
-            for (var m = 0; m < wordsList.length; m++) {
-                var w2 = wordsList[m];
-                if (Utils.normalizeText(w2.word) === normalizedCleaned || Utils.normalizeEntryKey(w2.word) === entryKeyCleaned) {
-                    targetWords.add(w2.word);
-                }
-                for (var n = 0; n < w2.variants.length; n++) {
-                    var variant = w2.variants[n];
-                    if (Utils.normalizeText(variant) === normalizedCleaned || Utils.normalizeEntryKey(variant) === entryKeyCleaned) {
-                        targetWords.add(w2.word);
-                    }
-                }
-            }
-        }
-
-        if (targetWords.size > 1 && questionPosSet.size > 0 && !questionPosSet.has('other')) {
-            var posFiltered = new Set();
-            var targetArr0 = Array.from(targetWords);
-            for (var di = 0; di < targetArr0.length; di++) {
-                var tw = targetArr0[di];
-                var twInfo = byWord[tw];
-                if (twInfo) {
-                    var twPosSet = new Set(twInfo.pos.map(function(p) { return p.replace(/\./g, '').toLowerCase().replace(/^vt$|^vi$/, 'v'); }));
-                    var posMatch = false;
-                    var qPosArr = Array.from(questionPosSet);
-                    for (var qi = 0; qi < qPosArr.length; qi++) {
-                        if (twPosSet.has(qPosArr[qi])) {
-                            posMatch = true;
-                            break;
-                        }
-                    }
-                    if (posMatch) posFiltered.add(tw);
-                }
-            }
-            if (posFiltered.size > 0 && posFiltered.size < targetWords.size) {
-                targetWords = posFiltered;
-                UI.addLogMessage('[Simple] [词性消歧] 根据题目词性筛选后目标=' + JSON.stringify(Array.from(targetWords)), 'info');
-            }
-        }
-
-        UI.addLogMessage('[Simple] [目标] 命中目标词=' + JSON.stringify(Array.from(targetWords)) + ' (共' + targetWords.size + '个)', targetWords.size > 0 ? 'info' : 'warning');
-
-        var bestIndex = 0;
-        var bestScore = -1;
-        var secondBestScore = -1;
-        var scoreDetails = [];
-
-        for (var ci = 0; ci < candidates.length; ci++) {
-            var candidate = candidates[ci];
-            if (!candidate) continue;
-
-            var maxScore = 0;
-            var cleanedCandidate = Utils.removePartOfSpeech(candidate);
-            var normalizedCandidate = Utils.normalizeText(cleanedCandidate);
-            var candidateKey = Utils.normalizeEntryKey(cleanedCandidate);
-            var candidatePosSet = Utils.extractPosSet(candidate);
-
-            var targetArr = Array.from(targetWords);
-            for (var ti = 0; ti < targetArr.length; ti++) {
-                var targetWord = targetArr[ti];
-                var wordInfo = byWord[targetWord];
-                if (!wordInfo) continue;
-
-                var wordEntry = null;
-                for (var wi = 0; wi < wordsList.length; wi++) {
-                    if (wordsList[wi].word === targetWord) {
-                        wordEntry = wordsList[wi];
-                        break;
-                    }
-                }
-
-                if (isChineseInput) {
-                    var score = 0;
-                    var scoreReason = '';
-
-                    if (candidateKey === Utils.normalizeEntryKey(targetWord)) {
-                        score = 100;
-                        scoreReason = '完全匹配';
-                    } else if (wordEntry && wordEntry.variants.indexOf(candidate.trim()) !== -1) {
-                        score = 95;
-                        scoreReason = '变体精确匹配';
-                    } else if (wordEntry) {
-                        for (var vi = 0; vi < wordEntry.variants.length; vi++) {
-                            var v = wordEntry.variants[vi];
-                            if (Utils.normalizeEntryKey(v) === candidateKey) {
-                                score = 95;
-                                scoreReason = '变体归一化匹配';
-                                break;
-                            }
-                        }
-                    }
-
-                    if (score === 0) {
-                        var sim = Utils.calculateSimilarity(candidate, targetWord);
-                        if (sim > 50) {
-                            score = sim * 0.7;
-                            scoreReason = '相似度=' + Math.round(sim) + '*0.7';
-                        }
-                    }
-
-                    if (score > 0) {
-                        var posBonus = Utils.isPosCompatible(candidatePosSet, questionPosSet) ? 1.0 : 0.6;
-                        if (posBonus < 1.0) {
-                            scoreReason += ' | 词性不兼容*0.6';
-                        }
-                        score *= posBonus;
-                    }
-
-                    if (score > 0) {
-                        UI.addLogMessage('[Simple] [评分] 候选[' + ci + ']="' + candidate + '" vs 目标="' + targetWord + '" → ' + Math.round(score) + '% (' + scoreReason + ')', 'info');
-                    }
-                    maxScore = Math.max(maxScore, score);
-                } else {
-                    var score2 = 0;
-                    var scoreReason2 = '';
-
-                    for (var mi = 0; mi < wordInfo.meanings.length; mi++) {
-                        var meaning = wordInfo.meanings[mi];
-                        var nm = Utils.normalizeText(meaning);
-                        if (normalizedCandidate === nm) {
-                            score2 = 100;
-                            scoreReason2 = '释义完全匹配="' + meaning + '"';
-                            break;
-                        }
-                    }
-
-                    if (score2 < 90) {
-                        var meaningsFG = (wordInfo.clean_meanings || []).concat(wordInfo.meanings);
-                        for (var miFG = 0; miFG < meaningsFG.length; miFG++) {
-                            var mFG = meaningsFG[miFG];
-                            var commaParts = mFG.split(/[，,、]/);
-                            for (var cp = 0; cp < commaParts.length; cp++) {
-                                var commaPart = commaParts[cp].trim();
-                                var posParts = commaPart.split(/\s+(?=[a-z]+\.)/);
-                                for (var pp = 0; pp < posParts.length; pp++) {
-                                    var finePart = posParts[pp].trim().replace(/^[a-z]+\.\s*/, '');
-                                    if (!finePart) continue;
-                                    var nfp = Utils.normalizeText(finePart);
-                                    if (!nfp) continue;
-
-                                    if (normalizedCandidate === nfp) {
-                                        score2 = 95;
-                                        scoreReason2 = '细粒度完全匹配="' + finePart + '"';
-                                        break;
-                                    }
-                                    if (nfp && normalizedCandidate && (nfp.includes(normalizedCandidate) || normalizedCandidate.includes(nfp))) {
-                                        var fpMinLen = Math.min(normalizedCandidate.length, nfp.length);
-                                        var fpMaxLen = Math.max(normalizedCandidate.length, nfp.length);
-                                        var fpScore = (fpMinLen / fpMaxLen) * 90;
-                                        if (fpScore > score2) {
-                                            score2 = fpScore;
-                                            scoreReason2 = '细粒度子串匹配="' + finePart + '" (' + fpMinLen + '/' + fpMaxLen + ')';
-                                        }
-                                    }
-                                }
-                                if (score2 >= 95) break;
-                            }
-                            if (score2 >= 95) break;
-                        }
-                    }
-
-                    if (score2 === 0) {
-                        for (var mi3 = 0; mi3 < wordInfo.meanings.length; mi3++) {
-                            var meaning3 = wordInfo.meanings[mi3];
-                            var nm3 = Utils.normalizeText(meaning3);
-                            if (nm3 && normalizedCandidate) {
-                                if (nm3.includes(normalizedCandidate) || normalizedCandidate.includes(nm3)) {
-                                    var minLen3 = Math.min(normalizedCandidate.length, nm3.length);
-                                    var maxLen3 = Math.max(normalizedCandidate.length, nm3.length);
-                                    var subScore3 = (minLen3 / maxLen3) * 90;
-                                    if (subScore3 > score2) {
-                                        score2 = subScore3;
-                                        scoreReason2 = '释义子串匹配="' + meaning3 + '" (' + minLen3 + '/' + maxLen3 + ')';
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (score2 < 85) {
-                        if (byQuestion[normalizedCandidate]) {
-                            var bqWords = byQuestion[normalizedCandidate];
-                            for (var bq = 0; bq < bqWords.length; bq++) {
-                                if (bqWords[bq] === targetWord) {
-                                    if (85 > score2) {
-                                        score2 = 85;
-                                        scoreReason2 = 'byQuestion归一化命中';
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        if (score2 < 85 && byQuestion[candidateKey]) {
-                            var bqWords2 = byQuestion[candidateKey];
-                            for (var bq2 = 0; bq2 < bqWords2.length; bq2++) {
-                                if (bqWords2[bq2] === targetWord) {
-                                    score2 = 85;
-                                    scoreReason2 = 'byQuestion entryKey命中';
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    if (score2 === 0) {
-                        for (var mi2 = 0; mi2 < wordInfo.meanings.length; mi2++) {
-                            var meaning2 = wordInfo.meanings[mi2];
-                            var candChineseLen = (cleanedCandidate.match(/[\u4e00-\u9fff]/g) || []).length;
-                            var meanChineseLen = (meaning2.match(/[\u4e00-\u9fff]/g) || []).length;
-                            var lenWeight = (candChineseLen > 0 && meanChineseLen > 0)
-                                ? Math.sqrt(Math.min(candChineseLen, meanChineseLen) / Math.max(candChineseLen, meanChineseLen))
-                                : 1;
-
-                            var overlap = Utils.chineseCharOverlap(cleanedCandidate, meaning2);
-                            if (overlap >= 0.3) {
-                                var overlapScore = overlap * 80 * lenWeight;
-                                if (overlapScore > score2) {
-                                    score2 = overlapScore;
-                                    scoreReason2 = '汉字重叠=' + Math.round(overlap * 100) + '%*80*权重' + lenWeight.toFixed(2) + ' vs "' + meaning2 + '"';
-                                }
-                            }
-                        }
-                    }
-
-                    if (score2 === 0) {
-                        var sim2 = Utils.calculateSimilarity(cleanedCandidate, cleanedWord);
-                        if (sim2 > 30) {
-                            score2 = sim2 * 0.3;
-                            scoreReason2 = '整体相似度=' + Math.round(sim2) + '*0.3';
-                        }
-                    }
-
-                    if (score2 > 0) {
-                        var posBonus2 = Utils.isPosCompatible(candidatePosSet, questionPosSet) ? 1.0 : 0.6;
-                        if (posBonus2 < 1.0) {
-                            scoreReason2 += ' | 词性不兼容*0.6';
-                        }
-                        score2 *= posBonus2;
-                    }
-
-                    if (score2 > 0) {
-                        UI.addLogMessage('[Simple] [评分] 候选[' + ci + ']="' + candidate + '" vs 目标="' + targetWord + '" → ' + Math.round(score2) + '% (' + scoreReason2 + ')', 'info');
-                    }
-                    maxScore = Math.max(maxScore, score2);
-                }
-            }
-
-            if (targetWords.size === 0) {
-                if (isChineseInput) {
-                    for (var fi = 0; fi < wordsList.length; fi++) {
-                        var fw = wordsList[fi];
-                        var meaningMatch = false;
-                        for (var fj = 0; fj < fw.meanings.length; fj++) {
-                            var fm = fw.meanings[fj];
-                            var fnm = Utils.normalizeText(fm);
-                            if (fnm && normalizedCleaned && (fnm.includes(normalizedCleaned) || normalizedCleaned.includes(fnm))) {
-                                meaningMatch = true;
-                                break;
-                            }
-                        }
-                        if (meaningMatch) {
-                            if (normalizedCandidate === Utils.normalizeText(fw.word) || candidateKey === Utils.normalizeEntryKey(fw.word)) {
-                                UI.addLogMessage('[Simple] [兜底匹配] 候选[' + ci + ']="' + candidate + '" → word="' + fw.word + '" (80%)', 'info');
-                                maxScore = Math.max(maxScore, 80);
-                            }
-                        }
-                    }
-                } else {
-                    for (var ei = 0; ei < wordsList.length; ei++) {
-                        var ew = wordsList[ei];
-                        var wordMatch = Utils.normalizeText(ew.word) === normalizedCleaned || Utils.normalizeEntryKey(ew.word) === entryKeyCleaned;
-                        if (!wordMatch) {
-                            for (var evi = 0; evi < ew.variants.length; evi++) {
-                                var ev = ew.variants[evi];
-                                if (Utils.normalizeText(ev) === normalizedCleaned || Utils.normalizeEntryKey(ev) === entryKeyCleaned) {
-                                    wordMatch = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (wordMatch) {
-                            for (var emi = 0; emi < ew.meanings.length; emi++) {
-                                var em = ew.meanings[emi];
-                                var enm = Utils.normalizeText(em);
-                                if (normalizedCandidate === enm) {
-                                    UI.addLogMessage('[Simple] [兜底匹配] 候选[' + ci + ']="' + candidate + '" → 释义完全匹配 (100%)', 'info');
-                                    maxScore = Math.max(maxScore, 100);
-                                } else if (enm && normalizedCandidate && (enm.includes(normalizedCandidate) || normalizedCandidate.includes(enm))) {
-                                    var eMinLen = Math.min(normalizedCandidate.length, enm.length);
-                                    var eMaxLen = Math.max(normalizedCandidate.length, enm.length);
-                                    var eSubScore = (eMinLen / eMaxLen) * 90;
-                                    UI.addLogMessage('[Simple] [兜底匹配] 候选[' + ci + ']="' + candidate + '" → 释义子串匹配 (' + Math.round(eSubScore) + '%)', 'info');
-                                    maxScore = Math.max(maxScore, eSubScore);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (isChineseInput && maxScore < 50) {
-                var candWInfo = byWord[cleanedCandidate];
-                if (!candWInfo) {
-                    for (var cwi = 0; cwi < wordsList.length; cwi++) {
-                        if (Utils.normalizeEntryKey(wordsList[cwi].word) === candidateKey) {
-                            candWInfo = byWord[wordsList[cwi].word];
-                            break;
-                        }
-                    }
-                }
-                if (candWInfo) {
-                    var mtcList = (candWInfo.clean_meanings || []).concat(candWInfo.meanings);
-                    for (var mci = 0; mci < mtcList.length; mci++) {
-                        var mcItem = mtcList[mci];
-                        var mcClean = Utils.removePartOfSpeech(mcItem);
-                        var mcFineParts = mcClean.split(/[，,、]/);
-                        for (var mcfp = 0; mcfp < mcFineParts.length; mcfp++) {
-                            var finePart = mcFineParts[mcfp].trim();
-                            var fpNorm = Utils.normalizeText(finePart);
-                            if (fpNorm && normalizedCleaned) {
-                                if (fpNorm === normalizedCleaned) {
-                                    maxScore = Math.max(maxScore, 92);
-                                    UI.addLogMessage('[Simple] [释义匹配] 候选[' + ci + ']="' + candidate + '" 释义细粒度完全匹配 (92%)', 'info');
-                                    break;
-                                }
-                                if (fpNorm.includes(normalizedCleaned) || normalizedCleaned.includes(fpNorm)) {
-                                    var fpMinLen = Math.min(fpNorm.length, normalizedCleaned.length);
-                                    var fpMaxLen = Math.max(fpNorm.length, normalizedCleaned.length);
-                                    var fpScore = (fpMinLen / fpMaxLen) * 85;
-                                    if (fpScore > maxScore) {
-                                        maxScore = fpScore;
-                                        UI.addLogMessage('[Simple] [释义匹配] 候选[' + ci + ']="' + candidate + '" 释义细粒度子串匹配 (' + Math.round(fpScore) + '%)', 'info');
-                                    }
-                                }
-                            }
-                        }
-                        if (maxScore >= 90) break;
-                    }
-                    if (maxScore > 0 && maxScore < 90) {
-                        var candPosSet2 = Utils.extractPosSet(candidate);
-                        if (!Utils.isPosCompatible(candPosSet2, questionPosSet)) {
-                            maxScore *= 0.7;
-                        }
-                    }
-                }
-            }
-
-            scoreDetails.push({ index: ci, candidate: candidate, score: maxScore });
-
-            if (maxScore > bestScore) {
-                secondBestScore = bestScore;
-                bestScore = maxScore;
-                bestIndex = ci;
-            } else if (maxScore > secondBestScore) {
-                secondBestScore = maxScore;
-            }
-        }
-
-        var scoreGap = bestScore - secondBestScore;
-
-        UI.addLogMessage('[Simple] [结果] 所有候选评分: ' + scoreDetails.map(function(s) { return '[' + s.index + ']' + s.candidate + '=' + Math.round(s.score) + '%'; }).join(' | '), 'info');
-        State.lastMatchScores = scoreDetails.slice();
-
-        if (bestScore >= 90 || scoreGap >= 10) {
-            UI.addLogMessage('[Simple] 选择答案: [' + bestIndex + '] ' + candidates[bestIndex] + ' (匹配度: ' + Math.round(bestScore) + '%, 置信度: ' + Math.round(scoreGap) + ')', 'match');
-            State.matchCount++;
-            return bestIndex >= 0 ? bestIndex : 0;
-        } else {
-            UI.addLogMessage('[Simple] 匹配度不够高，保持默认选择: [0] ' + candidates[0] + ' (最佳匹配度: ' + Math.round(bestScore) + '%, 次佳: ' + Math.round(secondBestScore) + '%)', 'warning');
-            State.missCount++;
-            UI.addLogMessage('[Simple] [统计] 命中=' + State.matchCount + ' | 未命中=' + State.missCount + ' | 命中率=' + (State.matchCount + State.missCount > 0 ? Math.round(State.matchCount / (State.matchCount + State.missCount) * 100) : 0) + '%', 'info');
-            return 0;
-        }
-    }
-};
-
-var ScoreControl = {
-    getTargetCorrect: function() {
-        if (State.scoreControlMode === 'count') {
-            return State.targetCorrectCount;
-        }
-        if (State.totalWordsInBucket <= 0) return 0;
-        return Math.ceil(State.totalWordsInBucket * State.targetScoreRate / 100);
-    },
-
-    shouldIntentionallyMiss: function() {
-        if (!State.scoreControlEnabled) return false;
-        var target = ScoreControl.getTargetCorrect();
-        if (target <= 0) return false;
-        if (State.scoreControlActive) return true;
-        if (State.answeredCorrectly >= target) {
-            State.scoreControlActive = true;
-            UI.addLogMessage('[分数控制] 已达目标正确数 ' + State.answeredCorrectly + '/' + target + '，切换为故意选错模式', 'warning');
-            return true;
-        }
-        return false;
-    },
-
-    recordAnswer: function(confidence) {
-        State.answeredTotal++;
-        if (confidence >= 50) {
-            State.answeredCorrectly++;
-        }
-    },
-
-    findWorstCandidateIndex: function() {
-        if (!State.lastMatchScores || State.lastMatchScores.length === 0) return 0;
-        var worst = State.lastMatchScores[0];
-        for (var i = 1; i < State.lastMatchScores.length; i++) {
-            if (State.lastMatchScores[i].score < worst.score) {
-                worst = State.lastMatchScores[i];
-            }
-        }
-        return worst.index;
-    },
-
-    reset: function() {
-        State.answeredCorrectly = 0;
-        State.answeredTotal = 0;
-        State.scoreControlActive = false;
-    },
-
-    getProgressText: function() {
-        var target = ScoreControl.getTargetCorrect();
-        if (target <= 0) return '目标未设置';
-        var pct = target > 0 ? Math.round(State.answeredCorrectly / target * 100) : 0;
-        return '正确: ' + State.answeredCorrectly + '/' + target + ' (' + pct + '%)' + (State.scoreControlActive ? ' [故意选错中]' : '');
-    }
-};
-
-var AIFallback = {
-    query: function(question, candidates) {
-        return new Promise(function(resolve, reject) {
-                        var keyUrl = a366BucketOrigin() + '/ai-api-key';
-            fetch(keyUrl, { cache: 'no-cache' })
-                .then(function(res) { return res.ok ? res.json() : Promise.reject(new Error('HTTP ' + res.status)); })
-                .then(function(data) {
-                    if (data && typeof data.key === 'string') {
-                        State.aiApiKey = data.key;
-                    }
-                    if (data && typeof data.baseUrl === 'string') { State.aiBaseUrl = data.baseUrl; }
-                    if (data && typeof data.model === 'string') { State.aiModel = data.model; }
-                    State.aiBuiltin = !!(data && data.builtin);
-                })
-                .catch(function() {})
-                .then(function() {
-                    // 内置免费 AI(chatnut*): 协议要签名, 页面里跑不了, 交给主进程代跑
-                    if (State.aiBuiltin) {
-                        var askUrl = a366BucketOrigin() + '/ai-ask';
-                        var ctl = new AbortController();
-                        var tmo = AI_TIMEOUT_BUILTIN;
-                        var tid = setTimeout(function() { ctl.abort(); }, tmo);
-                        fetch(askUrl, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ question: question, candidates: candidates, timeout: tmo }),
-                            signal: ctl.signal
-                        })
-                        .then(function(res) { return res.json(); })
-                        .then(function(d) {
-                            clearTimeout(tid);
-                            if (!d || !d.success) { reject(new Error(d && d.error ? d.error : '内置AI调用失败')); return; }
-                            UI.addLogMessage('[AI兜底] ' + State.aiModel + ' 回复: "' + String(d.text || '').substring(0, 60) + '" (' + d.ms + 'ms)', 'info');
-                            if (d.index >= 0 && d.index < candidates.length) {
-                                UI.addLogMessage('[AI兜底] 解析选项: [' + d.index + '] ' + candidates[d.index], 'info');
-                                resolve(d.index);
-                            } else {
-                                reject(new Error('内置AI未能解析出选项'));
-                            }
-                        })
-                        .catch(function(err) {
-                            clearTimeout(tid);
-                            reject(err.name === 'AbortError' ? new Error('AI请求超时(' + tmo + 'ms)') : err);
-                        });
-                        return;
-                    }
-                    if (!State.aiApiKey) {
-                        reject(new Error('API Key未设置，请在程序设置→代理设置中配置'));
-                        return;
-                    }
-
-            var systemPrompt = '你是单词PK答题助手。用户会给出题目和选项，你必须选出正确答案。你的回复只能是一个数字，表示正确选项的编号，不能包含任何其他文字、标点或解释。例如正确答案是第2个选项，你只回复2。';
-
-            var userPrompt = '题目: ' + question + '\n';
-            userPrompt += '选项:\n';
-            for (var i = 0; i < candidates.length; i++) {
-                userPrompt += (i + 1) + '. ' + candidates[i] + '\n';
-            }
-            userPrompt += '\n正确选项的编号是:';
-
-            var controller = new AbortController();
-            var timeoutId = setTimeout(function() { controller.abort(); }, AI_TIMEOUT);
-
-            fetch(State.aiBaseUrl || AI_API_URL, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': 'Bearer ' + State.aiApiKey
-                },
-                body: JSON.stringify({
-                    model: State.aiModel || AI_MODEL,
-                    messages: [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: userPrompt }
-                    ],
-                    temperature: 0,
-                    max_tokens: 5,
-                    thinking: { type: 'disabled' }
-                }),
-                signal: controller.signal
-            })
-            .then(function(res) {
-                clearTimeout(timeoutId);
-                if (!res.ok) {
-                    return res.text().then(function(t) {
-                        throw new Error('HTTP ' + res.status + ': ' + t.substring(0, 200));
-                    });
-                }
-                return res.json();
-            })
-            .then(function(data) {
-                UI.addLogMessage('[AI兜底] API原始返回: ' + JSON.stringify(data).substring(0, 500), 'info');
-
-                var content = '';
-                if (data.choices && data.choices[0]) {
-                    if (data.choices[0].message && data.choices[0].message.content) {
-                        content = data.choices[0].message.content.trim();
-                    } else if (typeof data.choices[0].text === 'string') {
-                        content = data.choices[0].text.trim();
-                    }
-                }
-
-                if (!content) {
-                    reject(new Error('AI返回内容为空'));
-                    return;
-                }
-
-                UI.addLogMessage('[AI兜底] AI回复内容: "' + content + '"', 'info');
-
-                var match = content.match(/(\d+)/);
-                if (match) {
-                    var index = parseInt(match[1], 10) - 1;
-                    if (index >= 0 && index < candidates.length) {
-                        UI.addLogMessage('[AI兜底] 解析选项: [' + index + '] ' + candidates[index], 'info');
-                        resolve(index);
-                        return;
-                    }
-                }
-                reject(new Error('AI返回格式异常: ' + content));
-            })
-            .catch(function(err) {
-                clearTimeout(timeoutId);
-                if (err.name === 'AbortError') {
-                    reject(new Error('AI请求超时(' + AI_TIMEOUT + 'ms)'));
-                } else {
-                    reject(err);
-                }
-            });
-        }); // close key-fetch .then()
-        });
-    }
-};
-
-var Loader = {
-    detectType: function(entryList) {
-        if (!Array.isArray(entryList) || entryList.length === 0) return 'full';
-        var sampleSize = Math.min(10, entryList.length);
-        for (var i = 0; i < sampleSize; i++) {
-            if (entryList[i].newPropList && entryList[i].newPropList.length > 0)
-                return 'full';
-        }
-        return 'simple';
-    },
-
-    fetchAiApiKey: function() {
-                var keyUrl = a366BucketOrigin() + '/ai-api-key';
-        fetch(keyUrl, { cache: 'no-cache' })
-            .then(function(res) {
-                if (!res.ok) throw new Error('HTTP ' + res.status);
-                return res.json();
-            })
-            .then(function(data) {
-                if (data && typeof data.key === 'string') {
-                    State.aiApiKey = data.key;
-                    if (typeof data.baseUrl === 'string') { State.aiBaseUrl = data.baseUrl; }
-                    if (typeof data.model === 'string') { State.aiModel = data.model; }
-                    State.aiBuiltin = !!data.builtin;
-                    if (State.aiBuiltin) {
-                        UI.addLogMessage('[AI兜底] 使用内置免费 AI: ' + State.aiModel + ' (无需 API Key)', 'info');
-                    } else {
-                        UI.addLogMessage('[AI兜底] API Key已从设置同步' + (data.key ? '' : ' (未设置)'), 'info');
-                    }
-                }
-            })
-            .catch(function(err) {
-                UI.addLogMessage('[AI兜底] 从设置获取API Key失败: ' + err.message, 'warning');
-            });
-    },
-
-    loadBucketFromServer: function() {
-        Loader.fetchAiApiKey();
+    function readNumber(key, fallback, min, max) {
         try {
-            var url = State.customBucketUrl || (a366BucketOrigin() + '/word-pk-answer');
-            UI.addLogMessage('[加载] 开始请求词库: ' + url, 'info');
-            fetch(url, { cache: 'no-cache' })
-                .then(function(res) {
-                    if (!res.ok) throw new Error('HTTP ' + res.status);
-                    return res.text();
-                })
-                .then(function(text) {
-                    try {
-                        var fullData = JSON.parse(text);
-                        var entryList = [];
-                        var dataSource = '';
-
-                        if (fullData && fullData.version === '3.4' && fullData.index && fullData.words) {
-                            State.jsonData = fullData;
-                            State.currentBucketType = 'full';
-                            State.totalWordsInBucket = State.jsonData.words.length;
-                            ScoreControl.reset();
-                            dataSource = 'v3.4 (预标准化)';
-                            State.bucketLoaded = true;
-                            State.bucketError = null;
-                            State.bucketRetryCount = 0;
-                            UI.updateStatus();
-                            UI.addLogMessage('使用v3.4预标准化格式加载词库', 'info');
-                            UI.addLogMessage('词库数据结构标准化完成 (v3.4)', 'success');
-                            UI.addLogMessage('单词PK词库加载成功，共' + State.jsonData.words.length + '个词条，数据源：' + dataSource, 'success');
-                            PkTimeMod.autoCalc(State.jsonData.words.length);
-                            return;
-                        }
-                        else if (fullData && fullData.data && fullData.data.contentList && fullData.data.contentList[0] && fullData.data.contentList[0].entryList) {
-                            // 合并所有 contentList 的 entryList（原仅取 [0] 会丢失后续词典）
-                            var clDetails = [];
-                            for (var ci = 0; ci < fullData.data.contentList.length; ci++) {
-                                var cl = fullData.data.contentList[ci];
-                                if (cl.entryList && Array.isArray(cl.entryList)) {
-                                    entryList = entryList.concat(cl.entryList);
-                                    clDetails.push('model=' + cl.model + ': ' + cl.entryList.length + '条');
-                                }
-                            }
-                            dataSource = '格式1 (contentList[*].entryList合并，共' + fullData.data.contentList.length + '本词典)';
-                            UI.addLogMessage('使用格式1加载词库: 合并 ' + fullData.data.contentList.length + ' 本词典 (' + clDetails.join(', ') + ')', 'info');
-                        }
-                        else if (fullData && Array.isArray(fullData.data) && fullData.data.length > 0 && fullData.data[0].entryList) {
-                            // 合并所有词典的entryList
-                            for (var di = 0; di < fullData.data.length; di++) {
-                                if (fullData.data[di].entryList && Array.isArray(fullData.data[di].entryList)) {
-                                    entryList = entryList.concat(fullData.data[di].entryList);
-                                }
-                            }
-                            dataSource = '格式1.5 (data[*].entryList合并，共' + fullData.data.length + '本词典)';
-                            UI.addLogMessage('使用格式1.5加载词库: 合并 ' + fullData.data.length + ' 本词典', 'info');
-                        }
-                        else if (fullData && fullData.data && fullData.data.words && Array.isArray(fullData.data.words)) {
-                            entryList = fullData.data.words.map(function(wordItem) {
-                                return {
-                                    entry: wordItem.en,
-                                    paraphrase: wordItem.cn,
-                                    entryId: wordItem.entryId
-                                };
-                            });
-                            dataSource = '格式2 (words)';
-                            UI.addLogMessage('使用格式2加载词库: words (已转换字段名)', 'info');
-                        }
-                        else {
-                            throw new Error('数据结构不正确，无法找到 entryList 或 words 数组');
-                        }
-
-                        if (entryList.length > 0) {
-                            UI.addLogMessage('词库加载成功，共 ' + entryList.length + ' 个单词 (' + dataSource + ')', 'success');
-
-                            State.currentBucketType = Loader.detectType(entryList);
-
-                            if (State.currentBucketType === 'simple') {
-                                State.jsonData = MatcherSimple.build(entryList);
-                            } else {
-                                State.jsonData = MatcherFull.build(entryList);
-                            }
-
-                            State.totalWordsInBucket = State.jsonData.words.length;
-                            ScoreControl.reset();
-                            State.bucketLoaded = true;
-                            State.bucketError = null;
-                            State.bucketRetryCount = 0;
-                            UI.updateStatus();
-                            UI.addLogMessage('词库数据结构标准化完成 (v3.4)', 'success');
-                            UI.addLogMessage('单词PK词库加载成功，共' + State.jsonData.words.length + '个词条（含标准化），数据源：' + dataSource, 'success');
-                            PkTimeMod.autoCalc(State.jsonData.words.length);
-                        } else {
-                            throw new Error('词库数据为空');
-                        }
-                    } catch (parseError) {
-                        UI.addLogMessage('词库解析失败: ' + parseError.message, 'error');
-                        throw new Error('词库数据解析失败: ' + parseError.message);
-                    }
-                })
-                .catch(function(err) {
-                    State.bucketLoaded = false;
-                    State.bucketError = err.message || String(err);
-                    UI.updateStatus();
-                    UI.addLogMessage('词库加载失败: ' + err.message, 'error');
-                    UI.addLogMessage('单词PK词库加载失败: ' + err.message, 'error');
-                    State.bucketRetryCount++;
-                    if (State.bucketRetryCount <= BUCKET_MAX_RETRIES) {
-                        UI.addLogMessage('自动重试加载词库... (第' + State.bucketRetryCount + '/' + BUCKET_MAX_RETRIES + '次)', 'info');
-                        setTimeout(function() {
-                            Loader.loadBucketFromServer();
-                        }, 1000);
-                    } else {
-                        UI.addLogMessage('词库加载已达最大重试次数(' + BUCKET_MAX_RETRIES + '次)，停止重试', 'error');
-                    }
-                });
+            var raw = window.localStorage.getItem(key);
+            if (raw === null || raw === '') return fallback;
+            var value = Number(raw);
+            if (!isFinite(value)) return fallback;
+            return Math.min(max, Math.max(min, value));
         } catch (e) {
-            State.bucketLoaded = false;
-            State.bucketError = e.message || String(e);
-            UI.updateStatus();
-            UI.addLogMessage('词库加载异常: ' + e.message, 'error');
-            UI.addLogMessage('单词PK词库加载异常: ' + e.message, 'error');
-            State.bucketRetryCount++;
-            if (State.bucketRetryCount <= BUCKET_MAX_RETRIES) {
-                UI.addLogMessage('自动重试加载词库... (第' + State.bucketRetryCount + '/' + BUCKET_MAX_RETRIES + '次)', 'info');
-                setTimeout(function() {
-                    Loader.loadBucketFromServer();
-                }, 1000);
-            } else {
-                UI.addLogMessage('词库加载已达最大重试次数(' + BUCKET_MAX_RETRIES + '次)，停止重试', 'error');
-            }
+            return fallback;
         }
     }
-};
 
-var UI = {
-    logMessages: [],
-    autoPkPanel: null,
-    logPanel: null,
-
-    addLogMessage: function(message, type) {
-        if (type === void 0) type = 'info';
-        var timestamp = new Date().toLocaleTimeString();
-        UI.logMessages.unshift({ timestamp: timestamp, message: message, type: type });
-        if (UI.logMessages.length > 99999999) {
-            UI.logMessages = UI.logMessages.slice(0, 99999999);
+    function saveNumber(key, value) {
+        try {
+            window.localStorage.setItem(key, String(value));
+        } catch (e) {
+            /* 隐私模式或存储被禁用时忽略 */
         }
-        UI.updateLogPanel();
-    },
+    }
 
-    exportLogs: function() {
-        if (UI.logMessages.length === 0) {
-            UI.addLogMessage('没有日志可导出', 'warning');
+    function readFlag(key, fallback) {
+        try {
+            var raw = window.localStorage.getItem(key);
+            if (raw === null || raw === '') return fallback;
+            return raw === '1' || raw === 'true';
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function saveFlag(key, value) {
+        try {
+            window.localStorage.setItem(key, value ? '1' : '0');
+        } catch (e) {
+            /* 忽略 */
+        }
+    }
+
+    function readSubmitSeconds() {
+        var value = readNumber(TIME_SECONDS_KEY, null, 0, INT32_MAX);
+        if (value === null) value = readNumber(LEGACY_TIME_SECONDS_KEY, null, 0, INT32_MAX);
+        return value === null ? null : Math.round(value);
+    }
+
+    function escapeHtml(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;');
+    }
+
+    // ---------- 状态 ----------
+
+    var state = {
+        running: false,
+        timer: null,
+        lastKey: '',
+        pendingKey: '',
+        pendingAt: 0,
+        answered: 0,
+        correct: 0,
+        wrong: 0,
+        failed: 0,
+        accuracy: readNumber('a366_pk_accuracy', 100, 0, 100),
+        interval: readNumber('a366_pk_interval', 150, 0, 60000),
+        skipAnim: readFlag('a366_pk_skip_anim', false),
+        // 提交时间：页面里的 fetch/XHR 拦不到 Electron 客户端发出的提交请求，
+        // 这里只保存状态并推给本地服务，真正改包在代理层完成。
+        submitTimeEnabled: readFlag(TIME_ENABLED_KEY, readFlag(LEGACY_TIME_ENABLED_KEY, false)),
+        submitTimeSeconds: readSubmitSeconds(),
+        submitTimeSync: '',
+        // 本次作答后用于“跳过动画”的跟进：等答对/答错动画结束，提前收尾
+        awaitKey: '',
+        awaitAt: 0,
+        speedAt: 0,
+        warnedVm: false,
+        warnedKey: '',
+        warnedEmpty: false,
+        // 页面用 clickFlag / curIndex 表示“已作答/动画中”，字段语义随版本变化，
+        // 这里只把它当作延迟提示：同一题最多等 2.5 秒，避免误判导致永远不答题。
+        blockedKey: '',
+        blockedAt: 0,
+        debug: true
+    };
+
+    var ui = {
+        panel: null,
+        launcher: null,
+        log: null,
+        toggle: null,
+        accuracy: null,
+        accuracyVal: null,
+        interval: null,
+        skip: null,
+        timeCheck: null,
+        timeMin: null,
+        timeSec: null,
+        stats: {}
+    };
+
+    function now() {
+        return Date.now();
+    }
+
+    // ---------- 跳过动画 ----------
+
+    // 页面的作答流程靠 animationend / transitionend 推进，不能直接禁用动画，
+    // 否则事件不触发、下一题永远不出来。这里只把时长压短：
+    //   单词缩放 300ms -> 30ms，对勾/叉 500ms -> 120ms，+1 飘字与错误提示 300ms -> 30ms。
+    // 对勾/叉必须比单词缩放慢，保证 animationScaleEnd 先于 animationPopEnd，
+    // 与页面原始时序一致，避免重复触发 after-right。
+    var SKIP_CSS = [
+        '.u3-pk-core__word.is-animation-scale{',
+        '-webkit-animation-duration:.03s!important;animation-duration:.03s!important;}',
+        '.u3-pk-core__icon.icon-enter-active,.u3-pk-core__icon.icon-leave-active{',
+        '-webkit-transition-duration:.12s!important;transition-duration:.12s!important;}',
+        '.u3-pk-core__toast.toast-enter-active,.u3-pk-core__toast.toast-leave-active,',
+        '.u3-page-pking__plus.plus-enter-active,.u3-page-pking__plus.plus-leave-active{',
+        '-webkit-transition-duration:.03s!important;transition-duration:.03s!important;}'
+    ].join('\n');
+
+    function applySkipStyle(on) {
+        var id = 'a366-pk-skip-style';
+        var existing = document.getElementById(id);
+        if (!on) {
+            if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
             return;
         }
+        if (existing) return;
 
-        var logText = UI.logMessages.slice().reverse().map(function(msg) {
-            var typePrefix = '';
-            if (msg.type === 'success') typePrefix = '[成功] ';
-            if (msg.type === 'error') typePrefix = '[错误] ';
-            if (msg.type === 'warning') typePrefix = '[警告] ';
-            if (msg.type === 'match') typePrefix = '[匹配] ';
-            return '[' + msg.timestamp + '] ' + typePrefix + msg.message;
-        }).join('\n');
+        var style = document.createElement('style');
+        style.id = id;
+        style.textContent = SKIP_CSS;
+        (document.head || document.documentElement).appendChild(style);
+    }
 
-        UI.addLogMessage('正在保存日志到桌面...', 'info');
-
-        fetch(a366BucketOrigin() + '/save-log', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: logText })
-        })
-        .then(function(res) { return res.json(); })
-        .then(function(result) {
-            if (result.success) {
-                UI.addLogMessage('日志已保存到: ' + result.path, 'success');
-            } else {
-                UI.addLogMessage('保存失败: ' + result.error, 'error');
-            }
-        })
-        .catch(function(err) {
-            UI.addLogMessage('保存失败: ' + err.message, 'error');
-        });
-    },
-
-    createLogPanel: function() {
-        if (UI.logPanel) return;
-        UI.logPanel = document.createElement('div');
-        UI.logPanel.id = 'auto-pk-log-panel';
-        UI.logPanel.style.position = 'fixed';
-        UI.logPanel.style.right = '300px';
-        UI.logPanel.style.bottom = '80px';
-        UI.logPanel.style.width = '350px';
-        UI.logPanel.style.height = '400px';
-        UI.logPanel.style.background = 'rgba(0,0,0,0.9)';
-        UI.logPanel.style.color = '#fff';
-        UI.logPanel.style.borderRadius = '8px';
-        UI.logPanel.style.padding = '10px';
-        UI.logPanel.style.zIndex = '9998';
-        UI.logPanel.style.overflow = 'hidden';
-        UI.logPanel.style.display = 'none';
-        UI.logPanel.style.userSelect = 'text';
-
-        var header = document.createElement('div');
-        header.style.display = 'flex';
-        header.style.justifyContent = 'space-between';
-        header.style.alignItems = 'center';
-        header.style.marginBottom = '8px';
-        header.style.paddingBottom = '8px';
-        header.style.borderBottom = '1px solid rgba(255,255,255,0.2)';
-        header.style.cursor = 'move';
-
-        var titleSpan = document.createElement('span');
-        titleSpan.textContent = '运行日志';
-        titleSpan.style.fontSize = '14px';
-        titleSpan.style.fontWeight = 'bold';
-        header.appendChild(titleSpan);
-
-        var exportBtn = document.createElement('button');
-        exportBtn.textContent = '导出';
-        exportBtn.title = '导出日志到桌面';
-        exportBtn.style.fontSize = '12px';
-        exportBtn.style.padding = '2px 6px';
-        exportBtn.style.cursor = 'pointer';
-        exportBtn.style.background = '#fff';
-        exportBtn.style.border = 'none';
-        exportBtn.style.color = '#000';
-        exportBtn.style.borderRadius = '3px';
-        exportBtn.style.marginRight = '3px';
-        exportBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            UI.exportLogs();
-        });
-        header.appendChild(exportBtn);
-
-        var closeBtn = document.createElement('button');
-        closeBtn.textContent = '\u00d7';
-        closeBtn.style.fontSize = '18px';
-        closeBtn.style.padding = '0 6px';
-        closeBtn.style.cursor = 'pointer';
-        closeBtn.style.background = 'transparent';
-        closeBtn.style.border = 'none';
-        closeBtn.style.color = '#fff';
-        closeBtn.style.userSelect = 'none';
-        closeBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            UI.logPanel.style.display = 'none';
-        });
-        header.appendChild(closeBtn);
-        UI.logPanel.appendChild(header);
-
-        var logViewport = document.createElement('div');
-        logViewport.id = 'auto-pk-log-viewport';
-        logViewport.style.height = 'calc(100% - 40px)';
-        logViewport.style.overflowY = 'auto';
-        logViewport.style.position = 'relative';
-        logViewport.style.fontSize = '11px';
-        logViewport.style.fontFamily = 'monospace';
-        logViewport.style.userSelect = 'text';
-
-        var logSpacer = document.createElement('div');
-        logSpacer.id = 'auto-pk-log-spacer';
-
-        var logVisible = document.createElement('div');
-        logVisible.id = 'auto-pk-log-visible';
-        logVisible.style.position = 'absolute';
-        logVisible.style.top = '0';
-        logVisible.style.left = '0';
-        logVisible.style.right = '0';
-
-        logViewport.appendChild(logSpacer);
-        logViewport.appendChild(logVisible);
-        UI.logPanel.appendChild(logViewport);
-
-        logViewport.addEventListener('scroll', function() {
-            UI.renderVisibleLogs();
-        });
-
-        document.body.appendChild(UI.logPanel);
-
-        var isDragging = false;
-        var offsetX = 0;
-        var offsetY = 0;
-
-        header.addEventListener('mousedown', function(e) {
-            if (e.target === closeBtn) return;
-            isDragging = true;
-            offsetX = e.clientX - UI.logPanel.offsetLeft;
-            offsetY = e.clientY - UI.logPanel.offsetTop;
-            e.preventDefault();
-        });
-
-        document.addEventListener('mousemove', function(e) {
-            if (!isDragging) return;
-            UI.logPanel.style.left = (e.clientX - offsetX) + 'px';
-            UI.logPanel.style.top = (e.clientY - offsetY) + 'px';
-            UI.logPanel.style.right = 'auto';
-            UI.logPanel.style.bottom = 'auto';
-        });
-
-        document.addEventListener('mouseup', function() {
-            isDragging = false;
-        });
-    },
-
-    updateLogPanel: function() {
-        if (!UI.logPanel) return;
-        var viewport = document.getElementById('auto-pk-log-viewport');
-        if (!viewport) return;
-        UI.renderVisibleLogs();
-    },
-
-    renderVisibleLogs: function() {
-        var viewport = document.getElementById('auto-pk-log-viewport');
-        if (!viewport) return;
-
-        var spacer = document.getElementById('auto-pk-log-spacer');
-        var visible = document.getElementById('auto-pk-log-visible');
-        if (!spacer || !visible) return;
-
-        var totalHeight = UI.logMessages.length * LOG_ROW_HEIGHT;
-        spacer.style.height = totalHeight + 'px';
-
-        var scrollTop = viewport.scrollTop;
-        var viewportHeight = viewport.clientHeight;
-
-        var startIndex = Math.max(0, Math.floor(scrollTop / LOG_ROW_HEIGHT) - 2);
-        var visibleCount = Math.ceil(viewportHeight / LOG_ROW_HEIGHT) + 20;
-        var endIndex = Math.min(startIndex + visibleCount, UI.logMessages.length);
-
-        visible.style.top = (startIndex * LOG_ROW_HEIGHT) + 'px';
-
-        var html = '';
-        for (var i = startIndex; i < endIndex; i++) {
-            var msg = UI.logMessages[i];
-            var color = '#fff';
-            if (msg.type === 'success') color = '#4caf50';
-            else if (msg.type === 'error') color = '#f44336';
-            else if (msg.type === 'warning') color = '#ff9800';
-            else if (msg.type === 'match') color = '#2196f3';
-
-            var escapedMsg = msg.message
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-            html += '<div style="margin-bottom:4px;color:' + color + '">[' + msg.timestamp + '] ' + escapedMsg + '</div>';
+    function restartTimer() {
+        if (state.timer) {
+            clearInterval(state.timer);
+            state.timer = null;
         }
-        visible.innerHTML = html;
-    },
-
-    showSuccessMessage: function() {
-        var messageDiv = document.createElement('div');
-        messageDiv.style.position = 'fixed';
-        messageDiv.style.top = '20px';
-        messageDiv.style.left = '50%';
-        messageDiv.style.transform = 'translateX(-50%)';
-        messageDiv.style.padding = '15px 25px';
-        messageDiv.style.backgroundColor = 'rgba(0, 200, 0, 0.9)';
-        messageDiv.style.color = 'white';
-        messageDiv.style.borderRadius = '5px';
-        messageDiv.style.fontSize = '16px';
-        messageDiv.style.fontWeight = 'bold';
-        messageDiv.style.zIndex = '9999';
-        messageDiv.style.boxShadow = '0 2px 10px rgba(0, 0, 0, 0.2)';
-        messageDiv.textContent = 'Auto366 注入成功，请点击控制面板的开始pk后点击页面中的开始PK按钮，并保持天学网在前台运行';
-        document.body.appendChild(messageDiv);
-        setTimeout(function() {
-            messageDiv.style.transition = 'opacity 0.5s';
-            messageDiv.style.opacity = '0';
-            setTimeout(function() {
-                if (messageDiv.parentNode) {
-                    messageDiv.parentNode.removeChild(messageDiv);
-                }
-            }, 500);
-        }, 15000);
-    },
-
-    createAutoPkPanel: function() {
-        if (UI.autoPkPanel) return;
-        UI.autoPkPanel = document.createElement('div');
-        UI.autoPkPanel.style.position = 'fixed';
-        UI.autoPkPanel.style.right = '20px';
-        UI.autoPkPanel.style.bottom = '80px';
-        UI.autoPkPanel.style.width = '280px';
-        UI.autoPkPanel.style.background = 'rgba(0,0,0,0.8)';
-        UI.autoPkPanel.style.color = '#fff';
-        UI.autoPkPanel.style.borderRadius = '8px';
-        UI.autoPkPanel.style.padding = '10px';
-        UI.autoPkPanel.style.zIndex = '9999';
-        UI.autoPkPanel.style.cursor = 'move';
-
-        var header = document.createElement('div');
-        header.style.display = 'flex';
-        header.style.justifyContent = 'space-between';
-        header.style.alignItems = 'center';
-        header.style.marginBottom = '8px';
-
-        var titleSpan = document.createElement('span');
-        titleSpan.textContent = '单词PK自动化';
-        titleSpan.style.fontSize = '14px';
-        titleSpan.style.fontWeight = 'bold';
-        header.appendChild(titleSpan);
-
-        var settingsBtn = document.createElement('button');
-        settingsBtn.textContent = '\u2699';
-        settingsBtn.title = '设置词库位置';
-        settingsBtn.style.fontSize = '14px';
-        settingsBtn.style.padding = '2px 6px';
-        settingsBtn.style.cursor = 'pointer';
-        settingsBtn.style.background = 'rgba(255,255,255,0.2)';
-        settingsBtn.style.border = 'none';
-        settingsBtn.style.color = '#fff';
-        settingsBtn.style.borderRadius = '3px';
-        settingsBtn.style.marginRight = '4px';
-        settingsBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-
-            var dialog = document.createElement('div');
-            dialog.style.position = 'fixed';
-            dialog.style.left = '50%';
-            dialog.style.top = '50%';
-            dialog.style.transform = 'translate(-50%, -50%)';
-            dialog.style.background = 'rgba(0,0,0,0.9)';
-            dialog.style.color = '#fff';
-            dialog.style.padding = '20px';
-            dialog.style.borderRadius = '8px';
-            dialog.style.zIndex = '10000';
-            dialog.style.minWidth = '300px';
-            dialog.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
-
-            var title = document.createElement('h3');
-            title.textContent = '设置自定义词库URL';
-            title.style.marginTop = '0';
-            title.style.marginBottom = '15px';
-            dialog.appendChild(title);
-
-            var input = document.createElement('input');
-            input.type = 'text';
-            input.value = State.customBucketUrl;
-            input.style.width = '100%';
-            input.style.padding = '8px';
-            input.style.marginBottom = '15px';
-            input.style.boxSizing = 'border-box';
-            input.style.borderRadius = '4px';
-            input.style.border = '1px solid rgba(255,255,255,0.3)';
-            input.style.background = 'rgba(255,255,255,0.1)';
-            input.style.color = '#fff';
-            dialog.appendChild(input);
-
-            var btnContainer = document.createElement('div');
-            btnContainer.style.display = 'flex';
-            btnContainer.style.justifyContent = 'flex-end';
-            btnContainer.style.gap = '10px';
-
-            var cancelBtn = document.createElement('button');
-            cancelBtn.textContent = '取消';
-            cancelBtn.style.padding = '8px 16px';
-            cancelBtn.style.borderRadius = '4px';
-            cancelBtn.style.border = 'none';
-            cancelBtn.style.cursor = 'pointer';
-            cancelBtn.style.background = 'rgba(255,255,255,0.2)';
-            cancelBtn.style.color = '#fff';
-
-            var confirmBtn = document.createElement('button');
-            confirmBtn.textContent = '确定';
-            confirmBtn.style.padding = '8px 16px';
-            confirmBtn.style.borderRadius = '4px';
-            confirmBtn.style.border = 'none';
-            confirmBtn.style.cursor = 'pointer';
-            confirmBtn.style.background = '#4caf50';
-            confirmBtn.style.color = '#fff';
-
-            btnContainer.appendChild(cancelBtn);
-            btnContainer.appendChild(confirmBtn);
-            dialog.appendChild(btnContainer);
-
-            document.body.appendChild(dialog);
-
-            setTimeout(function() { input.focus(); }, 100);
-
-            function closeDialog() {
-                if (dialog.parentNode) {
-                    dialog.parentNode.removeChild(dialog);
-                }
-            }
-
-            cancelBtn.addEventListener('click', closeDialog);
-
-            confirmBtn.addEventListener('click', function() {
-                var newUrl = input.value.trim();
-                State.customBucketUrl = newUrl;
-                localStorage.setItem('customBucketUrl', State.customBucketUrl);
-                State.bucketLoaded = false;
-                State.bucketError = null;
-                State.bucketRetryCount = 0;
-                UI.updateStatus();
-                UI.addLogMessage('词库URL已更新: ' + (State.customBucketUrl || '使用默认URL'), 'info');
-                Loader.loadBucketFromServer();
-                closeDialog();
-            });
-
-            input.addEventListener('keypress', function(e) {
-                if (e.key === 'Enter') {
-                    confirmBtn.click();
-                }
-            });
-        });
-        header.appendChild(settingsBtn);
-
-        var logBtn = document.createElement('button');
-        logBtn.textContent = 'Logs';
-        logBtn.title = '查看日志';
-        logBtn.style.fontSize = '12px';
-        logBtn.style.padding = '2px 6px';
-        logBtn.style.cursor = 'pointer';
-        logBtn.style.background = 'rgba(255,255,255,0.2)';
-        logBtn.style.border = 'none';
-        logBtn.style.color = '#fff';
-        logBtn.style.borderRadius = '3px';
-        logBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            if (!UI.logPanel) {
-                UI.createLogPanel();
-            }
-            UI.logPanel.style.display = UI.logPanel.style.display === 'none' ? 'block' : 'none';
-        });
-        header.appendChild(logBtn);
-
-        var consoleBtn = document.createElement('button');
-        consoleBtn.textContent = 'Console';
-        consoleBtn.title = '打开内部控制台';
-        consoleBtn.style.fontSize = '12px';
-        consoleBtn.style.padding = '2px 6px';
-        consoleBtn.style.cursor = 'pointer';
-        consoleBtn.style.background = 'rgba(0,122,204,0.8)';
-        consoleBtn.style.border = 'none';
-        consoleBtn.style.color = '#fff';
-        consoleBtn.style.borderRadius = '3px';
-        consoleBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            if (typeof openDevConsole === 'function') {
-                openDevConsole();
-                UI.addLogMessage('已打开内部控制台', 'info');
-            } else {
-                UI.addLogMessage('内部控制台未加载', 'error');
-            }
-        });
-        header.appendChild(consoleBtn);
-        UI.autoPkPanel.appendChild(header);
-
-        var delayRow = document.createElement('div');
-        delayRow.style.display = 'flex';
-        delayRow.style.alignItems = 'center';
-        delayRow.style.marginBottom = '6px';
-        var delayLabel = document.createElement('span');
-        delayLabel.textContent = '间隔(ms)：';
-        delayLabel.style.fontSize = '12px';
-        var delayInput = document.createElement('input');
-        delayInput.type = 'number';
-        delayInput.value = String(State.autoPkDelay);
-        delayInput.style.flex = '1';
-        delayInput.style.marginLeft = '6px';
-        delayInput.style.fontSize = '12px';
-        delayInput.style.background = 'rgba(255,255,255,0.2)';
-        delayInput.style.color = '#fff';
-        delayInput.style.border = '1px solid rgba(255,255,255,0.3)';
-        delayInput.style.borderRadius = '3px';
-        delayInput.addEventListener('change', function() {
-            var v = parseInt(delayInput.value, 10);
-            if (Number.isFinite(v) && v > 0) {
-                State.autoPkDelay = v;
-                if (State.autoPkIntervalId) {
-                    Scheduler.start();
-                }
-            }
-        });
-        delayRow.appendChild(delayLabel);
-        delayRow.appendChild(delayInput);
-        UI.autoPkPanel.appendChild(delayRow);
-
-        var presetRow = document.createElement('div');
-        presetRow.style.display = 'flex';
-        presetRow.style.gap = '4px';
-        presetRow.style.marginBottom = '6px';
-
-        var preset1 = document.createElement('button');
-        preset1.textContent = '10ms';
-        preset1.title = '速度最快';
-        preset1.style.flex = '1';
-        preset1.style.fontSize = '11px';
-        preset1.style.padding = '4px';
-        preset1.style.background = 'rgba(255,255,255,0.25)';
-        preset1.style.color = '#fff';
-        preset1.style.border = '1px solid rgba(255,255,255,0.3)';
-        preset1.style.borderRadius = '3px';
-        preset1.addEventListener('click', function() {
-            State.autoPkDelay = 10;
-            delayInput.value = '10';
-            if (State.autoPkIntervalId) {
-                Scheduler.start();
-            }
-        });
-
-        var preset2 = document.createElement('button');
-        preset2.textContent = '500ms';
-        preset2.title = '均衡';
-        preset2.style.flex = '1';
-        preset2.style.fontSize = '11px';
-        preset2.style.padding = '4px';
-        preset2.style.background = 'rgba(255,255,255,0.25)';
-        preset2.style.color = '#fff';
-        preset2.style.border = '1px solid rgba(255,255,255,0.3)';
-        preset2.style.borderRadius = '3px';
-        preset2.addEventListener('click', function() {
-            State.autoPkDelay = 500;
-            delayInput.value = '500';
-            if (State.autoPkIntervalId) {
-                Scheduler.start();
-            }
-        });
-
-        var preset3 = document.createElement('button');
-        preset3.textContent = '2000ms';
-        preset3.title = '准确率最高';
-        preset3.style.flex = '1';
-        preset3.style.fontSize = '11px';
-        preset3.style.padding = '4px';
-        preset3.style.background = 'rgba(255,255,255,0.25)';
-        preset3.style.color = '#fff';
-        preset3.style.border = '1px solid rgba(255,255,255,0.3)';
-        preset3.style.borderRadius = '3px';
-        preset3.addEventListener('click', function() {
-            State.autoPkDelay = 2000;
-            delayInput.value = '2000';
-            if (State.autoPkIntervalId) {
-                Scheduler.start();
-            }
-        });
-
-        presetRow.appendChild(preset1);
-        presetRow.appendChild(preset2);
-        presetRow.appendChild(preset3);
-        UI.autoPkPanel.appendChild(presetRow);
-
-        var scDivider = document.createElement('div');
-        scDivider.style.borderTop = '1px solid rgba(255,255,255,0.2)';
-        scDivider.style.margin = '8px 0 4px 0';
-        scDivider.style.paddingTop = '6px';
-        scDivider.style.fontSize = '14px';
-        scDivider.style.fontWeight = 'bold';
-        scDivider.style.color = '#fff';
-        scDivider.textContent = '分数控制';
-        UI.autoPkPanel.appendChild(scDivider);
-
-        var scEnableRow = document.createElement('div');
-        scEnableRow.style.display = 'flex';
-        scEnableRow.style.alignItems = 'center';
-        scEnableRow.style.marginBottom = '4px';
-        var scCheckbox = document.createElement('input');
-        scCheckbox.type = 'checkbox';
-        scCheckbox.checked = State.scoreControlEnabled;
-        scCheckbox.style.marginRight = '6px';
-        scCheckbox.style.cursor = 'pointer';
-        scCheckbox.addEventListener('change', function() {
-            State.scoreControlEnabled = scCheckbox.checked;
-            localStorage.setItem('scoreControlEnabled', String(State.scoreControlEnabled));
-            if (!State.scoreControlEnabled) {
-                ScoreControl.reset();
-            }
-            UI.updateStatus();
-            UI.addLogMessage('[分数控制] ' + (State.scoreControlEnabled ? '已启用' : '已禁用'), 'info');
-        });
-        var scEnableLabel = document.createElement('span');
-        scEnableLabel.textContent = '启用';
-        scEnableLabel.style.fontSize = '12px';
-        scEnableRow.appendChild(scCheckbox);
-        scEnableRow.appendChild(scEnableLabel);
-
-        var scModeRate = document.createElement('button');
-        scModeRate.textContent = '得分率';
-        scModeRate.style.fontSize = '11px';
-        scModeRate.style.padding = '2px 6px';
-        scModeRate.style.marginLeft = '8px';
-        scModeRate.style.cursor = 'pointer';
-        scModeRate.style.borderRadius = '3px';
-        scModeRate.style.border = 'none';
-        var scModeCount = document.createElement('button');
-        scModeCount.textContent = '正确题数';
-        scModeCount.style.fontSize = '11px';
-        scModeCount.style.padding = '2px 6px';
-        scModeCount.style.marginLeft = '4px';
-        scModeCount.style.cursor = 'pointer';
-        scModeCount.style.borderRadius = '3px';
-        scModeCount.style.border = 'none';
-
-        function updateModeButtons() {
-            if (State.scoreControlMode === 'rate') {
-                scModeRate.style.background = '#4caf50';
-                scModeRate.style.color = '#fff';
-                scModeCount.style.background = 'rgba(255,255,255,0.2)';
-                scModeCount.style.color = '#fff';
-                scRateRow.style.display = 'flex';
-                scCountRow.style.display = 'none';
-            } else {
-                scModeRate.style.background = 'rgba(255,255,255,0.2)';
-                scModeRate.style.color = '#fff';
-                scModeCount.style.background = '#4caf50';
-                scModeCount.style.color = '#fff';
-                scRateRow.style.display = 'none';
-                scCountRow.style.display = 'flex';
-            }
-        }
-
-        scModeRate.addEventListener('click', function() {
-            State.scoreControlMode = 'rate';
-            localStorage.setItem('scoreControlMode', 'rate');
-            ScoreControl.reset();
-            updateModeButtons();
-            UI.updateStatus();
-            UI.addLogMessage('[分数控制] 切换为得分率模式', 'info');
-        });
-        scModeCount.addEventListener('click', function() {
-            State.scoreControlMode = 'count';
-            localStorage.setItem('scoreControlMode', 'count');
-            ScoreControl.reset();
-            updateModeButtons();
-            UI.updateStatus();
-            UI.addLogMessage('[分数控制] 切换为正确题数模式', 'info');
-        });
-
-        scEnableRow.appendChild(scModeRate);
-        scEnableRow.appendChild(scModeCount);
-        UI.autoPkPanel.appendChild(scEnableRow);
-
-        var scRateRow = document.createElement('div');
-        scRateRow.style.display = 'flex';
-        scRateRow.style.alignItems = 'center';
-        scRateRow.style.marginBottom = '4px';
-        var scRateLabel = document.createElement('span');
-        scRateLabel.textContent = '得分率:';
-        scRateLabel.style.fontSize = '12px';
-        scRateLabel.style.marginRight = '4px';
-        scRateRow.appendChild(scRateLabel);
-        var scRateInput = document.createElement('input');
-        scRateInput.type = 'number';
-        scRateInput.min = '0';
-        scRateInput.max = '100';
-        scRateInput.value = String(State.targetScoreRate);
-        scRateInput.style.width = '45px';
-        scRateInput.style.fontSize = '12px';
-        scRateInput.style.textAlign = 'center';
-        scRateInput.style.background = 'rgba(255,255,255,0.2)';
-        scRateInput.style.color = '#fff';
-        scRateInput.style.border = '1px solid rgba(255,255,255,0.3)';
-        scRateInput.style.borderRadius = '3px';
-        scRateInput.addEventListener('change', function() {
-            var v = parseInt(scRateInput.value, 10);
-            if (Number.isFinite(v) && v >= 0 && v <= 100) {
-                State.targetScoreRate = v;
-                localStorage.setItem('targetScoreRate', String(v));
-                ScoreControl.reset();
-                UI.updateStatus();
-                UI.addLogMessage('[分数控制] 得分率设为 ' + v + '%', 'info');
-            }
-        });
-        scRateRow.appendChild(scRateInput);
-        var scRateSuffix = document.createElement('span');
-        scRateSuffix.textContent = '%';
-        scRateSuffix.style.fontSize = '12px';
-        scRateSuffix.style.marginLeft = '2px';
-        scRateRow.appendChild(scRateSuffix);
-        UI.autoPkPanel.appendChild(scRateRow);
-
-        var scCountRow = document.createElement('div');
-        scCountRow.style.display = 'flex';
-        scCountRow.style.alignItems = 'center';
-        scCountRow.style.marginBottom = '4px';
-        var scCountLabel = document.createElement('span');
-        scCountLabel.textContent = '正确题数:';
-        scCountLabel.style.fontSize = '12px';
-        scCountLabel.style.marginRight = '4px';
-        scCountRow.appendChild(scCountLabel);
-        var scCountInput = document.createElement('input');
-        scCountInput.type = 'number';
-        scCountInput.min = '0';
-        scCountInput.value = String(State.targetCorrectCount || '');
-        scCountInput.style.width = '50px';
-        scCountInput.style.fontSize = '12px';
-        scCountInput.style.textAlign = 'center';
-        scCountInput.addEventListener('change', function() {
-            var v = parseInt(scCountInput.value, 10);
-            if (Number.isFinite(v) && v >= 0) {
-                State.targetCorrectCount = v;
-                localStorage.setItem('targetCorrectCount', String(v));
-                ScoreControl.reset();
-                UI.updateStatus();
-                UI.addLogMessage('[分数控制] 正确题数设为 ' + v, 'info');
-            }
-        });
-        scCountRow.appendChild(scCountInput);
-        var scCountSuffix = document.createElement('span');
-        scCountSuffix.textContent = '题';
-        scCountSuffix.style.fontSize = '12px';
-        scCountSuffix.style.marginLeft = '2px';
-        scCountRow.appendChild(scCountSuffix);
-        UI.autoPkPanel.appendChild(scCountRow);
-
-        updateModeButtons();
-
-        var scProgressRow = document.createElement('div');
-        scProgressRow.style.fontSize = '11px';
-        scProgressRow.style.marginBottom = '6px';
-        scProgressRow.style.color = '#aaa';
-        scProgressRow.id = 'auto-pk-score-progress';
-        UI.autoPkPanel.appendChild(scProgressRow);
-
-        var aiDivider = document.createElement('div');
-        aiDivider.style.borderTop = '1px solid rgba(255,255,255,0.2)';
-        aiDivider.style.margin = '8px 0 4px 0';
-        aiDivider.style.paddingTop = '6px';
-        aiDivider.style.fontSize = '14px';
-        aiDivider.style.fontWeight = 'bold';
-        aiDivider.style.color = '#fff';
-        aiDivider.textContent = 'AI兜底';
-        UI.autoPkPanel.appendChild(aiDivider);
-
-        var aiEnableRow = document.createElement('div');
-        aiEnableRow.style.display = 'flex';
-        aiEnableRow.style.alignItems = 'center';
-        aiEnableRow.style.marginBottom = '4px';
-        var aiCheckbox = document.createElement('input');
-        aiCheckbox.type = 'checkbox';
-        aiCheckbox.checked = State.aiEnabled;
-        aiCheckbox.style.marginRight = '6px';
-        aiCheckbox.style.cursor = 'pointer';
-        aiCheckbox.addEventListener('change', function() {
-            State.aiEnabled = aiCheckbox.checked;
-            localStorage.setItem('aiEnabled', String(State.aiEnabled));
-            UI.updateStatus();
-            UI.addLogMessage('[AI兜底] ' + (State.aiEnabled ? '已启用' : '已禁用'), 'info');
-        });
-        var aiEnableLabel = document.createElement('span');
-        aiEnableLabel.textContent = '启用';
-        aiEnableLabel.style.fontSize = '12px';
-        aiEnableLabel.style.marginRight = '8px';
-        aiEnableRow.appendChild(aiCheckbox);
-        aiEnableRow.appendChild(aiEnableLabel);
-
-        var aiThreshLabel = document.createElement('span');
-        aiThreshLabel.textContent = '阈值:';
-        aiThreshLabel.style.fontSize = '12px';
-        aiThreshLabel.style.marginRight = '4px';
-        aiEnableRow.appendChild(aiThreshLabel);
-        var aiThreshInput = document.createElement('input');
-        aiThreshInput.type = 'number';
-        aiThreshInput.min = '0';
-        aiThreshInput.max = '100';
-        aiThreshInput.value = String(State.aiThreshold);
-        aiThreshInput.style.width = '45px';
-        aiThreshInput.style.fontSize = '12px';
-        aiThreshInput.style.textAlign = 'center';
-        aiThreshInput.style.background = 'rgba(255,255,255,0.2)';
-        aiThreshInput.style.color = '#fff';
-        aiThreshInput.style.border = '1px solid rgba(255,255,255,0.3)';
-        aiThreshInput.style.borderRadius = '3px';
-        aiThreshInput.addEventListener('change', function() {
-            var v = parseInt(aiThreshInput.value, 10);
-            if (Number.isFinite(v) && v >= 0 && v <= 100) {
-                State.aiThreshold = v;
-                localStorage.setItem('aiThreshold', String(v));
-                UI.updateStatus();
-                UI.addLogMessage('[AI兜底] 阈值设为 ' + v + '% (置信度低于此值时调用AI)', 'info');
-            }
-        });
-        aiEnableRow.appendChild(aiThreshInput);
-        var aiThreshSuffix = document.createElement('span');
-        aiThreshSuffix.textContent = '%';
-        aiThreshSuffix.style.fontSize = '12px';
-        aiThreshSuffix.style.marginLeft = '2px';
-        aiEnableRow.appendChild(aiThreshSuffix);
-        UI.autoPkPanel.appendChild(aiEnableRow);
-
-        // ===== 时间修改修改（通用自动PK 的子规则）=====
-        var ptDivider = document.createElement('div');
-        ptDivider.style.borderTop = '1px solid rgba(255,255,255,0.2)';
-        ptDivider.style.margin = '8px 0 4px 0';
-        ptDivider.style.paddingTop = '6px';
-        ptDivider.style.fontSize = '14px';
-        ptDivider.style.fontWeight = 'bold';
-        ptDivider.style.color = '#fff';
-        ptDivider.textContent = '时间修改';
-        UI.autoPkPanel.appendChild(ptDivider);
-
-        var ptRow = document.createElement('div');
-        ptRow.style.display = 'flex';
-        ptRow.style.alignItems = 'center';
-        ptRow.style.marginBottom = '4px';
-
-        var ptCheckbox = document.createElement('input');
-        ptCheckbox.type = 'checkbox';
-        ptCheckbox.checked = State.pkTimeModEnabled;
-        ptCheckbox.style.marginRight = '6px';
-        ptCheckbox.style.cursor = 'pointer';
-
-        // 分 + 秒 两个输入框（总秒数 = 分×60 + 秒，存入 State.pkTimeModSeconds）
-        function ptMakeNumInput() {
-            var el = document.createElement('input');
-            el.type = 'number';
-            el.step = '1';
-            el.min = String(INT32_MIN);
-            el.max = String(INT32_MAX);
-            el.placeholder = '-';
-            el.style.width = '52px';
-            el.style.fontSize = '12px';
-            el.style.textAlign = 'center';
-            el.style.background = 'rgba(255,255,255,0.2)';
-            el.style.color = '#fff';
-            el.style.border = '1px solid rgba(255,255,255,0.3)';
-            el.style.borderRadius = '3px';
-            el.disabled = !State.pkTimeModEnabled;
-            el.style.opacity = State.pkTimeModEnabled ? '1' : '0.5';
-            return el;
-        }
-        var ptMinInput = ptMakeNumInput();
-        ptMinInput.id = 'pk-time-min';
-        var ptSecInput = ptMakeNumInput();
-        ptSecInput.id = 'pk-time-sec';
-
-        // 用总秒数回填分秒框（保留符号：负总秒显示为 -分/-秒里的分钟带号）
-        function ptFillFromTotal() {
-            if (State.pkTimeModSeconds === null || State.pkTimeModSeconds === undefined) {
-                ptMinInput.value = '';
-                ptSecInput.value = '';
-                return;
-            }
-            var total = State.pkTimeModSeconds;
-            var sign = total < 0 ? -1 : 1;
-            var abs = Math.abs(total);
-            var mins = Math.floor(abs / 60) * sign;
-            var secs = (abs % 60) * sign;
-            ptMinInput.value = String(mins);
-            ptSecInput.value = String(secs);
-        }
-        ptFillFromTotal();
-
-        // 从分秒框读出总秒数并写入 State + 同步
-        function ptCommitFromInputs() {
-            var mRaw = ptMinInput.value.trim();
-            var sRaw = ptSecInput.value.trim();
-            if (mRaw === '' && sRaw === '') {
-                State.pkTimeModSeconds = null;
-                localStorage.removeItem('pkTimeModSeconds');
-                UI.addLogMessage('[时间修改] 时间已清空（提交不会被修改）', 'info');
-                PkTimeMod.push();
-                return;
-            }
-            var m = mRaw === '' ? 0 : parseInt(mRaw, 10);
-            var s = sRaw === '' ? 0 : parseInt(sRaw, 10);
-            if (!Number.isFinite(m)) m = 0;
-            if (!Number.isFinite(s)) s = 0;
-            var total = m * 60 + s;
-            if (total < INT32_MIN) total = INT32_MIN;
-            if (total > INT32_MAX) total = INT32_MAX;
-            State.pkTimeModSeconds = total;
-            localStorage.setItem('pkTimeModSeconds', String(total));
-            ptFillFromTotal();
-            UI.addLogMessage('[时间修改] 提交用时设为 ' + m + '分' + s + '秒 = ' + total + '秒（duration=' + (total * 1000) + 'ms）', 'info');
-            PkTimeMod.push();
-        }
-
-        ptCheckbox.addEventListener('change', function() {
-            State.pkTimeModEnabled = ptCheckbox.checked;
-            localStorage.setItem('pkTimeModEnabled', String(State.pkTimeModEnabled));
-            ptMinInput.disabled = !State.pkTimeModEnabled;
-            ptSecInput.disabled = !State.pkTimeModEnabled;
-            ptMinInput.style.opacity = State.pkTimeModEnabled ? '1' : '0.5';
-            ptSecInput.style.opacity = State.pkTimeModEnabled ? '1' : '0.5';
-            UI.addLogMessage('[时间修改] ' + (State.pkTimeModEnabled ? '已启用' : '已禁用')
-                + (State.pkTimeModEnabled && State.pkTimeModSeconds === null ? '（时间未填，提交不会被修改）' : ''), 'info');
-            PkTimeMod.push();
-        });
-        ptMinInput.addEventListener('change', ptCommitFromInputs);
-        ptSecInput.addEventListener('change', ptCommitFromInputs);
-
-        var ptEnableLabel = document.createElement('span');
-        ptEnableLabel.textContent = '启用';
-        ptEnableLabel.style.fontSize = '12px';
-        ptEnableLabel.style.marginRight = '8px';
-
-        var ptMinSuffix = document.createElement('span');
-        ptMinSuffix.textContent = '分';
-        ptMinSuffix.style.fontSize = '12px';
-        ptMinSuffix.style.margin = '0 4px 0 2px';
-
-        var ptSecSuffix = document.createElement('span');
-        ptSecSuffix.textContent = '秒';
-        ptSecSuffix.style.fontSize = '12px';
-        ptSecSuffix.style.marginLeft = '2px';
-
-        ptRow.appendChild(ptCheckbox);
-        ptRow.appendChild(ptEnableLabel);
-        ptRow.appendChild(ptMinInput);
-        ptRow.appendChild(ptMinSuffix);
-        ptRow.appendChild(ptSecInput);
-        ptRow.appendChild(ptSecSuffix);
-        UI.autoPkPanel.appendChild(ptRow);
-
-        var statsRow = document.createElement('div');
-        statsRow.style.fontSize = '11px';
-        statsRow.style.marginBottom = '6px';
-        statsRow.style.color = '#aaa';
-        statsRow.id = 'auto-pk-stats';
-        UI.autoPkPanel.appendChild(statsRow);
-
-        var statusRow = document.createElement('div');
-        statusRow.style.fontSize = '12px';
-        statusRow.style.marginBottom = '6px';
-        statusRow.id = 'auto-pk-status';
-        UI.autoPkPanel.appendChild(statusRow);
-
-        var btnRow = document.createElement('div');
-        btnRow.style.display = 'flex';
-        btnRow.style.gap = '6px';
-
-        var toggleBtn = document.createElement('button');
-        toggleBtn.id = 'auto-pk-toggle';
-        toggleBtn.textContent = '开始PK';
-        toggleBtn.style.flex = '1';
-        toggleBtn.style.fontSize = '12px';
-        toggleBtn.style.background = 'rgba(255,255,255,0.2)';
-        toggleBtn.style.color = '#fff';
-        toggleBtn.style.border = '1px solid rgba(255,255,255,0.3)';
-        toggleBtn.style.borderRadius = '3px';
-        toggleBtn.addEventListener('click', function() {
-            if (State.autoPkIntervalId) {
-                Scheduler.stop();
-            } else {
-                Scheduler.start();
-            }
-        });
-
-        var reloadBtn = document.createElement('button');
-        reloadBtn.textContent = '重载词库';
-        reloadBtn.style.flex = '1';
-        reloadBtn.style.fontSize = '12px';
-        reloadBtn.style.background = 'rgba(255,255,255,0.2)';
-        reloadBtn.style.color = '#fff';
-        reloadBtn.style.border = '1px solid rgba(255,255,255,0.3)';
-        reloadBtn.style.borderRadius = '3px';
-        reloadBtn.addEventListener('click', function() {
-            State.bucketLoaded = false;
-            State.bucketError = null;
-            State.bucketRetryCount = 0;
-            State.lastMatchedWord = '';
-            State.matchCount = 0;
-            State.missCount = 0;
-            ScoreControl.reset();
-            UI.updateStatus();
-            Loader.loadBucketFromServer();
-        });
-
-        btnRow.appendChild(toggleBtn);
-        btnRow.appendChild(reloadBtn);
-        UI.autoPkPanel.appendChild(btnRow);
-
-        // 听音拼词切换按钮（独立子规则）
-        var lsRow = document.createElement('div');
-        lsRow.style.display = 'flex';
-        lsRow.style.gap = '6px';
-        lsRow.style.marginTop = '6px';
-
-        var listenSpellBtn = document.createElement('button');
-        listenSpellBtn.id = 'auto-pk-listen-spell';
-        listenSpellBtn.textContent = State.listenSpellEnabled ? '听音拼词: 开' : '听音拼词: 关';
-        listenSpellBtn.title = '开启后，在拼写题页面通过碎片长度+字符匹配度反向匹配词库';
-        listenSpellBtn.style.flex = '1';
-        listenSpellBtn.style.fontSize = '12px';
-        listenSpellBtn.style.padding = '6px';
-        listenSpellBtn.style.cursor = 'pointer';
-        listenSpellBtn.style.color = '#fff';
-        listenSpellBtn.style.border = '1px solid rgba(255,255,255,0.3)';
-        listenSpellBtn.style.borderRadius = '3px';
-        listenSpellBtn.style.background = State.listenSpellEnabled ? 'rgba(33,150,243,0.7)' : 'rgba(255,255,255,0.2)';
-
-        function updateListenSpellBtn() {
-            var text = State.listenSpellEnabled ? '听音拼词: 开' : '听音拼词: 关';
-            if (State.listenSpellEnabled) {
-                if (ListenSpell.shouldReverse()) {
-                    text += ' [倒序]';
-                } else if (State.scoreControlEnabled) {
-                    var target = ScoreControl.getTargetCorrect();
-                    if (target > 0) {
-                        text += ' ' + ListenSpell.successCount + '/' + target;
-                    }
-                }
-            }
-            listenSpellBtn.textContent = text;
-            listenSpellBtn.style.background = State.listenSpellEnabled ? 'rgba(33,150,243,0.7)' : 'rgba(255,255,255,0.2)';
-        }
-
-        listenSpellBtn.addEventListener('click', function() {
-            State.listenSpellEnabled = !State.listenSpellEnabled;
-            localStorage.setItem('listenSpellEnabled', String(State.listenSpellEnabled));
-            // 开启时重置控分计数
-            if (State.listenSpellEnabled) {
-                ListenSpell.successCount = 0;
-            }
-            updateListenSpellBtn();
-            // 开启时若调度器未运行，自动启动，避免用户还要单独点"开始PK"
-            if (State.listenSpellEnabled && !State.autoPkIntervalId) {
-                Scheduler.start();
-            }
-            UI.addLogMessage('[听音拼词] ' + (State.listenSpellEnabled ? '已启用' : '已禁用'), 'info');
-        });
-
-        lsRow.appendChild(listenSpellBtn);
-        UI.autoPkPanel.appendChild(lsRow);
-
-        // 暴露刷新函数给 updateStatus 使用
-        UI.updateListenSpellBtn = updateListenSpellBtn;
-
-        document.body.appendChild(UI.autoPkPanel);
-
-        var isDragging = false;
-        var offsetX = 0;
-        var offsetY = 0;
-        UI.autoPkPanel.addEventListener('mousedown', function(e) {
-            isDragging = true;
-            offsetX = e.clientX - UI.autoPkPanel.offsetLeft;
-            offsetY = e.clientY - UI.autoPkPanel.offsetTop;
-        });
-        document.addEventListener('mousemove', function(e) {
-            if (!isDragging) return;
-            UI.autoPkPanel.style.left = (e.clientX - offsetX) + 'px';
-            UI.autoPkPanel.style.top = (e.clientY - offsetY) + 'px';
-            UI.autoPkPanel.style.right = 'auto';
-            UI.autoPkPanel.style.bottom = 'auto';
-        });
-        document.addEventListener('mouseup', function() {
-            isDragging = false;
-        });
-
-        UI.updateStatus();
-    },
-
-    updateStatus: function() {
-        if (!UI.autoPkPanel) return;
-        var statusEl = document.getElementById('auto-pk-status');
-        var toggleBtn = document.getElementById('auto-pk-toggle');
-        var statsEl = document.getElementById('auto-pk-stats');
-        var scoreProgressEl = document.getElementById('auto-pk-score-progress');
-        if (statusEl) {
-            if (State.bucketLoaded) {
-                statusEl.textContent = '词库加载成功';
-                statusEl.style.color = '#4caf50';
-            } else if (State.bucketError) {
-                statusEl.textContent = '词库加载失败: ' + State.bucketError;
-                statusEl.style.color = '#ff9800';
-            } else {
-                statusEl.textContent = '词库加载中...';
-                statusEl.style.color = '#ffc107';
-            }
-        }
-        if (toggleBtn) {
-            toggleBtn.textContent = State.autoPkIntervalId ? '停止PK' : '开始PK';
-        }
-        if (statsEl) {
-            var rate = State.matchCount + State.missCount > 0 ? Math.round(State.matchCount / (State.matchCount + State.missCount) * 100) : 0;
-            statsEl.textContent = '命中: ' + State.matchCount + ' | 未命中: ' + State.missCount + ' | 命中率: ' + rate + '%';
-        }
-        if (scoreProgressEl) {
-            if (State.scoreControlEnabled) {
-                scoreProgressEl.textContent = ScoreControl.getProgressText();
-                scoreProgressEl.style.color = State.scoreControlActive ? '#ff9800' : '#aaa';
-            } else {
-                scoreProgressEl.textContent = '';
-            }
-        }
-        if (typeof UI.updateListenSpellBtn === 'function') {
-            UI.updateListenSpellBtn();
+        if (state.running) {
+            state.timer = setInterval(tick, state.skipAnim ? TICK_FAST_MS : TICK_MS);
         }
     }
-};
 
-// ============================================================
-// 拼写PK模块 —— 处理 u3-spell 类型的拼写填空题
-// 与选择PK共享词库，但交互方式完全不同：
-//   选择PK: 读题 → 匹配 → 点击选项
-//   拼写PK: 读题 → 匹配 → 从碎片块中拼出正确单词
-// ============================================================
-var SpellPk = {
-    lastAnsweredKey: '',
-
-    isActive: function() {
-        return !!document.querySelector('.u3-spell.u3-page-pking__pk-core');
-    },
-
-    getQuestions: function() {
-        var wordCns = document.querySelectorAll('.u3-spell__word-cn');
-        var questions = [];
-        for (var i = 0; i < wordCns.length; i++) {
-            var text = wordCns[i].textContent || '';
-            text = text.replace(/^\s*\/\s*/, '').trim();
-            questions.push(text);
-        }
-        return questions;
-    },
-
-    getActiveQuestionIndex: function() {
-        var wordCns = document.querySelectorAll('.u3-spell__word-cn');
-        for (var i = 0; i < wordCns.length; i++) {
-            if (wordCns[i].classList.contains('is-active')) return i;
-        }
-        // 回退：使用活跃填空位置
-        var fillBlanks = document.querySelectorAll('.u3-spell__fill-blank.is-active');
-        if (fillBlanks.length === 0) return 0;
-        var activeBlank = fillBlanks[0];
-        var fillLists = document.querySelectorAll('.u3-spell__fill-list');
-        for (var j = 0; j < fillLists.length; j++) {
-            if (fillLists[j].contains(activeBlank)) return j;
-        }
-        return 0;
-    },
-
-    getAnswerFragments: function() {
-        var cols = document.querySelectorAll('.u3-spell__answer-col');
-        var fragments = [];
-        for (var i = 0; i < cols.length; i++) {
-            var col = cols[i];
-            var rightEl = col.querySelector('.u3-spell__answer-right');
-            if (rightEl) {
-                var text = (rightEl.textContent || '').trim();
-                fragments.push({ index: i, text: text, element: rightEl });
-            }
-        }
-        return fragments;
-    },
-
-    matchQuestion: function(questionText) {
-        if (!State.jsonData || !State.jsonData.words) return null;
-
-        // 拼写PK特有的前缀清理：去除 "Phrase" / "n." / "v." 等标记
-        var cleanedQuestion = questionText.replace(/^Phrase\s*/i, '').trim();
-        var isChineseInput = /[\u4e00-\u9fff]/.test(cleanedQuestion);
-        var cleanedWord = Utils.removePartOfSpeech(cleanedQuestion);
-        var normalizedCleaned = Utils.normalizeText(cleanedWord);
-        var entryKeyCleaned = Utils.normalizeEntryKey(cleanedWord);
-
-        var byQuestion = State.jsonData.index ? State.jsonData.index.by_question : null;
-        var byWord = State.jsonData.index ? State.jsonData.index.by_word : null;
-        var wordsList = State.jsonData.words;
-
-        // 先尝试索引查找
-        var targetWords = new Set();
-        if (byQuestion) {
-            var lookupKeys = [questionText, normalizedCleaned, cleanedWord, entryKeyCleaned];
-            for (var li = 0; li < lookupKeys.length; li++) {
-                var key = lookupKeys[li];
-                if (key && byQuestion[key]) {
-                    var hits = byQuestion[key];
-                    for (var h = 0; h < hits.length; h++) {
-                        targetWords.add(hits[h]);
-                    }
-                }
-            }
-        }
-
-        if (isChineseInput && targetWords.size === 0) {
-            for (var wi = 0; wi < wordsList.length; wi++) {
-                var w = wordsList[wi];
-                var checkList = (w.clean_meanings || []).concat(w.meanings);
-                for (var ci = 0; ci < checkList.length; ci++) {
-                    var nm = Utils.normalizeText(checkList[ci]);
-                    if (nm && normalizedCleaned && (nm.includes(normalizedCleaned) || normalizedCleaned.includes(nm))) {
-                        targetWords.add(w.word);
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (targetWords.size === 0) return null;
-
-        var bestWord = null;
-        var bestScore = 0;
-        targetWords.forEach(function(tw) {
-            var info = byWord ? byWord[tw] : null;
-            if (!info) {
-                for (var k = 0; k < wordsList.length; k++) {
-                    if (wordsList[k].word === tw) { info = wordsList[k]; break; }
-                }
-            }
-            if (!info) return;
-            var score = Utils.calculateSimilarity(cleanedWord, info.meaning_text || '');
-            if (score > bestScore) {
-                bestScore = score;
-                bestWord = tw;
-            }
-        });
-
-        return bestWord ? { word: bestWord, score: bestScore } : null;
-    },
-
-    findFragmentSequence: function(answer, fragments) {
-        // 归一化：去空格、标点，统一小写
-        function norm(s) { return s.toLowerCase().replace(/[\s.\-_,;:!?']/g, ''); }
-        var answerNorm = norm(answer);
-        var availFrags = [];
-        for (var i = 0; i < fragments.length; i++) {
-            if (fragments[i].text) {
-                availFrags.push({ text: norm(fragments[i].text), origIdx: i, orig: fragments[i] });
-            }
-        }
-
-        var result = SpellPk._searchSequence(answerNorm, availFrags, [], new Set());
-        return result;
-    },
-
-    _searchSequence: function(remaining, frags, path, usedSet) {
-        if (remaining.length === 0) return path;
-
-        // 按碎片长度降序排列，优先匹配较长的碎片（贪心）
-        var sorted = [];
-        for (var i = 0; i < frags.length; i++) {
-            if (!usedSet.has(i)) sorted.push(i);
-        }
-        sorted.sort(function(a, b) { return frags[b].text.length - frags[a].text.length; });
-
-        for (var s = 0; s < sorted.length; s++) {
-            var idx = sorted[s];
-            var frag = frags[idx];
-            if (remaining.startsWith(frag.text)) {
-                usedSet.add(idx);
-                var newPath = path.concat([frags[idx].orig]);
-                var result = SpellPk._searchSequence(remaining.substring(frag.text.length), frags, newPath, usedSet);
-                if (result) return result;
-                usedSet.delete(idx);
-            }
+    // 页面的 +1 飘字/next() 由页面组件（PKCore 的父级）控制；
+    // 不同入口中间可能多包一层，向上找几层即可。
+    function findPageVm(vm) {
+        var node = vm;
+        for (var i = 0; i < 6 && node; i++) {
+            node = node.$parent;
+            if (!node) return null;
+            if (node.isPlus !== undefined && typeof node.next === 'function') return node;
         }
         return null;
-    },
-
-    _clickSequence: function(sequence, idx) {
-        if (idx >= sequence.length) {
-            UI.addLogMessage('[拼写PK] 碎片点击序列完成', 'info');
-            UI.updateStatus();
-            return;
-        }
-        var frag = sequence[idx];
-
-        // 记录当前活跃填空，用于等待变化
-        var prevActiveBlank = document.querySelector('.u3-spell__fill-blank.is-active');
-
-        frag.element.click();
-        UI.addLogMessage('[拼写PK] 点击碎片[' + idx + ']: "' + frag.text + '"', 'info');
-
-        // 最后一个碎片点击后，等待面板设定的间隔再允许处理下一题
-        if (idx >= sequence.length - 1) {
-            UI.updateStatus();
-            var nextDelay = State.autoPkDelay || 1000;
-            UI.addLogMessage('[拼写PK] 当前题碎片已点完，等待 ' + nextDelay + 'ms 后处理下一题', 'info');
-            setTimeout(function() {
-                SpellPk.lastAnsweredKey = '';
-            }, nextDelay);
-            return;
-        }
-
-        // 等待活跃填空变化（is-active 移到下一个 blank）
-        var waitCount = 0;
-        var maxWait = 20; // 最多等 2 秒（20 × 100ms）
-        var checkInterval = setInterval(function() {
-            waitCount++;
-            var curActiveBlank = document.querySelector('.u3-spell__fill-blank.is-active');
-            if (curActiveBlank !== prevActiveBlank || waitCount >= maxWait) {
-                clearInterval(checkInterval);
-                if (waitCount >= maxWait) {
-                    UI.addLogMessage('[拼写PK] 等待填空变化超时，继续下一碎片', 'warning');
-                }
-                // 下一碎片
-                SpellPk._clickSequence(sequence, idx + 1);
-            }
-        }, 100);
-    },
-
-    auto: function() {
-        if (!SpellPk.isActive()) return false;
-
-        var questions = SpellPk.getQuestions();
-        if (questions.length === 0) {
-            UI.addLogMessage('[拼写PK] 未找到题目', 'warning');
-            return true;
-        }
-
-        var activeIdx = SpellPk.getActiveQuestionIndex();
-        if (activeIdx < 0) {
-            UI.addLogMessage('[拼写PK] 未找到活跃题目', 'warning');
-            return true;
-        }
-
-        var activeQuestion = questions[activeIdx] || '';
-        var dedupeKey = activeIdx + ':' + activeQuestion;
-        if (dedupeKey === SpellPk.lastAnsweredKey) return true;
-
-        UI.addLogMessage('[拼写PK] 第' + (activeIdx + 1) + '题: "' + activeQuestion + '"', 'info');
-
-        var answer = null;
-        var matchSource = '';
-
-        // 优先从词库匹配
-        var match = SpellPk.matchQuestion(activeQuestion);
-        if (match) {
-            answer = match.word;
-            matchSource = '词库(置信度=' + Math.round(match.score) + '%)';
-        }
-
-        // 回退：从 DOM 隐藏的 complex-content 读取答案
-        if (!answer) {
-            var complexContents = document.querySelectorAll('.u3-spell__complex-content');
-            if (complexContents.length > activeIdx) {
-                var domAnswer = (complexContents[activeIdx].textContent || '').trim();
-                if (domAnswer) {
-                    answer = domAnswer;
-                    matchSource = 'DOM(complex-content)';
-                }
-            }
-        }
-
-        if (!answer) {
-            UI.addLogMessage('[拼写PK] 词库和DOM均未找到答案', 'warning');
-            SpellPk.lastAnsweredKey = dedupeKey;
-            return true;
-        }
-
-        UI.addLogMessage('[拼写PK] 匹配: ' + answer + ' (来源=' + matchSource + ')', 'match');
-
-        var fragments = SpellPk.getAnswerFragments();
-        if (fragments.length === 0) {
-            UI.addLogMessage('[拼写PK] 未找到可点击碎片', 'warning');
-            SpellPk.lastAnsweredKey = dedupeKey;
-            return true;
-        }
-
-        var fragTexts = [];
-        for (var fi = 0; fi < fragments.length; fi++) {
-            fragTexts.push(fragments[fi].text);
-        }
-        UI.addLogMessage('[拼写PK] 可用碎片: ' + JSON.stringify(fragTexts), 'info');
-
-        // 尝试从碎片拼出答案
-        var sequence = SpellPk.findFragmentSequence(answer, fragments);
-
-        // 如果词库答案拼不出碎片，回退到 DOM complex-content 的答案
-        if (!sequence && matchSource.indexOf('词库') !== -1) {
-            var complexContents = document.querySelectorAll('.u3-spell__complex-content');
-            if (complexContents.length > activeIdx) {
-                var domAnswer = (complexContents[activeIdx].textContent || '').trim();
-                if (domAnswer && domAnswer !== answer) {
-                    UI.addLogMessage('[拼写PK] 词库答案"' + answer + '"拼不出碎片，尝试DOM答案"' + domAnswer + '"', 'info');
-                    answer = domAnswer;
-                    sequence = SpellPk.findFragmentSequence(answer, fragments);
-                }
-            }
-        }
-
-        // 如果完整匹配失败，检查当前填空中已有内容，只匹配剩余部分
-        if (!sequence) {
-            var activeFillList = document.querySelectorAll('.u3-spell__fill-list');
-            var currentFillList = activeFillList.length > activeIdx ? activeFillList[activeIdx] : null;
-            if (currentFillList) {
-                var filledBlanks = currentFillList.querySelectorAll('.u3-spell__fill-blank');
-                var filledText = '';
-                for (var fb = 0; fb < filledBlanks.length; fb++) {
-                    var blankText = (filledBlanks[fb].textContent || '').trim();
-                    if (blankText) filledText += blankText;
-                }
-                if (filledText) {
-                    var normFunc = function(s) { return s.toLowerCase().replace(/[\s.\-_,;:!?']/g, ''); };
-                    var answerNorm = normFunc(answer);
-                    var filledNorm = normFunc(filledText);
-                    if (answerNorm.startsWith(filledNorm) && filledNorm.length < answerNorm.length) {
-                        var remaining = answer.substring(filledText.length);
-                        UI.addLogMessage('[拼写PK] 已填入"' + filledText + '"，匹配剩余"' + remaining + '"', 'info');
-                        sequence = SpellPk.findFragmentSequence(remaining, fragments);
-                    }
-                }
-            }
-        }
-
-        if (!sequence) {
-            UI.addLogMessage('[拼写PK] 无法从碎片拼出 "' + answer + '"', 'warning');
-            SpellPk.lastAnsweredKey = dedupeKey;
-            return true;
-        }
-
-        SpellPk.lastAnsweredKey = dedupeKey;
-        State.matchCount++;
-
-        // 依次点击碎片，每次点击后等待活跃填空变化再点下一个
-        SpellPk._clickSequence(sequence, 0);
-
-        UI.updateStatus();
-        return true;
     }
-};
 
-// ============================================================
-// 听音拼词模块 —— 在无文字题面（仅音频）的拼写题中，
-// 通过对词库的长度（高权重）+字符匹配度比对，反向推断目标单词，
-// 再复用 SpellPk.findFragmentSequence 排序碎片、SpellPk._clickSequence 点击。
-// 与 SpellPk 共享 .u3-spell 页面 DOM，但匹配策略不同：
-//   拼写PK: 读中文题面 → 索引词库 → 拼碎片
-//   听音拼词: 无题面 → 碎片聚合 → 长度+字符相似度匹配词库 → 拼碎片
-// 去重复用 SpellPk.lastAnsweredKey（_clickSequence 完成后会自动清空）。
-// ============================================================
-var ListenSpell = {
-    busy: false,  // 做题流程中标志（含动画播放期，屏蔽轮询）
-    successCount: 0,  // 成功提交题数（碎片消失/题目切换计为成功）
+    // 开启“跳过动画”后，答对时不用等 +1 飘字的 400ms 计时器，
+    // 答错时也不用等错误提示的 2 秒：等页面把 +1 / 提示真正显示出来一帧，
+    // 再帮它收掉，页面就会立刻走 leave -> afterLeaveHandle -> next()。
+    //
+    // 必须等“出现过至少一帧”再动手：值刚变成 true 的同一帧就改回 false，
+    // Vue 根本不会渲染过渡，enter/leave 钩子都不触发，题目会卡住。
+    // 页面 transition 的 enter 钩子（afterEnterHandle / enter）在下一帧就会跑，
+    // 这里留 100ms 余量（掉帧时也不会抢在加分之前收掉 +1）。
+    var SPEEDUP_SETTLE_MS = 100;
 
-    // 每次做题前动态检查：是否需要做错（倒序拼词）
-    shouldReverse: function() {
-        if (!State.scoreControlEnabled) return false;
-        var target = ScoreControl.getTargetCorrect();
-        if (target <= 0) return false;
-        return ListenSpell.successCount >= target;
-    },
-
-    // 字符多重集交集大小（同一字符按最少出现次数计入）
-    _charOverlap: function(a, b) {
-        var counts = {};
-        for (var i = 0; i < a.length; i++) {
-            var ch = a[i];
-            counts[ch] = (counts[ch] || 0) + 1;
-        }
-        var overlap = 0;
-        for (var j = 0; j < b.length; j++) {
-            var c = b[j];
-            if (counts[c] && counts[c] > 0) {
-                overlap++;
-                counts[c]--;
-            }
-        }
-        return overlap;
-    },
-
-    // 综合相似度：长度（高权重 60%）+ 字符匹配（40%）
-    scoreCandidate: function(word, fragConcat) {
-        var wNorm = (word || '').toLowerCase().replace(/[\s.\-_,;:!?']/g, '');
-        var fNorm = (fragConcat || '').toLowerCase().replace(/[\s.\-_,;:!?']/g, '');
-        if (!wNorm || !fNorm) return 0;
-
-        var maxLen = Math.max(wNorm.length, fNorm.length);
-        if (maxLen === 0) return 0;
-
-        // 长度得分：完全一致=100，差异越大扣分越多
-        var lenDiff = Math.abs(wNorm.length - fNorm.length);
-        var lengthScore = (1 - lenDiff / maxLen) * 100;
-
-        // 字符匹配得分：多重集交集 / 最大长度
-        var overlap = ListenSpell._charOverlap(wNorm, fNorm);
-        var charScore = (overlap / maxLen) * 100;
-
-        return lengthScore * 0.6 + charScore * 0.4;
-    },
-
-    // 从词库中匹配最相似的单词
-    matchWord: function(fragments) {
-        if (!State.jsonData || !State.jsonData.words) return null;
-        var fragConcat = '';
-        for (var i = 0; i < fragments.length; i++) {
-            fragConcat += fragments[i].text;
-        }
-        if (!fragConcat) return null;
-
-        var bestWord = null;
-        var bestScore = 0;
-        var words = State.jsonData.words;
-        for (var w = 0; w < words.length; w++) {
-            var wordStr = words[w].word;
-            if (!wordStr) continue;
-            var score = ListenSpell.scoreCandidate(wordStr, fragConcat);
-            if (score > bestScore) {
-                bestScore = score;
-                bestWord = wordStr;
-            }
-        }
-        return bestWord ? { word: bestWord, score: bestScore } : null;
-    },
-
-    isActive: function() {
-        // 用户开启 且 当前页面是 u3-spell 拼写题页面
-        return !!State.listenSpellEnabled
-            && !!document.querySelector('.u3-spell.u3-page-pking__pk-core');
-    },
-
-    // 倒序拼词专用点击流程：
-    // 1. 点击最后一个碎片（倒序首碎片）
-    // 2. 每次点击后重新获取碎片，与初次获取对比，随机点击匹配的碎片
-    // 3. 点击次数 = 初次碎片数时结束
-    _clickReverseSequence: function(originalSequence) {
-        var totalCount = originalSequence.length;
-        var clickCount = 0;
-        var delay = 1500;
-        var origTexts = [];
-        for (var oi = 0; oi < originalSequence.length; oi++) {
-            origTexts.push(originalSequence[oi].text);
-        }
-
-        // 从末尾向前找文本唯一的碎片作为首碎片（避免后续文本匹配混淆）
-        var firstIdx = totalCount - 1;
-        var textCounts = {};
-        for (var ti = 0; ti < originalSequence.length; ti++) {
-            var t = originalSequence[ti].text;
-            textCounts[t] = (textCounts[t] || 0) + 1;
-        }
-        while (firstIdx > 0 && textCounts[originalSequence[firstIdx].text] > 1) {
-            firstIdx--;
-        }
-        var firstFrag = originalSequence[firstIdx];
-        firstFrag.element.click();
-        clickCount++;
-        UI.addLogMessage('[听音拼词] 点击碎片[' + clickCount + '/' + totalCount + ']: "' + firstFrag.text + '"（倒序首碎片，idx=' + firstIdx + '）', 'info');
-
-        if (clickCount >= totalCount) {
-            setTimeout(function() { SpellPk.lastAnsweredKey = ''; }, State.autoPkDelay || 1000);
+    function speedUpAnimation(vm) {
+        if (!state.skipAnim || !state.awaitKey) return;
+        if (now() - state.awaitAt > 15000) {
+            state.awaitKey = '';
+            state.speedAt = 0;
             return;
         }
 
-        // 后续点击：重新获取碎片，与初次对比，随机点击匹配的碎片
-        var clickInterval = setInterval(function() {
-            var curFragments = SpellPk.getAnswerFragments();
-            var matched = [];
-            for (var i = 0; i < curFragments.length; i++) {
-                for (var j = 0; j < origTexts.length; j++) {
-                    if (curFragments[i].text === origTexts[j]) {
-                        matched.push(curFragments[i]);
-                        break;
-                    }
-                }
-            }
+        var target = '';
+        var page = null;
 
-            if (matched.length === 0) {
-                clearInterval(clickInterval);
-                UI.addLogMessage('[听音拼词] 无匹配碎片，停止点击', 'warning');
-                setTimeout(function() { SpellPk.lastAnsweredKey = ''; }, State.autoPkDelay || 1000);
+        if (vm.isWrong) {
+            if (!vm.showToastWrong) {
+                state.speedAt = 0;
                 return;
             }
-
-            var frag = matched[Math.floor(Math.random() * matched.length)];
-            frag.element.click();
-            clickCount++;
-            UI.addLogMessage('[听音拼词] 点击碎片[' + clickCount + '/' + totalCount + ']: "' + frag.text + '"（随机）', 'info');
-
-            if (clickCount >= totalCount) {
-                clearInterval(clickInterval);
-                setTimeout(function() { SpellPk.lastAnsweredKey = ''; }, State.autoPkDelay || 1000);
-            }
-        }, delay);
-    },
-
-    auto: function() {
-        if (!ListenSpell.isActive()) return false;
-
-        // 做题流程中（含动画播放）：不轮询，等独立轮询解除 busy 后恢复
-        if (ListenSpell.busy) return true;
-
-        var activeIdx = SpellPk.getActiveQuestionIndex();
-        var dedupeKey = 'ls_' + activeIdx;
-        // 做题流程中（key 未被 _clickSequence 清空）：不再轮询，直接返回
-        if (dedupeKey === SpellPk.lastAnsweredKey) return true;
-
-        // 轮询碎片是否存在：不存在则静默继续轮询
-        var fragments = SpellPk.getAnswerFragments();
-        if (fragments.length === 0) return true;
-
-        UI.addLogMessage('[听音拼词] 第' + (activeIdx + 1) + '题，碎片数=' + fragments.length, 'info');
-
-        var fragTexts = [];
-        for (var fi = 0; fi < fragments.length; fi++) {
-            fragTexts.push(fragments[fi].text);
-        }
-        UI.addLogMessage('[听音拼词] 可用碎片: ' + JSON.stringify(fragTexts), 'info');
-
-        // 词库匹配：长度（高权重）+ 字符匹配度
-        var match = ListenSpell.matchWord(fragments);
-        if (!match) {
-            UI.addLogMessage('[听音拼词] 词库匹配失败', 'warning');
-            SpellPk.lastAnsweredKey = dedupeKey;
-            return true;
-        }
-
-        UI.addLogMessage('[听音拼词] 匹配: ' + match.word + ' (相似度=' + Math.round(match.score) + '%)', 'match');
-
-        // 按词库正确拼写顺序排序碎片（复用已有方法）
-        var sequence = SpellPk.findFragmentSequence(match.word, fragments);
-
-        // 拼不出则尝试 DOM complex-content 答案
-        if (!sequence) {
-            var complexContents = document.querySelectorAll('.u3-spell__complex-content');
-            if (complexContents.length > activeIdx) {
-                var domAnswer = (complexContents[activeIdx].textContent || '').trim();
-                if (domAnswer && domAnswer !== match.word) {
-                    UI.addLogMessage('[听音拼词] 词库答案"' + match.word + '"拼不出碎片，尝试DOM答案"' + domAnswer + '"', 'info');
-                    sequence = SpellPk.findFragmentSequence(domAnswer, fragments);
-                }
-            }
-        }
-
-        // 已填入部分补齐剩余
-        if (!sequence) {
-            var activeFillList = document.querySelectorAll('.u3-spell__fill-list');
-            var currentFillList = activeFillList.length > activeIdx ? activeFillList[activeIdx] : null;
-            if (currentFillList) {
-                var filledBlanks = currentFillList.querySelectorAll('.u3-spell__fill-blank');
-                var filledText = '';
-                for (var fb = 0; fb < filledBlanks.length; fb++) {
-                    var blankText = (filledBlanks[fb].textContent || '').trim();
-                    if (blankText) filledText += blankText;
-                }
-                if (filledText) {
-                    var normFunc = function(s) { return s.toLowerCase().replace(/[\s.\-_,;:!?']/g, ''); };
-                    var answerNorm = normFunc(match.word);
-                    var filledNorm = normFunc(filledText);
-                    if (answerNorm.startsWith(filledNorm) && filledNorm.length < answerNorm.length) {
-                        var remaining = match.word.substring(filledText.length);
-                        UI.addLogMessage('[听音拼词] 已填入"' + filledText + '"，匹配剩余"' + remaining + '"', 'info');
-                        sequence = SpellPk.findFragmentSequence(remaining, fragments);
-                    }
-                }
-            }
-        }
-
-        if (!sequence) {
-            UI.addLogMessage('[听音拼词] 无法从碎片拼出 "' + match.word + '"', 'warning');
-            SpellPk.lastAnsweredKey = dedupeKey;
-            return true;
-        }
-
-        SpellPk.lastAnsweredKey = dedupeKey;
-        State.matchCount++;
-
-        // 屏蔽轮询，防止做题流程中动画未播完时读到残留碎片
-        ListenSpell.busy = true;
-        // 每次做题前检查是否需要做错：若需要则倒序拼词（首碎片倒序，后续重新获取对比随机点击）
-        if (ListenSpell.shouldReverse()) {
-            ListenSpell._clickReverseSequence(sequence);
+            target = 'toast';
         } else {
-            SpellPk._clickSequence(sequence, 0);
-        }
-
-        // 独立轮询：等待碎片真正消失或题目切换或超时，才解除 busy 恢复轮询
-        var pollCount = 0;
-        var maxPoll = 100; // 最多等 10 秒（100 × 100ms）
-        var animPoll = setInterval(function() {
-            pollCount++;
-            var curFrags = SpellPk.getAnswerFragments();
-            var curIdx = SpellPk.getActiveQuestionIndex();
-            if (curFrags.length === 0 || curIdx !== activeIdx || pollCount >= maxPoll) {
-                clearInterval(animPoll);
-                ListenSpell.busy = false;
-                // 碎片消失或题目切换：计为成功提交
-                if (curFrags.length === 0 || curIdx !== activeIdx) {
-                    ListenSpell.successCount++;
-                    // 恰好达到阈值时提示一次（后续 shouldReverse 会自动返回 true）
-                    if (State.scoreControlEnabled) {
-                        var target = ScoreControl.getTargetCorrect();
-                        if (target > 0 && ListenSpell.successCount === target) {
-                            UI.addLogMessage('[听音拼词] 已达控分目标 ' + target + '，后续将倒序拼词', 'warning');
-                        }
-                    }
-                    UI.updateStatus();
-                }
-                if (pollCount >= maxPoll && curFrags.length > 0 && curIdx === activeIdx) {
-                    UI.addLogMessage('[听音拼词] 等待碎片消失/题目切换超时，恢复轮询', 'warning');
-                }
+            if (vm.curIndex !== -1 || vm.isAnimationScale || vm.isAnimationPop) {
+                state.speedAt = 0;
+                return;
             }
-        }, 100);
-
-        UI.updateStatus();
-        return true;
-    }
-};
-
-var Scheduler = {
-    auto: function() {
-        if (State.aiWaiting) return;
-
-        // 听音拼词优先检测（用户开启时优先于普通拼写PK）
-        if (ListenSpell.isActive()) {
-            ListenSpell.auto();
-            return;
-        }
-
-        // 拼写PK优先检测
-        if (SpellPk.isActive()) {
-            SpellPk.auto();
-            return;
-        }
-
-        var cnElements = document.getElementsByClassName('u3-pk-core__cn');
-        if (!cnElements || cnElements.length === 0) {
-            UI.addLogMessage('[DOM] 未找到题目元素(.u3-pk-core__cn)', 'warning');
-            return;
-        }
-        var textElements = document.getElementsByClassName('u3-pk-core__text');
-        if (!textElements || textElements.length === 0) {
-            UI.addLogMessage('[DOM] 未找到选项元素(.u3-pk-core__text)', 'warning');
-            return;
-        }
-
-        var word = cnElements[0].innerHTML;
-        var l = [];
-        Array.from(textElements).forEach(function(e) { l.push(e.innerHTML); });
-
-        if (word === State.lastMatchedWord) {
-            return;
-        }
-
-        UI.addLogMessage('[DOM] 读取题目innerHTML="' + word + '" | 选项数=' + l.length + ' | 选项=' + JSON.stringify(l), 'info');
-
-        if (State.scoreControlEnabled && ScoreControl.shouldIntentionallyMiss()) {
-            var missResult;
-            if (State.currentBucketType === 'simple') {
-                missResult = MatcherSimple.match(word, l);
-            } else {
-                missResult = MatcherFull.match(word, l);
+            page = findPageVm(vm);
+            if (!page || !page.isPlus) {
+                state.speedAt = 0;
+                return;
             }
-            var worstIndex = ScoreControl.findWorstCandidateIndex();
-            State.lastMatchedWord = word;
-            ScoreControl.recordAnswer(0);
-            UI.addLogMessage('[分数控制] 故意选错: [' + worstIndex + '] ' + l[worstIndex] + ' (最低匹配度)', 'warning');
-            textElements[worstIndex].click();
-            textElements[worstIndex].parentNode.click();
-            textElements[worstIndex].parentNode.parentNode.click();
-            UI.updateStatus();
-            return;
+            target = 'plus';
         }
 
-        var result;
-        if (State.currentBucketType === 'simple') {
-            result = MatcherSimple.match(word, l);
+        if (!state.speedAt) {
+            state.speedAt = now();
+            return;
+        }
+        if (now() - state.speedAt < SPEEDUP_SETTLE_MS) return;
+
+        state.awaitKey = '';
+        state.speedAt = 0;
+
+        if (target === 'toast') {
+            try { vm.showToastWrong = false; } catch (e) { /* 忽略 */ }
         } else {
-            result = MatcherFull.match(word, l);
-        }
-
-        var bestScore = 0;
-        if (State.lastMatchScores && State.lastMatchScores.length > 0) {
-            for (var i = 0; i < State.lastMatchScores.length; i++) {
-                if (State.lastMatchScores[i].score > bestScore) {
-                    bestScore = State.lastMatchScores[i].score;
-                }
+            // 页面在 +1 的 enter 钩子里挂了一个 400ms 计时器，提前收掉它，
+            // 免得它在新题上把 isPlus 关掉、抢跑一次 next()
+            if (page.timer) {
+                try { clearTimeout(page.timer); } catch (e) { /* 忽略 */ }
+                page.timer = null;
             }
+            try { page.isPlus = false; } catch (e) { /* 忽略 */ }
         }
-
-        if (State.aiEnabled && (State.aiBuiltin || State.aiApiKey) && bestScore < State.aiThreshold) {
-            State.aiWaiting = true;
-            State.lastMatchedWord = word;
-            UI.addLogMessage('[AI兜底] 算法置信度=' + Math.round(bestScore) + '% < 阈值=' + State.aiThreshold + '%，调用AI (' + (State.aiModel || AI_MODEL) + ')...', 'info');
-
-            var savedWord = word;
-            var savedCandidates = l;
-            var savedResult = result;
-            var savedTextElements = textElements;
-
-            AIFallback.query(savedWord, savedCandidates).then(function(aiIndex) {
-                var currentCn = document.getElementsByClassName('u3-pk-core__cn');
-                if (currentCn && currentCn.length > 0 && currentCn[0].innerHTML === savedWord) {
-                    ScoreControl.recordAnswer(100);
-                    UI.addLogMessage('[AI兜底] AI选择: [' + aiIndex + '] ' + savedCandidates[aiIndex], 'match');
-                    savedTextElements[aiIndex].click();
-                    savedTextElements[aiIndex].parentNode.click();
-                    savedTextElements[aiIndex].parentNode.parentNode.click();
-                } else {
-                    UI.addLogMessage('[AI兜底] 题目已变化，放弃AI结果', 'warning');
-                }
-                State.aiWaiting = false;
-                UI.updateStatus();
-            }).catch(function(err) {
-                UI.addLogMessage('[AI兜底] AI调用失败: ' + err.message + '，使用算法结果', 'warning');
-                var currentCn2 = document.getElementsByClassName('u3-pk-core__cn');
-                if (currentCn2 && currentCn2.length > 0 && currentCn2[0].innerHTML === savedWord) {
-                    ScoreControl.recordAnswer(bestScore);
-                    savedTextElements[savedResult].click();
-                    savedTextElements[savedResult].parentNode.click();
-                    savedTextElements[savedResult].parentNode.parentNode.click();
-                }
-                State.aiWaiting = false;
-                UI.updateStatus();
-            });
-            return;
-        }
-
-        State.lastMatchedWord = word;
-        ScoreControl.recordAnswer(bestScore);
-        UI.addLogMessage('[点击] 点击候选[' + result + ']: "' + l[result] + '"', 'info');
-        textElements[result].click();
-        textElements[result].parentNode.click();
-        textElements[result].parentNode.parentNode.click();
-        UI.updateStatus();
-    },
-
-    start: function() {
-        if (State.autoPkIntervalId) {
-            clearInterval(State.autoPkIntervalId);
-            State.autoPkIntervalId = null;
-        }
-        State.autoPkIntervalId = setInterval(Scheduler.auto, State.autoPkDelay);
-        UI.updateStatus();
-        UI.addLogMessage('[控制] 自动PK已启动，间隔=' + State.autoPkDelay + 'ms', 'info');
-    },
-
-    stop: function() {
-        if (State.autoPkIntervalId) {
-            clearInterval(State.autoPkIntervalId);
-            State.autoPkIntervalId = null;
-        }
-        UI.updateStatus();
-        UI.addLogMessage('[控制] 自动PK已停止 | 统计: 命中=' + State.matchCount + ' 未命中=' + State.missCount + ' 命中率=' + (State.matchCount + State.missCount > 0 ? Math.round(State.matchCount / (State.matchCount + State.missCount) * 100) : 0) + '%', 'info');
     }
-};
 
-// ============================================================
-// 时间修改修改 —— 网络层 Hook（fetch + XHR）
-// 本规则集靠 DOM 点击答题，原本不碰 submit 请求；这里新增 hook，
-// 拦截两类提交并改写 submitJson.duration（毫秒）+ wordInfos[].answerTime。
-//   普通PK : .../wordsbtl/student/submit
-//   词王争霸: .../word-king/submit
-// duration 单位为毫秒：用户填的是“秒”，落库时 ×1000。
-// ============================================================
-var PkTimeMod = {
-    // 改包逻辑已移到代理层(modules/proxy.js)，因为 submit 是 Electron 客户端的
-    // 网络请求，不经过本注入页的 fetch/XHR——页面层 hook 永远拦不到。
-    // 这里只负责把"启用/秒数"状态经本地 bucket server 推给代理层。
-    bucketBase: function() {
-        return a366BucketOrigin();
-    },
+    // ---------- 日志 ----------
 
-    push: function() {
-        var payload = {
-            enabled: State.pkTimeModEnabled === true,
-            seconds: (State.pkTimeModSeconds === null || State.pkTimeModSeconds === undefined)
-                ? null : State.pkTimeModSeconds
-        };
+    function addLog(message, type) {
+        if (!ui.log) return;
+
+        var time = '';
         try {
-            fetch(PkTimeMod.bucketBase() + '/pk-time', {
+            time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        } catch (e) {
+            time = new Date().toLocaleTimeString();
+        }
+
+        var stick = ui.log.scrollHeight - ui.log.scrollTop - ui.log.clientHeight < 24;
+        var row = document.createElement('div');
+        row.className = 'a366-log-' + (type || 'info');
+        row.innerHTML = '<span class="a366-ts">[' + time + ']</span>' + escapeHtml(message);
+        ui.log.appendChild(row);
+
+        while (ui.log.childNodes.length > LOG_LIMIT) {
+            ui.log.removeChild(ui.log.firstChild);
+        }
+        if (stick) ui.log.scrollTop = ui.log.scrollHeight;
+    }
+
+    function log(message) {
+        if (state.debug && window.console && console.log) {
+            console.log('%c[AutoPk] ' + message, 'color:#00a86b;font-weight:bold');
+        }
+        addLog(message, 'info');
+    }
+
+    function warn(message) {
+        if (window.console && console.warn) {
+            console.warn('[AutoPk] ' + message);
+        }
+        addLog(message, 'warn');
+    }
+
+    // ---------- 页面数据读取（与原逻辑一致） ----------
+
+    // 去掉页面渲染时附加的 style 和 HTML 标签，仅用于读取显示文字
+    function removeHtmlStyles(text) {
+        return String(text || '')
+            .replace(/style="[^"]*"/g, '')
+            .replace(/<[^>]*>/g, '');
+    }
+
+    function textOf(value) {
+        if (value === null || value === undefined) return '';
+        var text = String(value);
+        if (text.indexOf('<') !== -1 || text.indexOf('&') !== -1) {
+            var holder = document.createElement('div');
+            holder.innerHTML = text;
+            text = holder.textContent || holder.innerText || '';
+        }
+        return text
+            .replace(/\u00a0/g, ' ')
+            .replace(/[\s\u3000]+/g, ' ')
+            .trim();
+    }
+
+    function sameText(a, b) {
+        return textOf(removeHtmlStyles(a)) === textOf(removeHtmlStyles(b));
+    }
+
+    function isVisible(element) {
+        if (!element) return false;
+        var style = window.getComputedStyle ? getComputedStyle(element) : null;
+        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+        var rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function findRoot() {
+        var roots = document.querySelectorAll('.u3-pk-core');
+        for (var i = 0; i < roots.length; i++) {
+            if (isVisible(roots[i])) return roots[i];
+        }
+        return null;
+    }
+
+    function findVm(root) {
+        var element = root;
+        while (element) {
+            if (element.__vue__ && element.__vue__.word) {
+                return element.__vue__;
+            }
+            element = element.parentElement;
+        }
+        return null;
+    }
+
+    // 组件里的 D() 只做一件事：把同一个答案字段（word.cn）变成选项上显示的文本
+    // （去括号 -> 取第一个义项 -> 去掉 phr./phrase）。
+    // 这里复刻它只是为了知道“这个答案会被渲染成什么样”，不会去和选项列表做任何比对。
+    function displayedMeaning(value) {
+        if (value === null || value === undefined) return '';
+        var text = String(value);
+        if (!text) return '';
+
+        var noParen = text.replace(/[(（][^)）]*[)）]/g, '');
+        var first = (noParen.split(/[;；,，]/)[0] || '').trim();
+        var chosen = /[\u4e00-\u9fff]/.test(first) ? first : text.trim();
+
+        return chosen
+            .replace(/phr\./g, '')
+            .replace(/phrase/g, '')
+            .replace(/Phrase/g, '')
+            .trim();
+    }
+
+    // 直接从组件当前单词对象里取正确答案候选。
+    // 正常情况下就是 word.en / word.cn；额外字段只是同一对象里的备用答案文本，
+    // 不是词库，也不是相似度匹配。
+    function getAnswerCandidates(vm) {
+        var word = vm && vm.word ? vm.word : {};
+        var fields = vm.en2cn
+            ? [word.cn, word.paraphrase, word.meaning, word.definition]
+            : [word.en, word.entry, word.word];
+
+        var out = [];
+        var seen = {};
+
+        function add(value) {
+            var text = textOf(value);
+            if (!text || seen[text]) return;
+            seen[text] = true;
+            out.push(text);
+        }
+
+        for (var i = 0; i < fields.length; i++) {
+            add(fields[i]);
+            // 页面把 word.cn 渲染成 D(word.cn)，所以原值和渲染值都要能命中
+            if (vm.en2cn) add(displayedMeaning(textOf(fields[i])));
+        }
+        return out;
+    }
+
+    function questionKey(vm, root, candidates) {
+        var question = '';
+        var node = root.querySelector('.u3-pk-core__cn');
+        if (node) question = textOf(node.innerHTML);
+        var update = vm && vm.updateLocation !== undefined ? String(vm.updateLocation) : '';
+        return update + '|' + question + '|' + candidates.join('\u0001');
+    }
+
+    function questionLabel(vm, root) {
+        var node = root.querySelector('.u3-pk-core__cn');
+        var text = node ? textOf(node.innerHTML) : '';
+        if (text) return text;
+        var word = vm && vm.word ? vm.word : {};
+        return textOf(vm && vm.en2cn ? word.en : word.cn) || '当前题目';
+    }
+
+    function matchesAny(text, candidates) {
+        for (var i = 0; i < candidates.length; i++) {
+            if (sameText(text, candidates[i])) return true;
+        }
+        return false;
+    }
+
+    function clickAnswer(root, answer) {
+        var words = root.querySelectorAll('.u3-pk-core__word');
+        for (var i = 0; i < words.length; i++) {
+            if (sameText(words[i].textContent, answer)) {
+                words[i].click();
+                return true;
+            }
+        }
+
+        // 有些题型选项文字在子节点里，再按 .u3-pk-core__text 精确找一次
+        var texts = root.querySelectorAll('.u3-pk-core__text');
+        for (var j = 0; j < texts.length; j++) {
+            if (sameText(texts[j].textContent, answer)) {
+                var target = texts[j].parentNode || texts[j];
+                target.click();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 故意答错时，随机挑一个文字不等于答案的可见选项
+    function clickWrong(root, candidates) {
+        var pool = [];
+        var words = root.querySelectorAll('.u3-pk-core__word');
+        var i;
+
+        for (i = 0; i < words.length; i++) {
+            if (isVisible(words[i]) && !matchesAny(words[i].textContent, candidates)) {
+                pool.push(words[i]);
+            }
+        }
+        if (!pool.length) {
+            var texts = root.querySelectorAll('.u3-pk-core__text');
+            for (i = 0; i < texts.length; i++) {
+                if (isVisible(texts[i]) && !matchesAny(texts[i].textContent, candidates)) {
+                    pool.push(texts[i].parentNode || texts[i]);
+                }
+            }
+        }
+        if (!pool.length) return null;
+
+        var target = pool[Math.floor(Math.random() * pool.length)];
+        var label = textOf(target.textContent);
+        target.click();
+        return label;
+    }
+
+    // ---------- 主循环 ----------
+
+    function tick() {
+        if (!state.running) return;
+
+        var root = findRoot();
+        if (!root) return;
+
+        var vm = findVm(root);
+        if (!vm) {
+            if (!state.warnedVm) {
+                state.warnedVm = true;
+                warn('未找到 PKCore 的 Vue 组件实例，暂时无法读取标准答案');
+            }
+            return;
+        }
+        state.warnedVm = false;
+
+        // 跳过动画：跟进上一题的收尾（放在题目判定之前，动画期间也要跑）
+        speedUpAnimation(vm);
+
+        // 已经点过、正在播动画、题目禁用时都不要重复点击
+        if (vm.disabled) return;
+
+        var candidates = getAnswerCandidates(vm);
+        if (!candidates.length) {
+            if (!state.warnedEmpty) {
+                state.warnedEmpty = true;
+                state.failed++;
+                warn('组件 word 里没有当前模式的答案字段，已跳过');
+            }
+            return;
+        }
+        state.warnedEmpty = false;
+
+        var key = questionKey(vm, root, candidates);
+        if (key === state.lastKey) return;
+
+        // clickFlag / curIndex 只是“可能已作答”的提示，等 2.5 秒还没有变化就照常作答
+        var blocked = !!vm.clickFlag || (typeof vm.curIndex === 'number' && vm.curIndex >= 0);
+        if (blocked) {
+            if (state.blockedKey !== key) {
+                state.blockedKey = key;
+                state.blockedAt = now();
+            }
+            if (now() - state.blockedAt < 2500) return;
+        } else {
+            state.blockedKey = '';
+        }
+
+        // 新题出现后先等“间隔”这么久，再动手
+        if (state.pendingKey !== key) {
+            state.pendingKey = key;
+            state.pendingAt = now();
+        }
+        if (now() - state.pendingAt < state.interval) return;
+
+        state.pendingKey = '';
+        state.lastKey = key;
+
+        var question = questionLabel(vm, root);
+        var wantCorrect = Math.random() * 100 < state.accuracy;
+
+        if (!wantCorrect) {
+            var wrongText = clickWrong(root, candidates);
+            if (wrongText !== null) {
+                state.answered++;
+                state.wrong++;
+                state.warnedKey = '';
+                state.awaitKey = key;
+                state.awaitAt = now();
+                addLog('作答 ✗ ' + question + ' → ' + wrongText, 'warn');
+                updateStats();
+                return;
+            }
+            // 找不到别的选项时退回正确答案，避免卡住
+        }
+
+        for (var i = 0; i < candidates.length; i++) {
+            if (clickAnswer(root, candidates[i])) {
+                state.answered++;
+                state.correct++;
+                state.warnedKey = '';
+                state.awaitKey = key;
+                state.awaitAt = now();
+                addLog('作答 ✓ ' + question + ' → ' + candidates[i], 'success');
+                updateStats();
+                return;
+            }
+        }
+
+        state.failed++;
+        state.lastKey = '';
+        // 同一题找不到选项时只提示一次，避免每 100ms 刷屏
+        if (state.warnedKey !== key) {
+            state.warnedKey = key;
+            warn('组件答案“' + candidates.join(' / ') + '”在选项中没有找到完全一致的文字');
+        }
+    }
+
+    function start() {
+        if (state.running) return;
+        state.running = true;
+        state.lastKey = '';
+        state.pendingKey = '';
+        state.pendingAt = 0;
+        state.warnedKey = '';
+        state.warnedEmpty = false;
+        state.blockedKey = '';
+        state.awaitKey = '';
+        state.speedAt = 0;
+        restartTimer();
+        log('自动作答已启动（正确率 ' + state.accuracy + '%，间隔 ' + state.interval + 'ms' +
+            (state.skipAnim ? '，已跳过动画' : '') + '）');
+        syncUI();
+    }
+
+    function stop() {
+        if (!state.running) return;
+        state.running = false;
+        state.awaitKey = '';
+        state.speedAt = 0;
+        restartTimer();
+        log('自动作答已停止，累计作答 ' + state.answered + ' 题');
+        syncUI();
+    }
+
+    function updateStats() {
+        if (!ui.stats.answered) return;
+        ui.stats.answered.textContent = String(state.answered);
+        ui.stats.correct.textContent = String(state.correct);
+        ui.stats.wrong.textContent = String(state.wrong);
+        ui.stats.rate.textContent = state.answered
+            ? Math.round(state.correct / state.answered * 100) + '%'
+            : '-';
+    }
+
+    function syncUI() {
+        if (!ui.panel) return;
+        if (state.running) ui.panel.classList.add('a366-running');
+        else ui.panel.classList.remove('a366-running');
+        if (ui.toggle) {
+            ui.toggle.textContent = state.running ? '停止' : '开始';
+            if (state.running) ui.toggle.classList.add('a366-stop');
+            else ui.toggle.classList.remove('a366-stop');
+        }
+    }
+
+    function applyAccuracy(value) {
+        var v = Number(value);
+        if (!isFinite(v)) return;
+        v = Math.max(0, Math.min(100, Math.round(v)));
+        state.accuracy = v;
+        saveNumber('a366_pk_accuracy', v);
+        if (ui.accuracy) ui.accuracy.value = String(v);
+        if (ui.accuracyVal) ui.accuracyVal.textContent = v + '%';
+    }
+
+    function applyInterval(value) {
+        var v = Number(value);
+        if (!isFinite(v)) return;
+        v = Math.max(0, Math.min(60000, Math.round(v)));
+        state.interval = v;
+        saveNumber('a366_pk_interval', v);
+        if (ui.interval) ui.interval.value = String(v);
+    }
+
+    function applySkip(value) {
+        var on = !!value;
+        state.skipAnim = on;
+        saveFlag('a366_pk_skip_anim', on);
+        applySkipStyle(on);
+        if (!on) {
+            state.awaitKey = '';
+            state.speedAt = 0;
+        }
+        if (ui.skip) ui.skip.checked = on;
+        restartTimer();
+    }
+
+    // ---------- 提交时间（代理层改包） ----------
+    //
+    // 提交请求由 Electron 客户端发出，不经过页面里的 fetch/XHR，页面层 hook 拦不到。
+    // 因此这里只把「启用 / 秒数」推给本地服务（/pk-time），由代理层在转发时改写
+    // submitJson.duration（毫秒）和 wordInfos[].answerTime，见 modules/proxy/time-modifier.js。
+
+    function bucketBase() {
+        var cfg = window.__A366__ || {};
+        if (cfg.bucket) return String(cfg.bucket);
+        if (cfg.bucketPort) return 'http://127.0.0.1:' + cfg.bucketPort;
+        return 'http://127.0.0.1:5290';
+    }
+
+    function formatSeconds(total) {
+        var mins = Math.floor(total / 60);
+        var secs = total % 60;
+        if (mins > 0) return mins + '分' + secs + '秒';
+        return secs + '秒';
+    }
+
+    function describeSubmitTime() {
+        if (!state.submitTimeEnabled) return '已关闭';
+        if (state.submitTimeSeconds === null) return '已启用，未填时长（提交不会被修改）';
+        return '已启用，提交用时 ' + formatSeconds(state.submitTimeSeconds);
+    }
+
+    function pushSubmitTime() {
+        var payload = {
+            enabled: state.submitTimeEnabled === true,
+            seconds: state.submitTimeSeconds === null ? null : state.submitTimeSeconds
+        };
+        // 日志文案按“推送这一刻”的状态生成，避免异步返回时读到更新后的值
+        var label = describeSubmitTime();
+
+        state.submitTimeSync = 'pending';
+        try {
+            // 必须用 text/plain：本地服务没有处理 OPTIONS 预检，
+            // application/json 会被浏览器的 CORS 预检拦掉。
+            // 请求体仍是 JSON，服务端照样 JSON.parse（modules/proxy/http.js）。
+            fetch(bucketBase() + '/pk-time', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
                 body: JSON.stringify(payload),
                 cache: 'no-cache'
-            }).then(function(r) { return r.json(); })
-              .then(function(res) {
-                  if (res && res.success) {
-                      UI.addLogMessage('[时间修改] 状态已同步到代理层 | 启用='
-                          + payload.enabled + ' 秒数=' + (payload.seconds === null ? '-' : payload.seconds), 'success');
-                  } else {
-                      UI.addLogMessage('[时间修改] 同步失败(代理层返回异常)', 'warning');
-                  }
-              })
-              .catch(function(e) {
-                  UI.addLogMessage('[时间修改] 同步失败：连不上本地服务(' + e.message + ')，确认代理已开启', 'warning');
-              });
+            }).then(function (res) {
+                return res.json();
+            }).then(function (res) {
+                if (res && res.success) {
+                    state.submitTimeSync = 'ok';
+                    log('提交时间已同步到代理层（' + label + '）');
+                } else {
+                    state.submitTimeSync = 'fail';
+                    warn('提交时间同步失败：代理层返回异常');
+                }
+            }).catch(function (e) {
+                state.submitTimeSync = 'fail';
+                warn('提交时间同步失败：' + (e && e.message ? e.message : e) + '（确认主程序仍在运行）');
+            });
         } catch (e) {
-            UI.addLogMessage('[时间修改] 同步异常：' + e.message, 'warning');
+            state.submitTimeSync = 'fail';
+            warn('提交时间同步异常：' + (e && e.message ? e.message : e));
         }
-    },
+    }
 
-    // 初始化：把面板当前状态推一次，保证代理层与面板一致
-    install: function() {
-        PkTimeMod.push();
-    },
-
-    // 词库加载后自动计算合理时间：每词 2.5~4 秒随机取值，取整
-    autoCalc: function(wordCount) {
-        if (!wordCount || wordCount <= 0) return;
-        var rate = 2.5 + Math.random() * 1.5;
-        var total = Math.round(wordCount * rate);
-        State.pkTimeModSeconds = total;
-        localStorage.setItem('pkTimeModSeconds', String(total));
-        UI.addLogMessage('[时间修改] 词库 ' + wordCount + ' 词 × ' + rate.toFixed(1) + 's/词 ≈ ' + total + '秒，已自动设定', 'info');
-        PkTimeMod.push();
-        PkTimeMod.updateInputs();
-    },
-
-    // 用 State.pkTimeModSeconds 回填 UI 分秒输入框
-    updateInputs: function() {
-        var minInput = document.getElementById('pk-time-min');
-        var secInput = document.getElementById('pk-time-sec');
-        if (!minInput || !secInput) return;
-        if (State.pkTimeModSeconds === null || State.pkTimeModSeconds === undefined) {
-            minInput.value = '';
-            secInput.value = '';
+    function fillTimeInputs() {
+        if (!ui.timeMin || !ui.timeSec) return;
+        if (state.submitTimeSeconds === null) {
+            ui.timeMin.value = '';
+            ui.timeSec.value = '';
             return;
         }
-        var total = State.pkTimeModSeconds;
-        var sign = total < 0 ? -1 : 1;
-        var abs = Math.abs(total);
-        minInput.value = String(Math.floor(abs / 60) * sign);
-        secInput.value = String((abs % 60) * sign);
+        ui.timeMin.value = String(Math.floor(state.submitTimeSeconds / 60));
+        ui.timeSec.value = String(state.submitTimeSeconds % 60);
     }
-};
 
-function init() {
-    UI.createAutoPkPanel();
-    UI.createLogPanel();
-    PkTimeMod.install();
-    UI.addLogMessage('系统初始化完成', 'success');
-    Loader.loadBucketFromServer();
-}
+    function applySubmitTime(enabled, seconds, silent) {
+        var on = !!enabled;
+        var total = null;
+        if (seconds !== null && seconds !== undefined && seconds !== '') {
+            total = Math.round(Number(seconds));
+            if (!isFinite(total)) total = null;
+            else total = Math.max(0, Math.min(INT32_MAX, total));
+        }
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-        UI.showSuccessMessage();
-        init();
-    });
-} else {
-    UI.showSuccessMessage();
-    init();
-}
+        state.submitTimeEnabled = on;
+        state.submitTimeSeconds = total;
+        saveFlag(TIME_ENABLED_KEY, on);
+        try {
+            if (total === null) window.localStorage.removeItem(TIME_SECONDS_KEY);
+            else window.localStorage.setItem(TIME_SECONDS_KEY, String(total));
+        } catch (e) {
+            /* 忽略 */
+        }
+
+        if (ui.timeCheck) ui.timeCheck.checked = on;
+        fillTimeInputs();
+        if (!silent) pushSubmitTime();
+    }
+
+    function commitTimeInputs() {
+        if (!ui.timeMin || !ui.timeSec) return;
+        var minRaw = String(ui.timeMin.value || '').trim();
+        var secRaw = String(ui.timeSec.value || '').trim();
+
+        if (minRaw === '' && secRaw === '') {
+            applySubmitTime(state.submitTimeEnabled, null);
+            log('提交时间已清空（提交不会被修改）');
+            return;
+        }
+
+        var mins = parseInt(minRaw, 10);
+        var secs = parseInt(secRaw, 10);
+        if (!isFinite(mins)) mins = 0;
+        if (!isFinite(secs)) secs = 0;
+
+        var total = mins * 60 + secs;
+        if (total < 0) total = 0;
+        if (total > INT32_MAX) total = INT32_MAX;
+        applySubmitTime(state.submitTimeEnabled, total);
+        log('提交时间已设为 ' + formatSeconds(total) + '（duration=' + total * 1000 + 'ms）');
+    }
+
+    // ---------- 控制台 UI ----------
+
+    var PANEL_CSS = [
+        '#a366-pk-panel{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:300px;max-width:calc(100vw - 24px);',
+        'background:#fff;color:#212529;border:1px solid #dee2e6;border-radius:8px;box-shadow:0 8px 28px rgba(0,0,0,.22);',
+        'font:12px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;',
+        'overflow:hidden;user-select:none;-webkit-user-select:none;}',
+        '#a366-pk-panel.a366-dragging{box-shadow:0 16px 44px rgba(0,0,0,.34);}',
+        '#a366-pk-panel *{box-sizing:border-box;}',
+        '#a366-pk-panel .a366-hd{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f8f9fa;',
+        'border-bottom:1px solid #dee2e6;cursor:move;touch-action:none;-ms-touch-action:none;}',
+        '#a366-pk-panel .a366-dot{flex:none;width:8px;height:8px;border-radius:50%;background:#adb5bd;}',
+        '#a366-pk-panel.a366-running .a366-dot{background:#28a745;box-shadow:0 0 0 3px rgba(40,167,69,.16);}',
+        '#a366-pk-panel .a366-title{flex:1;min-width:0;font-weight:600;color:#007bff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+        '#a366-pk-panel .a366-ib{flex:none;width:22px;height:22px;padding:0;line-height:18px;border:1px solid #dee2e6;',
+        'border-radius:4px;background:#fff;color:#6c757d;font-size:12px;cursor:pointer;}',
+        '#a366-pk-panel .a366-ib:hover{color:#212529;}',
+        '#a366-pk-panel .a366-bd{display:flex;flex-direction:column;gap:8px;padding:10px;}',
+        '#a366-pk-panel.a366-collapsed .a366-bd{display:none;}',
+        '#a366-pk-panel .a366-stats{display:flex;align-items:center;justify-content:space-between;gap:6px;',
+        'padding:6px 8px;background:#f8f9fa;border:1px solid #e9ecef;border-radius:6px;overflow:hidden;}',
+        '#a366-pk-panel .a366-stats span{color:#6c757d;white-space:nowrap;}',
+        '#a366-pk-panel .a366-stats b{color:#212529;font-weight:600;}',
+        '#a366-pk-panel .a366-stats b.ok{color:#28a745;}',
+        '#a366-pk-panel .a366-stats b.bad{color:#dc3545;}',
+        '#a366-pk-panel .a366-row{display:flex;align-items:center;gap:6px;}',
+        '#a366-pk-panel .a366-label{flex:none;color:#6c757d;}',
+        '#a366-pk-panel .a366-range{flex:1;min-width:40px;margin:0;accent-color:#007bff;}',
+        '#a366-pk-panel .a366-val{flex:none;width:44px;text-align:right;color:#007bff;font-weight:600;}',
+        '#a366-pk-panel .a366-num{width:64px;padding:3px 4px;border:1px solid #dee2e6;border-radius:4px;',
+        'font-size:12px;text-align:center;color:#212529;background:#fff;outline:none;}',
+        '#a366-pk-panel .a366-num.a366-time{width:42px;}',
+        '#a366-pk-panel .a366-unit{flex:none;color:#adb5bd;}',
+        '#a366-pk-panel .a366-check{display:flex;align-items:center;gap:4px;flex:1;color:#495057;cursor:pointer;}',
+        '#a366-pk-panel .a366-check input{margin:0;accent-color:#007bff;cursor:pointer;}',
+        '#a366-pk-panel .a366-btn{flex:none;padding:4px 8px;border:1px solid #dee2e6;border-radius:4px;',
+        'background:#fff;color:#495057;font-size:12px;cursor:pointer;}',
+        '#a366-pk-panel .a366-btn:hover{border-color:#adb5bd;}',
+        '#a366-pk-panel .a366-btn.a366-primary{flex:1;background:#007bff;border-color:#007bff;color:#fff;}',
+        '#a366-pk-panel .a366-btn.a366-primary.a366-stop{background:#dc3545;border-color:#dc3545;}',
+        '#a366-pk-panel .a366-log{height:112px;overflow-y:auto;padding:4px 6px;border:1px solid #e9ecef;border-radius:6px;',
+        'background:#fff;font:11px/1.5 Consolas,"Courier New",monospace;word-break:break-all;',
+        'user-select:text;-webkit-user-select:text;}',
+        '#a366-pk-panel .a366-log>div{padding:1px 0;border-bottom:1px dashed #f1f3f5;}',
+        '#a366-pk-panel .a366-log .a366-ts{color:#adb5bd;margin-right:4px;}',
+        '#a366-pk-panel .a366-log .a366-log-info{color:#6c757d;}',
+        '#a366-pk-panel .a366-log .a366-log-success{color:#28a745;}',
+        '#a366-pk-panel .a366-log .a366-log-warn{color:#e67e22;}',
+        '#a366-pk-panel .a366-log .a366-log-error{color:#dc3545;}',
+        '#a366-pk-launcher{position:fixed;right:16px;bottom:16px;z-index:2147483000;width:44px;height:44px;',
+        'border-radius:50%;background:#007bff;color:#fff;display:flex;align-items:center;justify-content:center;',
+        'font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;',
+        'cursor:pointer;user-select:none;box-shadow:0 4px 16px rgba(0,123,255,.45);}'
+    ].join('\n');
+
+    var PANEL_HTML = [
+        '<div class="a366-hd" id="a366-pk-hd">',
+        '<span class="a366-dot"></span>',
+        '<span class="a366-title">单词PK自动作答</span>',
+        '<button type="button" class="a366-ib" data-a366="collapse" title="折叠/展开">—</button>',
+        '<button type="button" class="a366-ib" data-a366="hide" title="隐藏控制台">✕</button>',
+        '</div>',
+        '<div class="a366-bd">',
+        '<div class="a366-stats">',
+        '<span>已答 <b data-stat="answered">0</b></span>',
+        '<span>正确 <b class="ok" data-stat="correct">0</b></span>',
+        '<span>错误 <b class="bad" data-stat="wrong">0</b></span>',
+        '<span>正确率 <b data-stat="rate">-</b></span>',
+        '</div>',
+        '<div class="a366-row">',
+        '<span class="a366-label">正确率</span>',
+        '<input class="a366-range" type="range" min="0" max="100" step="5" data-ctl="accuracy">',
+        '<span class="a366-val" data-val="accuracy">100%</span>',
+        '</div>',
+        '<div class="a366-row">',
+        '<span class="a366-label">间隔</span>',
+        '<input class="a366-num" type="number" min="0" max="60000" step="50" data-ctl="interval">',
+        '<span class="a366-unit">ms</span>',
+        '<button type="button" class="a366-btn" data-preset="0">0</button>',
+        '<button type="button" class="a366-btn" data-preset="150">150</button>',
+        '<button type="button" class="a366-btn" data-preset="500">500</button>',
+        '</div>',
+        '<div class="a366-row">',
+        '<label class="a366-check"><input type="checkbox" data-ctl="skip"> 跳过动画</label>',
+        '<span class="a366-unit">加快作答</span>',
+        '</div>',
+        '<div class="a366-row">',
+        '<label class="a366-check"><input type="checkbox" data-ctl="time"> 提交时间</label>',
+        '<input class="a366-num a366-time" type="number" min="0" step="1" data-ctl="time-min">',
+        '<span class="a366-unit">分</span>',
+        '<input class="a366-num a366-time" type="number" min="0" max="59" step="1" data-ctl="time-sec">',
+        '<span class="a366-unit">秒</span>',
+        '</div>',
+        '<div class="a366-row">',
+        '<button type="button" class="a366-btn a366-primary" data-a366="toggle">停止</button>',
+        '<button type="button" class="a366-btn" data-a366="clear">清空日志</button>',
+        '</div>',
+        '<div class="a366-log" data-log></div>',
+        '</div>'
+    ].join('');
+
+    // 鼠标 + 触控都能拖动；优先 Pointer Events，不支持时退回 mouse/touch。
+    function makeDraggable(panel, handle) {
+        if (!panel || !handle) return;
+
+        var drag = null;
+
+        function pointOf(e) {
+            if (e.touches && e.touches.length) return e.touches[0];
+            if (e.changedTouches && e.changedTouches.length) return e.changedTouches[0];
+            return e;
+        }
+
+        function onDown(e) {
+            if (e.button !== undefined && e.button !== 0) return;
+            var target = e.target || {};
+            var tag = String(target.tagName || '').toLowerCase();
+            if (tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'a') return;
+
+            var p = pointOf(e);
+            var rect = panel.getBoundingClientRect();
+            drag = { x: p.clientX, y: p.clientY, left: rect.left, top: rect.top };
+
+            panel.style.left = rect.left + 'px';
+            panel.style.top = rect.top + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+            panel.classList.add('a366-dragging');
+
+            if (e.pointerId !== undefined && handle.setPointerCapture) {
+                try { handle.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+            }
+            e.preventDefault();
+            e.stopPropagation();
+        }
+
+        function onMove(e) {
+            if (!drag) return;
+            var p = pointOf(e);
+            var width = panel.offsetWidth || 300;
+            var left = drag.left + p.clientX - drag.x;
+            var top = drag.top + p.clientY - drag.y;
+
+            left = Math.max(4, Math.min(window.innerWidth - width - 4, left));
+            top = Math.max(4, Math.min(window.innerHeight - 44, top));
+
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
+            e.preventDefault();
+        }
+
+        function onUp() {
+            if (!drag) return;
+            drag = null;
+            panel.classList.remove('a366-dragging');
+        }
+
+        function bind(el, type, fn, opts) {
+            try { el.addEventListener(type, fn, opts); }
+            catch (e) { el.addEventListener(type, fn, false); }
+        }
+
+        if (window.PointerEvent) {
+            bind(handle, 'pointerdown', onDown, false);
+            bind(document, 'pointermove', onMove, { passive: false });
+            bind(document, 'pointerup', onUp, false);
+            bind(document, 'pointercancel', onUp, false);
+        } else {
+            bind(handle, 'mousedown', onDown, false);
+            bind(document, 'mousemove', onMove, false);
+            bind(document, 'mouseup', onUp, false);
+            bind(handle, 'touchstart', onDown, { passive: false });
+            bind(document, 'touchmove', onMove, { passive: false });
+            bind(document, 'touchend', onUp, false);
+            bind(document, 'touchcancel', onUp, false);
+        }
+    }
+
+    function showLauncher() {
+        if (!ui.launcher) {
+            var launcher = document.createElement('div');
+            launcher.id = 'a366-pk-launcher';
+            launcher.textContent = 'PK';
+            launcher.title = '打开自动作答控制台';
+            launcher.addEventListener('click', function () {
+                launcher.style.display = 'none';
+                if (ui.panel) ui.panel.style.display = '';
+            });
+            document.body.appendChild(launcher);
+            ui.launcher = launcher;
+        }
+        ui.launcher.style.display = 'flex';
+    }
+
+    function createUI() {
+        if (document.getElementById('a366-pk-panel')) return;
+
+        var style = document.createElement('style');
+        style.id = 'a366-pk-style';
+        style.textContent = PANEL_CSS;
+        (document.head || document.documentElement).appendChild(style);
+
+        var panel = document.createElement('div');
+        panel.id = 'a366-pk-panel';
+        panel.innerHTML = PANEL_HTML;
+        document.body.appendChild(panel);
+        ui.panel = panel;
+
+        ui.log = panel.querySelector('[data-log]');
+        ui.toggle = panel.querySelector('[data-a366="toggle"]');
+        ui.accuracy = panel.querySelector('[data-ctl="accuracy"]');
+        ui.accuracyVal = panel.querySelector('[data-val="accuracy"]');
+        ui.interval = panel.querySelector('[data-ctl="interval"]');
+        ui.skip = panel.querySelector('[data-ctl="skip"]');
+        ui.timeCheck = panel.querySelector('[data-ctl="time"]');
+        ui.timeMin = panel.querySelector('[data-ctl="time-min"]');
+        ui.timeSec = panel.querySelector('[data-ctl="time-sec"]');
+        ui.stats.answered = panel.querySelector('[data-stat="answered"]');
+        ui.stats.correct = panel.querySelector('[data-stat="correct"]');
+        ui.stats.wrong = panel.querySelector('[data-stat="wrong"]');
+        ui.stats.rate = panel.querySelector('[data-stat="rate"]');
+
+        applyAccuracy(state.accuracy);
+        applyInterval(state.interval);
+        applySkip(state.skipAnim);
+        applySubmitTime(state.submitTimeEnabled, state.submitTimeSeconds, true);
+
+        panel.querySelector('[data-a366="collapse"]').addEventListener('click', function () {
+            panel.classList.toggle('a366-collapsed');
+        });
+
+        panel.querySelector('[data-a366="hide"]').addEventListener('click', function () {
+            panel.style.display = 'none';
+            showLauncher();
+        });
+
+        ui.toggle.addEventListener('click', function () {
+            if (state.running) stop();
+            else start();
+        });
+
+        panel.querySelector('[data-a366="clear"]').addEventListener('click', function () {
+            if (ui.log) ui.log.innerHTML = '';
+        });
+
+        ui.accuracy.addEventListener('input', function () {
+            applyAccuracy(this.value);
+        });
+        ui.accuracy.addEventListener('change', function () {
+            addLog('正确率已设为 ' + state.accuracy + '%', 'info');
+        });
+
+        ui.interval.addEventListener('change', function () {
+            applyInterval(this.value);
+            addLog('作答间隔已设为 ' + state.interval + 'ms', 'info');
+        });
+
+        ui.skip.addEventListener('change', function () {
+            applySkip(this.checked);
+            addLog('跳过动画已' + (state.skipAnim ? '开启' : '关闭'), 'info');
+        });
+
+        ui.timeCheck.addEventListener('change', function () {
+            applySubmitTime(this.checked, state.submitTimeSeconds);
+            if (state.submitTimeEnabled && state.submitTimeSeconds === null) {
+                warn('提交时间已启用，但时长未填，提交不会被修改');
+            } else {
+                log('提交时间已' + (state.submitTimeEnabled ? '启用' : '关闭'));
+            }
+        });
+
+        ui.timeMin.addEventListener('change', commitTimeInputs);
+        ui.timeSec.addEventListener('change', commitTimeInputs);
+
+        var presets = panel.querySelectorAll('[data-preset]');
+        for (var i = 0; i < presets.length; i++) {
+            presets[i].addEventListener('click', function () {
+                applyInterval(this.getAttribute('data-preset'));
+                addLog('作答间隔已设为 ' + state.interval + 'ms', 'info');
+            });
+        }
+
+        makeDraggable(panel, panel.querySelector('#a366-pk-hd'));
+    }
+
+    // ---------- 启动 ----------
+
+    function boot() {
+        createUI();
+        updateStats();
+        syncUI();
+        addLog('控制台已就绪（正确率 ' + state.accuracy + '%，间隔 ' + state.interval + 'ms，跳过动画 ' +
+            (state.skipAnim ? '开' : '关') + '），点击“开始”启动', 'info');
+        // 代理层的提交时间状态只存在内存里，页面刷新后要重新推一次
+        pushSubmitTime();
+    }
+
+    window.AutoPk = {
+        version: VERSION,
+        start: start,
+        stop: stop,
+        show: function () {
+            if (ui.panel) ui.panel.style.display = '';
+            if (ui.launcher) ui.launcher.style.display = 'none';
+        },
+        hide: function () {
+            if (ui.panel) ui.panel.style.display = 'none';
+            showLauncher();
+        },
+        setAccuracy: function (value) {
+            applyAccuracy(value);
+        },
+        setIntervalMs: function (value) {
+            applyInterval(value);
+        },
+        setSkipAnim: function (value) {
+            applySkip(value);
+        },
+        setSubmitTime: function (enabled, seconds) {
+            applySubmitTime(enabled, seconds);
+        },
+        status: function () {
+            return {
+                running: state.running,
+                answered: state.answered,
+                correct: state.correct,
+                wrong: state.wrong,
+                failed: state.failed,
+                accuracy: state.accuracy,
+                interval: state.interval,
+                skipAnim: state.skipAnim,
+                submitTime: {
+                    enabled: state.submitTimeEnabled,
+                    seconds: state.submitTimeSeconds,
+                    sync: state.submitTimeSync
+                },
+                lastKey: state.lastKey
+            };
+        },
+        get debug() {
+            return state.debug;
+        },
+        set debug(value) {
+            state.debug = !!value;
+        }
+    };
+
+    if (document.body) boot();
+    else document.addEventListener('DOMContentLoaded', boot);
 })();
