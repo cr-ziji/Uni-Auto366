@@ -302,9 +302,28 @@ if ($count -gt 0) {
     }
   }
 
+  /**
+   * 移动端打开天学网：通过手机版的自定义 scheme 拉起应用。
+   *
+   * 天学网手机版注册了 `up366mobile://`，其中 `identityAuth` 路径用于身份认证
+   * 跳转。移动端没有 up366.exe，也没有 Windows 注册表，无法用 openPath 启动，
+   * 这里走 shell.openExternal（RN 外壳映射到 Linking.openURL），由系统解析
+   * scheme 并把天学网带到前台。
+   */
+  async openUp366Mobile() {
+    const scheme = 'up366mobile://identityAuth';
+    try {
+      await shell.openExternal(scheme);
+      return { success: true, mode: 'scheme', url: scheme };
+    } catch (error) {
+      moduleLog.error('[ProcessMonitor] 打开天学网手机版失败:', error);
+      return { success: false, error: '未检测到天学网手机版，请确认已安装' };
+    }
+  }
+
   async openUp366() {
     if (isMobile) {
-      return { success: false, skipped: true, error: MONITOR_UNSUPPORTED };
+      return this.openUp366Mobile();
     }
     const up366Path = this.getUp366Path();
     if (up366Path) {

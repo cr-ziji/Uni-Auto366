@@ -253,6 +253,7 @@ export const PRELOAD_BRIDGE_SOURCE = `(function () {
   // that do not declare the attribute (for example an injected third party
   // page) are ignored on purpose - they must not repaint the shell.
   var reportedTheme = null;
+  var themeObserverInstalled = false;
 
   function reportTheme() {
     try {
@@ -273,29 +274,43 @@ export const PRELOAD_BRIDGE_SOURCE = `(function () {
     }
   }
 
-  function installThemeReporter() {
-    // The attribute is usually not set yet when this script runs (it is
-    // injected at document start), the observer below catches that first
-    // value as well - the immediate call only handles a page that already
-    // rendered.
-    reportTheme();
-
+  // This script is injected at document-start, when document.documentElement
+  // may still be null - observing it then silently does nothing and the theme
+  // reporter stops following later switches. The install is therefore
+  // retriable: it is tried immediately and again on DOMContentLoaded and load,
+  // when the document root is guaranteed to exist.
+  function installObserver() {
+    if (themeObserverInstalled) { return; }
     try {
       var root = typeof document === 'undefined' ? null : document.documentElement;
-      if (root && typeof MutationObserver === 'function') {
-        var observer = new MutationObserver(function () { reportTheme(); });
-        observer.observe(root, {attributes: true, attributeFilter: ['data-theme']});
-      }
+      if (!root || typeof MutationObserver !== 'function') { return; }
+      var observer = new MutationObserver(function () { reportTheme(); });
+      observer.observe(root, {attributes: true, attributeFilter: ['data-theme']});
+      themeObserverInstalled = true;
     } catch (error) {
       console.warn('[e2rn] theme observer failed', error);
     }
+  }
+
+  function installThemeReporter() {
+    // The attribute is usually not set yet when this script runs (it is
+    // injected at document start); the immediate call only handles a page
+    // that already rendered, the observer catches the first value too.
+    reportTheme();
+    installObserver();
 
     try {
       if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-        document.addEventListener('DOMContentLoaded', reportTheme);
+        document.addEventListener('DOMContentLoaded', function () {
+          reportTheme();
+          installObserver();
+        });
       }
       if (typeof window.addEventListener === 'function') {
-        window.addEventListener('load', reportTheme);
+        window.addEventListener('load', function () {
+          reportTheme();
+          installObserver();
+        });
       }
     } catch (error) {
       // No DOM events available - the observer above is enough.

@@ -16,6 +16,7 @@ import AgreementUI from './dialogs/agreement.js';
 import SpeedUI from './pages/speed/index.js';
 import ThemeUI from './shell/theme.js';
 import TtsApprovalUI from './dialogs/approval.js';
+import { initExternalLinks } from './shell/external-links.js';
 
 class Auto366App {
   constructor() {
@@ -40,6 +41,9 @@ class Auto366App {
       await initializeSettings();
       // 暴露方法到全局（必须在最前面，因为HTML中的onclick依赖这些方法）
       this.exposeMethods();
+
+      // 外部链接（项目地址/隐私协议等）交给系统默认浏览器打开
+      initExternalLinks();
 
       // 按运行平台裁剪界面（移动端去掉窗口按钮、进程加速、增强模式入口）
       await this.applyPlatformLayout();
