@@ -16,6 +16,8 @@
 		A20000000000000000000001 /* Auto366Net.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* Auto366Net.swift */; };
 		A20000000000000000000002 /* Auto366NetBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* Auto366NetBridge.m */; };
 		A20000000000000000000003 /* auto366_mitm.p12 in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* auto366_mitm.p12 */; };
+		A20000000000000000000004 /* Auto366Files.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* Auto366Files.swift */; };
+		A20000000000000000000005 /* Auto366FilesBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* Auto366FilesBridge.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -33,6 +35,8 @@
 		A10000000000000000000002 /* Auto366NetBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = Auto366NetBridge.m; path = Auto366/Auto366NetBridge.m; sourceTree = "<group>"; };
 		A10000000000000000000003 /* Auto366-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "Auto366-Bridging-Header.h"; path = "Auto366/Auto366-Bridging-Header.h"; sourceTree = "<group>"; };
 		A10000000000000000000004 /* auto366_mitm.p12 */ = {isa = PBXFileReference; lastKnownFileType = file; name = auto366_mitm.p12; path = Auto366/auto366_mitm.p12; sourceTree = "<group>"; };
+		A10000000000000000000005 /* Auto366Files.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = Auto366Files.swift; path = Auto366/Auto366Files.swift; sourceTree = "<group>"; };
+		A10000000000000000000006 /* Auto366FilesBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = Auto366FilesBridge.m; path = Auto366/Auto366FilesBridge.m; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
@@ -56,6 +60,8 @@
 				761780EE2CA45674006654EF /* SceneDelegate.swift */,
 				A10000000000000000000001 /* Auto366Net.swift */,
 				A10000000000000000000002 /* Auto366NetBridge.m */,
+				A10000000000000000000005 /* Auto366Files.swift */,
+				A10000000000000000000006 /* Auto366FilesBridge.m */,
 				A10000000000000000000003 /* Auto366-Bridging-Header.h */,
 				A10000000000000000000004 /* auto366_mitm.p12 */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -265,6 +271,8 @@
 				761780EF2CA45674006654EF /* SceneDelegate.swift in Sources */,
 				A20000000000000000000001 /* Auto366Net.swift in Sources */,
 				A20000000000000000000002 /* Auto366NetBridge.m in Sources */,
+				A20000000000000000000004 /* Auto366Files.swift in Sources */,
+				A20000000000000000000005 /* Auto366FilesBridge.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -31,7 +31,7 @@
 | TypeScript | 6.0.3（`@react-native/typescript-config` 0.88.0） |
 | Jest | 29.7.0（`@react-native/jest-preset` 0.88.0） |
 | ESLint / Prettier | 8.57.1 / 3.9.10 |
-| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1；网络层为自研原生模块 `Auto366Net` |
+| 原生依赖 | `react-native-webview` 14.0.1、`react-native-fs` 2.20.0、`react-native-url-polyfill` 4.0.0、`react-native-safe-area-context` 5.10.1；自研原生模块 `Auto366Net`（传输层）与 `Auto366Files`（文件对话框 / 同步读） |
 | Android | Gradle 9.4.1、AGP（`com.android.tools.build:gradle`）、Kotlin 2.2.0、compileSdk 37、targetSdk 36、minSdk 26、NDK 27.1.12297006 |
 | iOS | Swift `AppDelegate` + `SceneDelegate`（`RCTDefaultReactNativeFactoryDelegate`）、`RCTNewArchEnabled=true` |
 
@@ -274,6 +274,20 @@ CA 只生成一次（重跑保留已有 CA，`--force` 才轮换），避免已�
 2. 旧库在 TCP connect 时就报告 TLS 成功，此时 `write()` 会失败；现在
    `connectTls()` 只在原生 TLS 握手完成后才回调，JS 不会再遇到
    “Socket is closed”。
+
+**文件对话框实现**（`Auto366Files`，两端同一套 JS 协议
+`src/runtime/native/files.ts`）：
+
+- Android：`files/Auto366FilesModule.kt`，`ACTION_OPEN_DOCUMENT` 选取（复制进
+  `cache/imports`）、`ACTION_CREATE_DOCUMENT` 保存（返回 `content://`，由
+  `writeToUri` 写入）、`FileProvider` + `ACTION_VIEW` / `ACTION_SEND` 打开与分享；
+- iOS：`Auto366Files.swift`，`UIDocumentPickerViewController(asCopy: true)` 选取、
+  `forOpeningContentTypes: [.folder]` 选目录后把「目录 + 文件名」当目标 URI、
+  `UIDocumentInteractionController` 打开、`UIActivityViewController` 分享；
+  `readFileBase64Sync` 用 `RCT_EXTERN__BLOCKING_SYNCHRONOUS_METHOD` 暴露成同步方法，
+  让 `fs.readFileSync` 能按需取字节（否则 iOS 启动时要把整个数据目录搬过 bridge）；
+- 保存的两段式约定不变：`dialog.showSaveDialog` 只拿目标位置，`fs` 写入沙盒副本后
+  再由 `flushPendingSave` 调用原生 `writeToUri` 复制到用户选的位置。
 
 ## 4. ModuleMapper
 

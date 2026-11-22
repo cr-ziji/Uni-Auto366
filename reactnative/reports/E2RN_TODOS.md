@@ -53,8 +53,19 @@
 ## P1 — 功能降级
 
 ### 3. 系统对话框
-- `dialog.showSaveDialog` / `showOpenDialog` / `showErrorBox` 在 shim 中返回 `canceled: true`。
-- **方案**：接入 `react-native-document-picker` / `react-native-share`；错误框用 RN `Alert`。
+- **已实现**：自研 `Auto366Files` 原生模块接系统文档选择器（Android SAF / iOS
+  `UIDocumentPicker`），`dialog.showOpenDialog` / `showSaveDialog` /
+  `shell.openPath` / `showItemInFolder` 都是真实能力，选中的文件会复制进沙盒缓存，
+  保存的目标位置由 `fs.persistFile` 在落盘后写入（Android `content://`、
+  iOS security-scoped 目录）。
+- **仍受限**：
+  - `showOpenDialogSync` / `showSaveDialogSync` 需要同步 UI，移动端返回 `undefined`；
+  - `properties: ['openDirectory']` 不支持：Android SAF 只给 `content://`，iOS 给的
+    目录是 security-scoped 的，都撑不起沙盒 `fs` 的同步 API；
+  - iOS 的保存是「选目录 + 固定文件名」，不能像 Android `ACTION_CREATE_DOCUMENT`
+    那样在对话框里改名；
+  - iOS 没有系统级下载目录，`saveToDownloads` 落在 `<Documents>/Downloads/Auto366`
+    （「文件」App 的「我的 iPhone / Auto366」里可见）。
 
 ### 4. 应用内自动更新
 - `electron-updater` stub 永远返回 `update-not-available`。
@@ -186,4 +197,7 @@
 - [ ] 客户端安装根证书后，业务 App 内的 HTTPS 请求可被解密
 - [ ] 答案上传/下载走通（Supabase storage）
 - [ ] 杀进程后重启，状态可恢复
-- [ ] iOS 全流程
+- [x] iOS 启动（模拟器 iPhone 17 Pro / iOS 26.5）：Nitro 0.37.2 + nitro-unzip 0.6.0
+      下 JSI bindings 正常安装，界面可以跑到协议页与主界面；启动屏已改成应用图标
+      （`LaunchScreen.storyboard` + `LaunchIcon` / `LaunchBackground`）
+- [ ] iOS 全流程（代理 / MITM / 注入 / 文件对话框 / 答案包）

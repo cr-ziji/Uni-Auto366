@@ -31,6 +31,10 @@ describe('app theme palette', () => {
     // styles/global/theme.css (dark) and styles/global/tokens.css (light).
     expect(APP_THEMES.dark.background).toBe('#16181c');
     expect(APP_THEMES.light.background).toBe('#f5f5f5');
+    // The bottom safe area is painted with the tab bar colour
+    // (`--color-bg-muted`), so the bar reaches the screen edge.
+    expect(APP_THEMES.light.nav).toBe('#f8f9fa');
+    expect(APP_THEMES.dark.nav).toBe('#1e2127');
     expect(APP_THEMES.dark.isDark).toBe(true);
     expect(APP_THEMES.light.statusBarStyle).toBe('dark-content');
     expect(APP_THEMES.dark.statusBarStyle).toBe('light-content');

@@ -26,6 +26,13 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<!-- iOS 没有全局可写的「下载」文件夹，导出的规则集/答案包/抓包结果落在
+	     <Documents>/Downloads/Auto366，这两个开关让它出现在「文件」App 的
+	     「我的 iPhone / Auto366」里，等价于 Android 的 Download/Auto366。 -->
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>UIFileSharingEnabled</key>
+	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 	  <!-- The proxy has to talk to plain HTTP endpoints, therefore arbitrary loads

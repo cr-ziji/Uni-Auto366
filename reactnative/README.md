@@ -9,13 +9,21 @@ CLI 20.2.0 · TypeScript 6.0.3。
 ## 快速开始
 
 ```bash
-npm install          # 安装依赖（postinstall 会给 tcp-socket 打 keystore 密码补丁）
-npm run assets       # 把 Web 资源内嵌进 src/web-assets/assets.json（生成物）
+npm install          # 安装依赖（含构建期资源 bootstrap-icons）
+npm run assets       # 把 Web 资源内嵌进 src/web-assets/（生成物，含图标字体）
 npm run certs        # 生成 HTTPS 中间人证书与 p12 keystore（需要 openssl，已有则跳过）
 npm start            # 启动 Metro
 npm run android      # 需要 Android SDK
 npm run ios          # 需要 Xcode
 ```
+
+> `bootstrap-icons` 是**构建期依赖**：`index.html` 直接引用
+> `node_modules/bootstrap-icons/font/bootstrap-icons.css`，缺了它整套图标都会消失。
+> 桌面端树没装依赖时，`scripts/build-web-assets.js` 会退回本仓库的
+> `node_modules`。`.npmrc` 里的 `legacy-peer-deps=true` 是为了绕过
+> `react-native-nitro-zlib` 仍写 `^0.35` 的 peer 冲突（RN 0.88 需要 nitro ≥ 0.37）。
+> 启动时会跳过桌面版的答题教程（`src/runtime/preload.ts` 的
+> `SKIP_DESKTOP_TUTORIAL`），设置页的「重播教程」仍可打开。
 
 ## 校验命令
 

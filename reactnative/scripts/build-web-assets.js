@@ -184,10 +184,29 @@ function walk(directory, baseDirectory, files) {
   }
 }
 
+/**
+ * Resolves a verbatim entry against the desktop project, then against this
+ * repository.
+ *
+ * The desktop tree is not necessarily installed (`node_modules` missing) while
+ * the mobile build still needs `bootstrap-icons` for the icon font: without it
+ * every `<i class="bi ...">` in the renderer renders an empty box. The mobile
+ * repository declares the same package for that reason, so a missing desktop
+ * copy falls back to `reactnative/node_modules`.
+ */
+function resolveEntry(entry, source) {
+  const absolute = path.join(source, entry.from);
+  if (fs.existsSync(absolute) || entry.dir) {
+    return absolute;
+  }
+  const local = path.join(PROJECT_ROOT, entry.from);
+  return fs.existsSync(local) ? local : absolute;
+}
+
 function collect(source) {
   const files = new Map();
   for (const entry of ENTRIES) {
-    const absolute = path.join(source, entry.from);
+    const absolute = resolveEntry(entry, source);
     if (!fs.existsSync(absolute)) {
       process.stdout.write(`[web-assets] skipped (missing): ${entry.from}\n`);
       continue;

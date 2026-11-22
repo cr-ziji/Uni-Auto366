@@ -17,12 +17,28 @@ import Security
  */
 @objc(Auto366Net)
 final class Auto366Net: RCTEventEmitter {
+  /// 与 Android 的 `DEFAULT_CONNECT_TIMEOUT` 一致。
+  private static let connectTimeoutMs = 15_000
+
   private let lock = NSRecursiveLock()
   private var servers: [String: NetServer] = [:]
   private var connections: [String: NetConnection] = [:]
   private let ioQueue = DispatchQueue(label: "com.auto366.net.io", attributes: .concurrent)
   private let stateQueue = DispatchQueue(label: "com.auto366.net.state")
   private var sequence: UInt64 = 0
+
+  /**
+   * TCP 选项：始终开 `noDelay`。
+   *
+   * Android 的每个 socket 都设了 `tcpNoDelay = true`；代理转发的是大量小报文
+   * （HTTP 头、分片响应体），Nagle 会让它们多等一个 RTT。Network.framework
+   * 的选项在创建连接时确定，所以这里统一在参数里打开，`setNoDelay` 只保留接口。
+   */
+  fileprivate static func tcpOptions() -> NWProtocolTCP.Options {
+    let tcp = NWProtocolTCP.Options()
+    tcp.noDelay = true
+    return tcp
+  }
 
   override class func requiresMainQueueSetup() -> Bool {
     false
@@ -50,9 +66,12 @@ final class Auto366Net: RCTEventEmitter {
 
   private func store(server: NetServer, id: String) {
     lock.lock()
-    servers[id]?.close()
+    let previous = servers[id]
     servers[id] = server
     lock.unlock()
+    // 关闭会在锁外进行：`close()` 会回收该服务端的连接并发 `close` 事件，
+    // 不希望在持有模块锁时做这些事。
+    previous?.close()
   }
 
   private func remove(serverId: String) -> NetServer? {
@@ -165,9 +184,9 @@ final class Auto366Net: RCTEventEmitter {
         )
       }
       sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-      parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
+      parameters = NWParameters(tls: tlsOptions, tcp: Self.tcpOptions())
     } else {
-      parameters = NWParameters.tcp
+      parameters = NWParameters(tls: nil, tcp: Self.tcpOptions())
     }
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: nwPort)
     let nw = NWConnection(to: endpoint, using: parameters)
@@ -299,7 +318,8 @@ final class Auto366Net: RCTEventEmitter {
 
   @objc(setNoDelay:value:)
   func setNoDelay(_ socketId: String, value: Bool) {
-    // Network.framework 的 TCP 选项在创建连接时确定；这里保持接口兼容。
+    // Network.framework 的 TCP 选项在创建连接时确定，之后改不了；所有连接
+    // 创建时已经开了 `noDelay`（见 `tcpOptions()`），这里只保持接口兼容。
   }
 
   @objc(tunnel:host:port:restBase64:useTls:resolver:rejecter:)
@@ -354,7 +374,7 @@ final class Auto366Net: RCTEventEmitter {
     resolve: @escaping RCTPromiseResolveBlock,
     reject: @escaping RCTPromiseRejectBlock
   ) {
-    let parameters = NWParameters.tcp
+    let parameters = NWParameters(tls: nil, tcp: Self.tcpOptions())
     parameters.allowLocalEndpointReuse = true
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: port)
     let remote = NWConnection(to: endpoint, using: parameters)
@@ -368,11 +388,27 @@ final class Auto366Net: RCTEventEmitter {
       return true
     }
 
+    // 与 Android 一致：隧道连不上不能一直挂着，否则 JS 永远等不到 CONNECT 的
+    // 结果，浏览器会一直转圈。
+    let timeoutItem = DispatchWorkItem { [weak client] in
+      guard settle() else { return }
+      remote.stateUpdateHandler = nil
+      remote.cancel()
+      client?.cancelTunnel()
+      client?.close()
+      reject(
+        "ETUNNEL",
+        "tunnel connect timed out after \(Self.connectTimeoutMs) ms",
+        nil
+      )
+    }
+
     remote.stateUpdateHandler = { [weak self] state in
       guard let self = self else { return }
       switch state {
       case .ready:
         if settle() {
+          timeoutItem.cancel()
           remote.stateUpdateHandler = nil
           if !rest.isEmpty {
             remote.send(content: rest, completion: .contentProcessed { _ in })
@@ -383,15 +419,25 @@ final class Auto366Net: RCTEventEmitter {
         }
       case .failed(let error):
         if settle() {
+          timeoutItem.cancel()
           remote.stateUpdateHandler = nil
           client.cancelTunnel()
           client.close()
           reject("ETUNNEL", error.localizedDescription, error)
         }
+      case .cancelled:
+        if settle() {
+          timeoutItem.cancel()
+          remote.stateUpdateHandler = nil
+          client.cancelTunnel()
+          client.close()
+          reject("ETUNNEL", "tunnel cancelled", nil)
+        }
       default:
         break
       }
     }
+    ioQueue.asyncAfter(deadline: .now() + .milliseconds(Self.connectTimeoutMs), execute: timeoutItem)
     remote.start(queue: ioQueue)
   }
 
@@ -443,6 +489,20 @@ final class Auto366Net: RCTEventEmitter {
 
   fileprivate func removeClosed(_ socketId: String) {
     _ = remove(connectionId: socketId)
+  }
+
+  /**
+   * 关掉某个服务端上还活着的连接。
+   *
+   * Android 的 `ProxyServer.close()` 会把 `serverId` 匹配的连接一起关掉；iOS 之前
+   * 只停掉监听，已经建立的客户端连接留在 `connections` 里，代理重启后 JS 侧仍
+   * 持有这些 socket，表现为旧页面一直「加载中」。
+   */
+  fileprivate func closeConnections(serverId: String) {
+    lock.lock()
+    let victims = connections.values.filter { $0.serverId == serverId }
+    lock.unlock()
+    victims.forEach { $0.close() }
   }
 
   fileprivate func emitClosed(_ socketId: String) {
@@ -581,7 +641,7 @@ private final class NetServer {
   }
 
   private func makePlainListener() throws -> NWListener {
-    let parameters = NWParameters.tcp
+    let parameters = NWParameters(tls: nil, tcp: Auto366Net.tcpOptions())
     parameters.allowLocalEndpointReuse = true
     let nwPort = NWEndpoint.Port(rawValue: requestedPort) ?? .any
     if host.isEmpty || host == "0.0.0.0" {
@@ -612,7 +672,7 @@ private final class NetServer {
     let tlsOptions = NWProtocolTLS.Options()
     sec_protocol_options_set_local_identity(tlsOptions.securityProtocolOptions, secIdentity)
     sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-    let parameters = NWParameters(tls: tlsOptions, tcp: NWProtocolTCP.Options())
+    let parameters = NWParameters(tls: tlsOptions, tcp: Auto366Net.tcpOptions())
     parameters.allowLocalEndpointReuse = true
     parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
     return try NWListener(using: parameters)
@@ -668,6 +728,9 @@ private final class NetServer {
     tls?.cancel()
     tls = nil
     tlsPort = nil
+    // 与 Android 的 ProxyServer.close() 对齐：监听停掉后也要回收这条服务端
+    // 已经接进来的客户端连接。
+    module?.closeConnections(serverId: id)
   }
 }
 

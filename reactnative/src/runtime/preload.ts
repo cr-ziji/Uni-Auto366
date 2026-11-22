@@ -17,6 +17,31 @@ import {PRELOAD_BRIDGE_SOURCE} from '../components/preloadBridge';
 export {PRELOAD_BRIDGE_SOURCE};
 
 /**
+ * Marks the desktop tutorial as completed inside the page.
+ *
+ * `renderer/dialogs/tutorial.js` shows a 14-step quiz on the first launch and
+ * only writes `tutorial-completed` once every question is answered correctly.
+ * That quiz is written for the desktop layout and blocks the phone UI behind a
+ * long form, so mobile builds seed the same keys the last tutorial step writes
+ * and boot straight into the application. Set the constant to `false` to bring
+ * the tutorial back (`设置 → 重播教程` still works either way).
+ */
+const SKIP_DESKTOP_TUTORIAL = true;
+
+const SKIP_TUTORIAL_SOURCE = SKIP_DESKTOP_TUTORIAL
+  ? `(function () {
+  try {
+    window.localStorage.setItem('tutorial-completed', 'true');
+    window.localStorage.setItem('tutorial-version', '5');
+    window.localStorage.removeItem('tutorial-step');
+    window.localStorage.removeItem('tutorial-progress-version');
+  } catch (error) {
+    console.warn('[e2rn] could not mark the tutorial as completed', error);
+  }
+})();`
+  : '';
+
+/**
  * The desktop preload sources, copied verbatim from the Electron project
  * (`preload/index.js` and `preload/bridge.js`).
  *
@@ -325,6 +350,7 @@ export function buildPreloadScript(options?: PreloadScriptOptions): string {
     '  if (window.__E2RN_PRELOAD__) { return; }',
     '  window.__E2RN_PRELOAD__ = true;',
     windowId ? `  window.__E2RN_WINDOW_ID__ = ${JSON.stringify(windowId)};` : '',
+    SKIP_TUTORIAL_SOURCE,
     PRELOAD_BRIDGE_SOURCE,
     ELECTRON_STUB,
     LOADER_HEAD,

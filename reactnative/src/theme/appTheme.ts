@@ -30,6 +30,14 @@ export interface AppThemePalette {
   background: string;
   /** Raised surface (window cards, the plate behind the app icon). */
   surface: string;
+  /**
+   * Colour of the page's bottom tab bar (`--color-bg-muted`).
+   *
+   * The shell paints the bottom safe area (the home indicator strip) with it,
+   * so the tab bar visually continues to the screen edge instead of floating
+   * above a band of page background - which looked like wasted space.
+   */
+  nav: string;
   /** Primary text colour of the shell. */
   text: string;
   /** Secondary text colour (the boot message). */
@@ -45,6 +53,8 @@ export const APP_THEMES: Record<AppThemeName, AppThemePalette> = {
     name: 'light',
     background: '#f5f5f5',
     surface: '#ffffff',
+    // --color-gray-50, the background of the mobile bottom navigation.
+    nav: '#f8f9fa',
     text: '#333333',
     textMuted: '#6c757d',
     isDark: false,
@@ -54,6 +64,7 @@ export const APP_THEMES: Record<AppThemeName, AppThemePalette> = {
     name: 'dark',
     background: '#16181c',
     surface: '#1e2127',
+    nav: '#1e2127',
     text: '#d4dae1',
     textMuted: '#98a1ac',
     isDark: true,

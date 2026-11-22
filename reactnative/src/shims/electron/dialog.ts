@@ -7,8 +7,8 @@
  * destination, so the bytes a caller writes into the sandbox are relayed there
  * (see `fs.persistFile`). Message boxes use React Native `Alert`.
  *
- * When the native module is not available (iOS, tests) everything degrades to
- * "cancelled", which the ported desktop code already handles.
+ * When the native module is not available (older builds, tests) everything
+ * degrades to "cancelled", which the ported desktop code already handles.
  */
 import {Alert} from 'react-native';
 
@@ -162,8 +162,10 @@ export const dialog = {
     }
     const properties = options?.properties ?? [];
     if (properties.includes('openDirectory')) {
-      // Android has no "pick a directory and get a writable path" concept; the
-      // Storage Access Framework only hands out `content://` URIs.
+      // Android's Storage Access Framework only hands out `content://` URIs
+      // (not a writable path), and an iOS folder picked through the document
+      // picker is security-scoped - neither can back the sandbox `fs`. Save
+      // targets do support picking a folder, see `showSaveDialog` below.
       console.warn('[e2rn] picking a directory is not supported on mobile.');
       return {canceled: true, filePaths: []};
     }

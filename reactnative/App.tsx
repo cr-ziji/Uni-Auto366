@@ -20,7 +20,7 @@
  */
 
 import React, {useEffect, useState} from 'react';
-import {StatusBar, StyleSheet, Text, View} from 'react-native';
+import {Platform, StatusBar, StyleSheet, Text, View} from 'react-native';
 import {
   SafeAreaProvider,
   initialWindowMetrics,
@@ -34,11 +34,34 @@ import {useAppTheme} from './src/theme/useAppTheme';
 
 type BootState = 'starting' | 'running' | 'failed';
 
+/**
+ * Space the shell keeps free below the page, in dp.
+ *
+ * iOS reports a 34pt bottom inset on notch / Dynamic Island devices, but that
+ * is the height a *tab bar* is supposed to occupy, not blank space: reserving
+ * all of it left a large empty band under the navigation. Only the home
+ * indicator itself has to stay clear, so the page may run 12dp from the edge
+ * and its own bottom bar absorbs the rest.
+ *
+ * Android's bottom inset is the system navigation bar (gesture pill or the
+ * three buttons), i.e. real screen estate the page must not cover - it is kept
+ * as reported.
+ */
+const BOTTOM_INSET_MAX = 12;
+
+function bottomInsetFor(inset: number): number {
+  if (Platform.OS !== 'ios') {
+    return inset;
+  }
+  return Math.min(inset, BOTTOM_INSET_MAX);
+}
+
 function AppContent(): React.JSX.Element {
   const [state, setState] = useState<BootState>('starting');
   const [message, setMessage] = useState('正在启动 Auto366…');
   const insets = useSafeAreaInsets();
   const theme = useAppTheme();
+  const bottomInset = bottomInsetFor(insets.bottom);
 
   useEffect(() => {
     let cancelled = false;
@@ -75,8 +98,11 @@ function AppContent(): React.JSX.Element {
     // and the gesture bar), the content is inset by the safe area so that the
     // desktop UI is never covered by the notch or the gesture bar.
     //
-    // Both surfaces use the colour of the page instead of black/white: the
-    // safe area then looks like a continuation of the UI, not like a frame.
+    // The top / side insets use the page colour, so the notch area looks like a
+    // continuation of the page. The bottom inset is trimmed to the home
+    // indicator and painted with the tab bar colour: reserving the whole system
+    // inset left a tall empty band under the navigation, and painting it with
+    // the page colour made that band stand out even more.
     <View style={[styles.root, {backgroundColor: theme.background}]}>
       <View
         style={[
@@ -84,7 +110,6 @@ function AppContent(): React.JSX.Element {
           {
             backgroundColor: theme.background,
             paddingTop: insets.top,
-            paddingBottom: insets.bottom,
             paddingLeft: insets.left,
             paddingRight: insets.right,
           },
@@ -100,6 +125,9 @@ function AppContent(): React.JSX.Element {
           </View>
         )}
       </View>
+      {bottomInset > 0 ? (
+        <View style={[styles.bottomInset, {height: bottomInset, backgroundColor: theme.nav}]} />
+      ) : null}
     </View>
   );
 }
@@ -125,6 +153,10 @@ const styles = StyleSheet.create({
   },
   safeArea: {
     flex: 1,
+  },
+  bottomInset: {
+    // The bar colour is applied at render time (it follows the page theme).
+    backgroundColor: '#f8f9fa',
   },
   placeholder: {
     flex: 1,

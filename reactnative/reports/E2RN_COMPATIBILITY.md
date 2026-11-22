@@ -44,7 +44,7 @@
 | `ipcMain` | `handle` `on`（全部经过 `modules/register.js` 的可信来源包装） | `src/shims/electron/ipcMain.ts` + `EventBus` | ✅ | `event.senderFrame.url` 合成自 `/app/...` |
 | `ipcRenderer` | `invoke` `send` `on` `removeListener` | `src/shims/electron/ipcRenderer.ts` + `WindowManagerBridge` | ✅ | 经 WebView 消息桥 |
 | `contextBridge` | `exposeInMainWorld('electronAPI', {...})` | `src/shims/electron/contextBridge.ts` + 注入脚本 | ✅ | preload 源码字节一致 |
-| `dialog` | `showErrorBox` `showSaveDialog` `showOpenDialog` | `src/shims/electron/dialog.ts` | ⚠️ | 一律返回 `canceled: true`，没有系统文件选择器 |
+| `dialog` | `showErrorBox` `showSaveDialog` `showOpenDialog` | `src/shims/electron/dialog.ts` + 原生 `Auto366Files` | ✅ | 打开/保存走系统文档选择器；同步版本（`*Sync`）与 `openDirectory` 仍不支持 |
 | `shell` | `openExternal` | `src/shims/electron/shell.ts` | ✅ | 走 RN `Linking` |
 | `screen` | `getPrimaryDisplay().scaleFactor` | `src/shims/electron/screen.ts` | ⚠️ | 固定 `scaleFactor = 2` |
 | `nativeTheme` / `Menu` / `Tray` / `Notification` / `clipboard` / `powerMonitor` / `globalShortcut` / `protocol` / `session` / `systemPreferences` / `autoUpdater` | 少量使用 | `src/shims/electron/misc.ts` | ⚠️ | 均为安全 no-op |

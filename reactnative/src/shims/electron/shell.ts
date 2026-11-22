@@ -100,7 +100,7 @@ export const shell = {
         if (await sharePath(newest)) {
           return '';
         }
-        // 原生分享面板不可用（例如 iOS 还没接）同样按“已处理”返回。
+        // 原生分享面板不可用（旧构建、测试环境）同样按“已处理”返回。
         return isFilePickerAvailable() ? 'could not share the file of this folder' : '';
       }
     } catch {

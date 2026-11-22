@@ -1,11 +1,11 @@
 /**
- * Native file picker / opener (`Auto366Files` on Android).
+ * Native file picker / opener (`Auto366Files` on Android and iOS).
  *
  * The desktop build uses `dialog.showOpenDialog`, `dialog.showSaveDialog` and
  * `shell.openPath`, which the Electron shims cannot emulate with JavaScript
  * alone. This module wraps the native counterpart; every function degrades to
- * "not available" when the module is missing (iOS, tests, Expo Go), so the
- * shims keep the previous behaviour instead of crashing.
+ * "not available" when the module is missing (older builds, Jest, Expo Go), so
+ * the shims keep the previous behaviour instead of crashing.
  */
 import {NativeModules} from 'react-native';
 import {Buffer} from 'buffer';
@@ -58,8 +58,9 @@ export async function pickFiles(options?: {multiple?: boolean}): Promise<PickedF
  * Save targets that were chosen through the system dialog.
  *
  * `fs` writes into the app sandbox (that is the only place a `file://` path is
- * writable), so the bytes still have to be copied into the `content://` URI the
- * user picked. The copy happens in `fs.persistFile` through
+ * writable), so the bytes still have to be copied into the destination the user
+ * picked - a `content://` URI on Android, a security-scoped `file://` URL inside
+ * the chosen folder on iOS. The copy happens in `fs.persistFile` through
  * {@link flushPendingSave}, which keeps the desktop contract of
  * `dialog.showSaveDialog` ("pick a path, then write it") intact.
  */
@@ -132,7 +133,11 @@ export async function shareFile(path: string, mimeType?: string | null): Promise
   return native.shareFile(path, mimeType ?? null);
 }
 
-/** Copies a sandbox file into the public `Download/Auto366` folder. */
+/**
+ * Copies a sandbox file into the platform's "downloads" location:
+ * `Download/Auto366` on Android, `<Documents>/Downloads/Auto366` on iOS (the
+ * folder shown in the Files app, `UIApplication` has no public Downloads).
+ */
 export async function saveToDownloads(
   path: string,
   fileName: string,
@@ -148,7 +153,7 @@ export async function saveToDownloads(
 /**
  * Synchronous read of a sandbox file.
  *
- * Returns `null` when the native blocking method is missing (older build, iOS,
+ * Returns `null` when the native blocking method is missing (older build,
  * tests) or when the file cannot be read, so the caller can fall back to the
  * previous behaviour instead of throwing a different error.
  */
@@ -175,7 +180,17 @@ export function isSyncReadAvailable(): boolean {
   const native = filesModule() as (FilesModule & {
     readFileBase64Sync?: (path: string) => string;
   }) | null;
-  return !!native && typeof native.readFileBase64Sync === 'function';
+  if (!native || typeof native.readFileBase64Sync !== 'function') {
+    return false;
+  }
+  // 真探一次：不存在的路径必须同步返回空串。旧构建、或桥接把同步方法退化成了
+  // Promise，这里就拿不到字符串 —— 那 `fs` 必须退回「启动时全量镜像」的老路，
+  // 否则 `readFileSync` 会在延迟目录上抛 EBUSY。
+  try {
+    return native.readFileBase64Sync('') === '';
+  } catch {
+    return false;
+  }
 }
 
 export default {
